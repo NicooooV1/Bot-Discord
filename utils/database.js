@@ -30,7 +30,8 @@ db.exec(`
     ticket_category_id TEXT,
     ticket_log_channel_id TEXT,
     mod_role_id TEXT,
-    mute_role_id TEXT
+    mute_role_id TEXT,
+    antispam_enabled INTEGER DEFAULT 0
   );
 
   -- Table des tickets
@@ -74,7 +75,8 @@ const getGuildConfig = (guildId) => {
 const updateGuildConfig = (guildId, key, value) => {
   const allowed = [
     'log_channel_id', 'welcome_channel_id', 'welcome_message', 'leave_message',
-    'ticket_category_id', 'ticket_log_channel_id', 'mod_role_id', 'mute_role_id'
+    'ticket_category_id', 'ticket_log_channel_id', 'mod_role_id', 'mute_role_id',
+    'antispam_enabled'
   ];
   if (!allowed.includes(key)) throw new Error(`Clé de config invalide: ${key}`);
   db.prepare(`UPDATE guild_config SET ${key} = ? WHERE guild_id = ?`).run(value, guildId);

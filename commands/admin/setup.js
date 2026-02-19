@@ -74,6 +74,15 @@ module.exports = {
         )
     )
     .addSubcommand(sub =>
+      sub.setName('antispam')
+        .setDescription('Activer/Désactiver l\'anti-spam automatique')
+        .addBooleanOption(opt =>
+          opt.setName('activer')
+            .setDescription('Activer ou désactiver l\'anti-spam')
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
       sub.setName('view')
         .setDescription('Voir la configuration actuelle')
     )
@@ -95,6 +104,7 @@ module.exports = {
       'ticket-category': { key: 'ticket_category_id', get: () => interaction.options.getChannel('catégorie').id, label: 'Catégorie des tickets' },
       'ticket-logs': { key: 'ticket_log_channel_id', get: () => interaction.options.getChannel('salon').id, label: 'Salon de logs des tickets' },
       'mod-role': { key: 'mod_role_id', get: () => interaction.options.getRole('rôle').id, label: 'Rôle modérateur' },
+      'antispam': { key: 'antispam_enabled', get: () => interaction.options.getBoolean('activer') ? 1 : 0, label: 'Anti-spam' },
     };
 
     const config = configMap[sub];
@@ -128,7 +138,7 @@ async function handleView(interaction) {
       { name: '🛡️ Rôle modérateur', value: formatRole(config.mod_role_id), inline: true },
       { name: '🎫 Catégorie tickets', value: formatChannel(config.ticket_category_id), inline: true },
       { name: '📝 Logs tickets', value: formatChannel(config.ticket_log_channel_id), inline: true },
-      { name: '\u200b', value: '\u200b', inline: true },
+      { name: '🛡️ Anti-spam', value: config.antispam_enabled ? '✅ Activé' : '❌ Désactivé', inline: true },
       { name: '👋 Message de bienvenue', value: `\`\`\`${config.welcome_message}\`\`\`` },
       { name: '👋 Message de départ', value: `\`\`\`${config.leave_message}\`\`\`` },
     )
