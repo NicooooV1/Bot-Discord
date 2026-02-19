@@ -1,0 +1,150 @@
+{
+  "common": {
+    "error": "❌ Une erreur est survenue.",
+    "no_permission": "❌ Vous n'avez pas la permission d'utiliser cette commande.",
+    "bot_no_permission": "❌ Je n'ai pas les permissions nécessaires.",
+    "module_disabled": "❌ Ce module est désactivé sur ce serveur.",
+    "cooldown": "⏳ Veuillez patienter **{{remaining}}s** avant de réutiliser cette commande.",
+    "invalid_user": "❌ Utilisateur introuvable.",
+    "invalid_channel": "❌ Salon introuvable.",
+    "invalid_role": "❌ Rôle introuvable.",
+    "self_action": "❌ Vous ne pouvez pas effectuer cette action sur vous-même.",
+    "bot_action": "❌ Vous ne pouvez pas effectuer cette action sur un bot.",
+    "higher_role": "❌ La cible a un rôle supérieur ou égal au vôtre.",
+    "success": "✅ Action effectuée avec succès.",
+    "cancelled": "❌ Action annulée.",
+    "confirm": "Confirmer",
+    "cancel": "Annuler",
+    "page": "Page {{current}}/{{total}}",
+    "no_results": "Aucun résultat trouvé.",
+    "duration_format": "{{days}}j {{hours}}h {{minutes}}m {{seconds}}s"
+  },
+  "admin": {
+    "setup": {
+      "title": "⚙️ Configuration du bot",
+      "module_enabled": "✅ Module **{{module}}** activé.",
+      "module_disabled": "❌ Module **{{module}}** désactivé.",
+      "config_updated": "✅ Configuration mise à jour : `{{key}}` → `{{value}}`.",
+      "config_reset": "✅ Configuration réinitialisée."
+    },
+    "help": {
+      "title": "📖 Aide — Ultra Suite",
+      "description": "Utilisez les menus ci-dessous pour naviguer dans les catégories.",
+      "no_description": "Aucune description disponible."
+    }
+  },
+  "mod": {
+    "ban": {
+      "success": "🔨 **{{user}}** a été banni. (Case #{{case}})",
+      "reason": "Raison : {{reason}}",
+      "dm": "Vous avez été banni de **{{guild}}**.\nRaison : {{reason}}"
+    },
+    "kick": {
+      "success": "👢 **{{user}}** a été expulsé. (Case #{{case}})",
+      "dm": "Vous avez été expulsé de **{{guild}}**.\nRaison : {{reason}}"
+    },
+    "timeout": {
+      "success": "🔇 **{{user}}** a été réduit au silence pour **{{duration}}**. (Case #{{case}})",
+      "removed": "🔊 Le timeout de **{{user}}** a été retiré."
+    },
+    "warn": {
+      "success": "⚠️ **{{user}}** a reçu un avertissement. (Case #{{case}}, total : {{total}})",
+      "dm": "Vous avez reçu un avertissement sur **{{guild}}**.\nRaison : {{reason}}"
+    },
+    "unban": {
+      "success": "✅ **{{user}}** a été débanni."
+    },
+    "clear": {
+      "success": "🗑️ **{{count}}** messages supprimés.",
+      "none": "Aucun message à supprimer."
+    },
+    "slowmode": {
+      "success": "🐌 Slowmode défini à **{{seconds}}s** dans {{channel}}.",
+      "removed": "✅ Slowmode retiré de {{channel}}."
+    },
+    "lock": {
+      "locked": "🔒 Salon {{channel}} verrouillé.",
+      "unlocked": "🔓 Salon {{channel}} déverrouillé."
+    },
+    "nick": {
+      "success": "✏️ Pseudo de **{{user}}** changé en **{{nick}}**.",
+      "reset": "✏️ Pseudo de **{{user}}** réinitialisé."
+    },
+    "case": {
+      "not_found": "❌ Case #{{case}} introuvable.",
+      "revoked": "✅ Case #{{case}} révoquée."
+    },
+    "modlogs": {
+      "title": "📋 Historique de modération — {{user}}",
+      "empty": "Aucune sanction enregistrée."
+    }
+  },
+  "logs": {
+    "message_delete": "🗑️ Message supprimé dans {{channel}}",
+    "message_edit": "✏️ Message modifié dans {{channel}}",
+    "member_join": "📥 {{user}} a rejoint le serveur",
+    "member_leave": "📤 {{user}} a quitté le serveur",
+    "member_update": "🔄 {{user}} a été mis à jour",
+    "channel_create": "📁 Salon **{{channel}}** créé",
+    "channel_delete": "📁 Salon **{{channel}}** supprimé",
+    "role_create": "🏷️ Rôle **{{role}}** créé",
+    "role_delete": "🏷️ Rôle **{{role}}** supprimé",
+    "voice_join": "🔊 {{user}} a rejoint **{{channel}}**",
+    "voice_leave": "🔇 {{user}} a quitté **{{channel}}**",
+    "voice_move": "🔀 {{user}} déplacé vers **{{channel}}**"
+  },
+  "tickets": {
+    "open": "🎫 Ticket ouvert par {{user}}",
+    "close": "🎫 Ticket fermé par {{user}}",
+    "already_open": "❌ Vous avez déjà un ticket ouvert.",
+    "max_tickets": "❌ Nombre maximum de tickets atteint ({{max}}).",
+    "not_ticket": "❌ Ce salon n'est pas un ticket.",
+    "panel_title": "🎫 Système de tickets",
+    "panel_description": "Cliquez sur le bouton ci-dessous pour ouvrir un ticket.",
+    "panel_button": "📩 Ouvrir un ticket",
+    "rating_prompt": "Comment évaluez-vous le support reçu ?",
+    "transcript_saved": "📝 Transcript sauvegardé."
+  },
+  "xp": {
+    "level_up": "🎉 Bravo {{user}} ! Vous êtes passé au **niveau {{level}}** !",
+    "rank": "📊 **{{user}}** — Niveau {{level}} ({{xp}}/{{needed}} XP) — Rang #{{rank}}",
+    "leaderboard_title": "🏆 Classement XP",
+    "no_xp": "Vous n'avez pas encore d'XP."
+  },
+  "economy": {
+    "balance": "💰 **{{user}}** — Portefeuille : {{balance}}{{symbol}} | Banque : {{bank}}{{symbol}}",
+    "daily": "✅ Vous avez reçu **{{amount}}{{symbol}}** ! Revenez demain.",
+    "daily_cooldown": "⏳ Vous avez déjà récupéré votre récompense quotidienne. Revenez dans **{{remaining}}**.",
+    "insufficient": "❌ Fonds insuffisants.",
+    "transfer_success": "✅ **{{amount}}{{symbol}}** transféré à **{{user}}**.",
+    "deposit_success": "🏦 **{{amount}}{{symbol}}** déposé en banque.",
+    "withdraw_success": "💸 **{{amount}}{{symbol}}** retiré de la banque."
+  },
+  "security": {
+    "raid_detected": "🚨 **RAID DÉTECTÉ** — {{count}} membres ont rejoint en {{seconds}}s",
+    "spam_detected": "⚠️ Spam détecté de {{user}}",
+    "phishing_detected": "🛡️ Lien de phishing détecté de {{user}}",
+    "action_taken": "Action : {{action}}"
+  },
+  "onboarding": {
+    "welcome": "Bienvenue {{user}} sur **{{guild}}** ! 🎉",
+    "goodbye": "{{user}} a quitté le serveur. 👋",
+    "rules_prompt": "Veuillez accepter le règlement pour accéder au serveur.",
+    "rules_accepted": "✅ Règlement accepté ! Bienvenue !",
+    "verification_title": "🔐 Vérification",
+    "verification_button": "✅ Vérifier"
+  },
+  "roles": {
+    "menu_title": "🏷️ Rôles disponibles",
+    "added": "✅ Rôle **{{role}}** ajouté.",
+    "removed": "❌ Rôle **{{role}}** retiré.",
+    "max_reached": "❌ Nombre maximum de rôles atteint."
+  },
+  "utility": {
+    "serverinfo_title": "📊 Informations — {{guild}}",
+    "userinfo_title": "👤 Informations — {{user}}",
+    "avatar_title": "🖼️ Avatar de {{user}}",
+    "reminder_set": "⏰ Rappel défini pour **{{time}}** : {{message}}",
+    "reminder_fire": "⏰ **Rappel** : {{message}}"
+  }
+}

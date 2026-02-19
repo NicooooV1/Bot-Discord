@@ -1,52 +1,37 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { COLORS } = require('../../utils/logger');
-const { errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /slowmode
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { successEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
   data: new SlashCommandBuilder()
     .setName('slowmode')
-    .setDescription('🐌 Définir le mode lent d\'un salon')
-    .addIntegerOption(opt =>
-      opt.setName('secondes')
-        .setDescription('Délai en secondes (0 pour désactiver)')
-        .setRequired(true)
+    .setDescription('Définit le slowmode d\'un salon')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addIntegerOption((opt) =>
+      opt
+        .setName('secondes')
+        .setDescription('Intervalle en secondes (0 = désactiver)')
         .setMinValue(0)
         .setMaxValue(21600)
+        .setRequired(true)
     )
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison du changement'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
+    .addChannelOption((opt) => opt.setName('salon').setDescription('Salon cible')),
 
   async execute(interaction) {
     const seconds = interaction.options.getInteger('secondes');
-    const reason = interaction.options.getString('raison') || '';
+    const channel = interaction.options.getChannel('salon') || interaction.channel;
 
-    try {
-      await interaction.channel.setRateLimitPerUser(seconds, reason);
+    await channel.setRateLimitPerUser(seconds, `Par ${interaction.user.tag}`);
 
-      const embed = new EmbedBuilder()
-        .setColor(seconds > 0 ? COLORS.YELLOW : COLORS.GREEN)
-        .setTimestamp();
-
-      if (seconds === 0) {
-        embed.setTitle('🐌 Mode lent désactivé');
-        embed.setDescription('Le mode lent a été désactivé dans ce salon.');
-      } else {
-        const formatted = seconds >= 3600
-          ? `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
-          : seconds >= 60
-            ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-            : `${seconds}s`;
-
-        embed.setTitle('🐌 Mode lent activé');
-        embed.setDescription(`Le mode lent a été défini à **${formatted}**.`);
-      }
-
-      if (reason) embed.addFields({ name: '📝 Raison', value: reason });
-
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[SLOWMODE]', error);
-      await interaction.reply(errorReply('❌ Impossible de modifier le mode lent.'));
-    }
+    const key = seconds === 0 ? 'mod.slowmode.removed' : 'mod.slowmode.success';
+    await interaction.reply({
+      embeds: [successEmbed(t(key, undefined, { seconds, channel: channel.toString() }))],
+      ephemeral: true,
+    });
   },
 };

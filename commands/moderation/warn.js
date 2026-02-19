@@ -1,80 +1,100 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addWarn, getWarns, addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { canModerate, errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /warn
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const configService = require('../../core/configService');
+const { canModerate } = require('../../utils/permissions');
+const { modEmbed, errorEmbed, successEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('warn')
-    .setDescription('⚠️ Avertir un utilisateur')
-    .addUserOption(opt => opt.setName('utilisateur').setDescription('L\'utilisateur à avertir').setRequired(true))
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison de l\'avertissement').setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    .setDescription('Avertit un membre')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à avertir').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison de l\'avertissement')),
 
   async execute(interaction) {
-    const target = interaction.options.getUser('utilisateur');
-    const reason = interaction.options.getString('raison');
+    const target = interaction.options.getMember('membre');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
 
-    const check = canModerate(interaction, target);
-    if (!check.ok) return interaction.reply(errorReply(check.reason));
+    if (!target) {
+      return interaction.reply({ embeds: [errorEmbed(t('common.invalid_user'))], ephemeral: true });
+    }
 
+    const check = canModerate(interaction.member, target);
+    if (!check.allowed) {
+      return interaction.reply({ embeds: [errorEmbed(t(`common.${check.reason}`))], ephemeral: true });
+    }
+
+    // Créer le warn
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type: 'WARN',
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      reason,
+    });
+
+    const total = await sanctionQueries.activeWarns(interaction.guild.id, target.id);
+
+    // DM
     try {
-      // Ajouter le warn
-      addWarn(interaction.guild.id, target.id, interaction.user.id, reason);
+      await target.user.send(t('mod.warn.dm', undefined, { guild: interaction.guild.name, reason }));
+    } catch {}
 
-      // Compter les warns
-      const warns = getWarns(interaction.guild.id, target.id);
-      const warnCount = warns.length;
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: target.id,
+      targetType: 'user',
+      details: { action: 'WARN', reason, caseNumber, total },
+    });
 
-      // Log en base de données
-      addModLog(interaction.guild.id, 'WARN', target.id, interaction.user.id, reason);
+    const embed = modEmbed({
+      type: '⚠️ Warn',
+      target: target.user.tag,
+      moderator: interaction.user.tag,
+      reason,
+      caseNumber,
+    }).addFields({ name: 'Warns actifs', value: `${total}`, inline: true });
 
-      // Log dans le salon
-      await modLog(interaction.guild, {
-        action: `Avertissement (#${warnCount})`,
-        moderator: interaction.user,
-        target,
-        reason,
-        color: COLORS.YELLOW,
-      });
+    await interaction.reply({ embeds: [embed] });
 
-      // DM à l'utilisateur
-      try {
-        const dmEmbed = new EmbedBuilder()
-          .setTitle('⚠️ Vous avez reçu un avertissement')
-          .setColor(COLORS.YELLOW)
-          .addFields(
-            { name: 'Serveur', value: interaction.guild.name },
-            { name: 'Raison', value: reason },
-            { name: 'Total d\'avertissements', value: `${warnCount}` },
-          )
-          .setTimestamp();
-        await target.send({ embeds: [dmEmbed] });
-      } catch { /* DMs fermés */ }
+    // Auto-action si seuil atteint
+    const config = await configService.get(interaction.guild.id);
+    if (config.automod?.maxWarns && total >= config.automod.maxWarns) {
+      const action = config.automod.warnAction || 'TIMEOUT';
+      const duration = config.automod.warnActionDuration || 3600;
 
-      // Réponse
-      const embed = new EmbedBuilder()
-        .setTitle('⚠️ Utilisateur averti')
-        .setColor(COLORS.YELLOW)
-        .setDescription(`**${target.tag}** a reçu un avertissement.`)
-        .addFields(
-          { name: '📝 Raison', value: reason },
-          { name: '📊 Total', value: `${warnCount} avertissement(s)`, inline: true },
-        )
-        .setTimestamp();
-
-      // Alerte si beaucoup de warns
-      if (warnCount >= 3) {
-        embed.addFields({
-          name: '🚨 Attention',
-          value: `Cet utilisateur a **${warnCount}** avertissements !`,
+      if (action === 'TIMEOUT') {
+        await target.timeout(duration * 1000, `Auto-action : ${total} warns`).catch(() => {});
+        await interaction.followUp({
+          embeds: [successEmbed(`⚠️ **${target.user.tag}** a atteint ${total} warns — timeout automatique appliqué.`)],
+        });
+      } else if (action === 'KICK') {
+        await target.kick(`Auto-action : ${total} warns`).catch(() => {});
+        await interaction.followUp({
+          embeds: [successEmbed(`⚠️ **${target.user.tag}** a atteint ${total} warns — kick automatique.`)],
+        });
+      } else if (action === 'BAN') {
+        await interaction.guild.members.ban(target.id, { reason: `Auto-action : ${total} warns` }).catch(() => {});
+        await interaction.followUp({
+          embeds: [successEmbed(`⚠️ **${target.user.tag}** a atteint ${total} warns — ban automatique.`)],
         });
       }
+    }
 
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[WARN]', error);
-      await interaction.reply(errorReply('❌ Impossible d\'avertir cet utilisateur.'));
+    if (config.modLogChannel) {
+      const logChannel = interaction.guild.channels.cache.get(config.modLogChannel);
+      if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
     }
   },
 };

@@ -1,149 +1,250 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ChannelType } = require('discord.js');
-const { getGuildConfig, updateGuildConfig } = require('../../utils/database');
-const { COLORS } = require('../../utils/logger');
+// ===================================
+// Ultra Suite — Admin: /setup
+// Configuration interactive du bot
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits, ChannelType, StringSelectMenuBuilder, ActionRowBuilder } = require('discord.js');
+const configService = require('../../core/configService');
+const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'admin',
   data: new SlashCommandBuilder()
     .setName('setup')
-    .setDescription('⚙️ Configurer le bot')
-    .addSubcommand(sub =>
-      sub.setName('logs')
-        .setDescription('Définir le salon de logs')
-        .addChannelOption(opt =>
-          opt.setName('salon')
-            .setDescription('Le salon pour les logs')
+    .setDescription('Configure le bot pour ce serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((sub) =>
+      sub
+        .setName('module')
+        .setDescription('Active ou désactive un module')
+        .addStringOption((opt) =>
+          opt
+            .setName('nom')
+            .setDescription('Nom du module')
+            .setRequired(true)
+            .addChoices(
+              { name: 'Modération', value: 'moderation' },
+              { name: 'Logs', value: 'logs' },
+              { name: 'Sécurité', value: 'security' },
+              { name: 'Onboarding', value: 'onboarding' },
+              { name: 'Rôles', value: 'roles' },
+              { name: 'Tickets', value: 'tickets' },
+              { name: 'XP & Niveaux', value: 'xp' },
+              { name: 'Économie', value: 'economy' },
+              { name: 'Utilitaire', value: 'utility' },
+              { name: 'Fun', value: 'fun' },
+              { name: 'Musique', value: 'music' },
+              { name: 'Vocal Temporaire', value: 'tempvoice' },
+              { name: 'Candidatures', value: 'applications' },
+              { name: 'Tags/FAQ', value: 'tags' },
+              { name: 'Événements', value: 'events' },
+              { name: 'RP', value: 'rp' },
+              { name: 'Intégrations', value: 'integrations' },
+              { name: 'Annonces', value: 'announcements' },
+              { name: 'Statistiques', value: 'stats' }
+            )
+        )
+        .addBooleanOption((opt) =>
+          opt.setName('actif').setDescription('Activer ou désactiver').setRequired(true)
+        )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('logs')
+        .setDescription('Définit le salon de logs')
+        .addChannelOption((opt) =>
+          opt
+            .setName('salon')
+            .setDescription('Salon de logs')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
     )
-    .addSubcommand(sub =>
-      sub.setName('welcome')
-        .setDescription('Définir le salon de bienvenue')
-        .addChannelOption(opt =>
-          opt.setName('salon')
-            .setDescription('Le salon pour les messages de bienvenue')
+    .addSubcommand((sub) =>
+      sub
+        .setName('modlogs')
+        .setDescription('Définit le salon de logs de modération')
+        .addChannelOption((opt) =>
+          opt
+            .setName('salon')
+            .setDescription('Salon de modlogs')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
     )
-    .addSubcommand(sub =>
-      sub.setName('welcome-message')
-        .setDescription('Personnaliser le message de bienvenue')
-        .addStringOption(opt =>
-          opt.setName('message')
-            .setDescription('Message ({user}, {server}, {memberCount})')
+    .addSubcommand((sub) =>
+      sub
+        .setName('welcome')
+        .setDescription('Configure le message de bienvenue')
+        .addChannelOption((opt) =>
+          opt
+            .setName('salon')
+            .setDescription('Salon de bienvenue')
+            .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
-    )
-    .addSubcommand(sub =>
-      sub.setName('leave-message')
-        .setDescription('Personnaliser le message de départ')
-        .addStringOption(opt =>
-          opt.setName('message')
-            .setDescription('Message ({user}, {server}, {memberCount})')
-            .setRequired(true)
+        .addStringOption((opt) =>
+          opt.setName('message').setDescription('Message ({{user}}, {{guild}}, {{count}})').setRequired(false)
+        )
+        .addRoleOption((opt) =>
+          opt.setName('role').setDescription('Rôle à donner automatiquement').setRequired(false)
         )
     )
-    .addSubcommand(sub =>
-      sub.setName('ticket-category')
-        .setDescription('Définir la catégorie pour les tickets')
-        .addChannelOption(opt =>
-          opt.setName('catégorie')
-            .setDescription('La catégorie pour créer les tickets')
+    .addSubcommand((sub) =>
+      sub
+        .setName('tickets')
+        .setDescription('Configure le système de tickets')
+        .addChannelOption((opt) =>
+          opt
+            .setName('categorie')
+            .setDescription('Catégorie pour les tickets')
             .addChannelTypes(ChannelType.GuildCategory)
             .setRequired(true)
         )
-    )
-    .addSubcommand(sub =>
-      sub.setName('ticket-logs')
-        .setDescription('Définir le salon de logs des tickets')
-        .addChannelOption(opt =>
-          opt.setName('salon')
-            .setDescription('Le salon pour les logs des tickets')
+        .addChannelOption((opt) =>
+          opt
+            .setName('logs')
+            .setDescription('Salon de logs tickets')
             .addChannelTypes(ChannelType.GuildText)
-            .setRequired(true)
+            .setRequired(false)
+        )
+        .addRoleOption((opt) =>
+          opt.setName('staff').setDescription('Rôle staff pour les tickets').setRequired(false)
         )
     )
-    .addSubcommand(sub =>
-      sub.setName('mod-role')
-        .setDescription('Définir le rôle modérateur')
-        .addRoleOption(opt =>
-          opt.setName('rôle')
-            .setDescription('Le rôle modérateur')
-            .setRequired(true)
+    .addSubcommand((sub) =>
+      sub
+        .setName('muterole')
+        .setDescription('Définit le rôle mute')
+        .addRoleOption((opt) =>
+          opt.setName('role').setDescription('Rôle mute').setRequired(true)
         )
     )
-    .addSubcommand(sub =>
-      sub.setName('antispam')
-        .setDescription('Activer/Désactiver l\'anti-spam automatique')
-        .addBooleanOption(opt =>
-          opt.setName('activer')
-            .setDescription('Activer ou désactiver l\'anti-spam')
-            .setRequired(true)
-        )
+    .addSubcommand((sub) =>
+      sub
+        .setName('view')
+        .setDescription('Affiche la configuration actuelle')
     )
-    .addSubcommand(sub =>
-      sub.setName('view')
-        .setDescription('Voir la configuration actuelle')
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .addSubcommand((sub) =>
+      sub
+        .setName('reset')
+        .setDescription('Réinitialise toute la configuration')
+    ),
 
   async execute(interaction) {
     const sub = interaction.options.getSubcommand();
-    const guildId = interaction.guild.id;
 
-    if (sub === 'view') {
-      return handleView(interaction);
+    switch (sub) {
+      case 'module': {
+        const name = interaction.options.getString('nom');
+        const enabled = interaction.options.getBoolean('actif');
+        await configService.setModule(interaction.guild.id, name, enabled);
+        const key = enabled ? 'admin.setup.module_enabled' : 'admin.setup.module_disabled';
+        return interaction.reply({ embeds: [successEmbed(t(key, undefined, { module: name }))], ephemeral: true });
+      }
+
+      case 'logs': {
+        const channel = interaction.options.getChannel('salon');
+        await configService.set(interaction.guild.id, { logChannel: channel.id });
+        return interaction.reply({
+          embeds: [successEmbed(t('admin.setup.config_updated', undefined, { key: 'logChannel', value: channel.toString() }))],
+          ephemeral: true,
+        });
+      }
+
+      case 'modlogs': {
+        const channel = interaction.options.getChannel('salon');
+        await configService.set(interaction.guild.id, { modLogChannel: channel.id });
+        return interaction.reply({
+          embeds: [successEmbed(t('admin.setup.config_updated', undefined, { key: 'modLogChannel', value: channel.toString() }))],
+          ephemeral: true,
+        });
+      }
+
+      case 'welcome': {
+        const channel = interaction.options.getChannel('salon');
+        const message = interaction.options.getString('message');
+        const role = interaction.options.getRole('role');
+
+        const patch = { welcomeChannel: channel.id };
+        if (message) patch.welcomeMessage = message;
+        if (role) patch.welcomeRole = role.id;
+
+        await configService.set(interaction.guild.id, patch);
+        return interaction.reply({
+          embeds: [successEmbed(`✅ Bienvenue configuré dans ${channel}`)],
+          ephemeral: true,
+        });
+      }
+
+      case 'tickets': {
+        const category = interaction.options.getChannel('categorie');
+        const logsChannel = interaction.options.getChannel('logs');
+        const staff = interaction.options.getRole('staff');
+
+        const patch = { ticketCategory: category.id };
+        if (logsChannel) patch.ticketLogChannel = logsChannel.id;
+        if (staff) patch.ticketStaffRole = staff.id;
+
+        await configService.set(interaction.guild.id, patch);
+        return interaction.reply({
+          embeds: [successEmbed(`✅ Tickets configurés dans ${category}`)],
+          ephemeral: true,
+        });
+      }
+
+      case 'muterole': {
+        const role = interaction.options.getRole('role');
+        await configService.set(interaction.guild.id, { muteRole: role.id });
+        return interaction.reply({
+          embeds: [successEmbed(t('admin.setup.config_updated', undefined, { key: 'muteRole', value: role.toString() }))],
+          ephemeral: true,
+        });
+      }
+
+      case 'view': {
+        const config = await configService.get(interaction.guild.id);
+        const modules = await configService.getModules(interaction.guild.id);
+
+        const embed = createEmbed('primary')
+          .setTitle(`⚙️ Configuration — ${interaction.guild.name}`)
+          .addFields(
+            {
+              name: '📋 Modules activés',
+              value: Object.entries(modules)
+                .map(([k, v]) => `${v ? '✅' : '❌'} ${k}`)
+                .join('\n') || 'Aucun module activé',
+            },
+            {
+              name: '📝 Logs',
+              value: `Logs : ${config.logChannel ? `<#${config.logChannel}>` : 'Non défini'}\nModLogs : ${config.modLogChannel ? `<#${config.modLogChannel}>` : 'Non défini'}`,
+              inline: true,
+            },
+            {
+              name: '👋 Bienvenue',
+              value: `Salon : ${config.welcomeChannel ? `<#${config.welcomeChannel}>` : 'Non défini'}\nRôle : ${config.welcomeRole ? `<@&${config.welcomeRole}>` : 'Non défini'}`,
+              inline: true,
+            },
+            {
+              name: '🎫 Tickets',
+              value: `Catégorie : ${config.ticketCategory ? `<#${config.ticketCategory}>` : 'Non défini'}\nStaff : ${config.ticketStaffRole ? `<@&${config.ticketStaffRole}>` : 'Non défini'}`,
+              inline: true,
+            },
+            {
+              name: '🔇 Mute Role',
+              value: config.muteRole ? `<@&${config.muteRole}>` : 'Non défini',
+              inline: true,
+            }
+          );
+
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      case 'reset': {
+        await configService.set(interaction.guild.id, configService.DEFAULT_CONFIG);
+        return interaction.reply({ embeds: [successEmbed(t('admin.setup.config_reset'))], ephemeral: true });
+      }
     }
-
-    const configMap = {
-      'logs': { key: 'log_channel_id', get: () => interaction.options.getChannel('salon').id, label: 'Salon de logs' },
-      'welcome': { key: 'welcome_channel_id', get: () => interaction.options.getChannel('salon').id, label: 'Salon de bienvenue' },
-      'welcome-message': { key: 'welcome_message', get: () => interaction.options.getString('message'), label: 'Message de bienvenue' },
-      'leave-message': { key: 'leave_message', get: () => interaction.options.getString('message'), label: 'Message de départ' },
-      'ticket-category': { key: 'ticket_category_id', get: () => interaction.options.getChannel('catégorie').id, label: 'Catégorie des tickets' },
-      'ticket-logs': { key: 'ticket_log_channel_id', get: () => interaction.options.getChannel('salon').id, label: 'Salon de logs des tickets' },
-      'mod-role': { key: 'mod_role_id', get: () => interaction.options.getRole('rôle').id, label: 'Rôle modérateur' },
-      'antispam': { key: 'antispam_enabled', get: () => interaction.options.getBoolean('activer') ? 1 : 0, label: 'Anti-spam' },
-    };
-
-    const config = configMap[sub];
-    if (!config) return;
-
-    const value = config.get();
-    updateGuildConfig(guildId, config.key, value);
-
-    const embed = new EmbedBuilder()
-      .setTitle('⚙️ Configuration mise à jour')
-      .setColor(COLORS.GREEN)
-      .setDescription(`**${config.label}** a été configuré avec succès.`)
-      .setTimestamp();
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
   },
 };
-
-async function handleView(interaction) {
-  const config = getGuildConfig(interaction.guild.id);
-
-  const formatChannel = (id) => id ? `<#${id}>` : '`Non défini`';
-  const formatRole = (id) => id ? `<@&${id}>` : '`Non défini`';
-
-  const embed = new EmbedBuilder()
-    .setTitle('⚙️ Configuration du bot')
-    .setColor(COLORS.BLUE)
-    .addFields(
-      { name: '📋 Salon de logs', value: formatChannel(config.log_channel_id), inline: true },
-      { name: '👋 Salon de bienvenue', value: formatChannel(config.welcome_channel_id), inline: true },
-      { name: '🛡️ Rôle modérateur', value: formatRole(config.mod_role_id), inline: true },
-      { name: '🎫 Catégorie tickets', value: formatChannel(config.ticket_category_id), inline: true },
-      { name: '📝 Logs tickets', value: formatChannel(config.ticket_log_channel_id), inline: true },
-      { name: '🛡️ Anti-spam', value: config.antispam_enabled ? '✅ Activé' : '❌ Désactivé', inline: true },
-      { name: '👋 Message de bienvenue', value: `\`\`\`${config.welcome_message}\`\`\`` },
-      { name: '👋 Message de départ', value: `\`\`\`${config.leave_message}\`\`\`` },
-    )
-    .setFooter({ text: 'Variables disponibles: {user}, {server}, {memberCount}' })
-    .setTimestamp();
-
-  await interaction.reply({ embeds: [embed], ephemeral: true });
-}

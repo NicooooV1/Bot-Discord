@@ -1,15 +1,32 @@
 {
-  "name": "discord-bot",
-  "version": "1.0.0",
-  "description": "Bot Discord complet - Modération, Tickets, Logs, Bienvenue",
-  "main": "index.js",
+  "name": "ultra-suite-bot",
+  "version": "2.0.0",
+  "description": "Bot Discord Ultra Suite — 22 modules, modulaire, configurable, Pterodactyl-ready",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node index.js",
-    "deploy": "node deploy-commands.js"
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js",
+    "migrate": "node src/database/migrate.js",
+    "test": "jest --passWithNoTests",
+    "legacy:start": "node index.js",
+    "legacy:deploy": "node deploy-commands.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
     "better-sqlite3": "^11.7.0",
-    "dotenv": "^16.4.7"
-  }
+    "dotenv": "^16.4.7",
+    "knex": "^3.1.0",
+    "node-cron": "^3.0.3",
+    "node-cache": "^5.1.2",
+    "winston": "^3.17.0",
+    "express": "^4.21.1",
+    "uuid": "^11.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
 }

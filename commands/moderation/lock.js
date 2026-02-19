@@ -1,105 +1,42 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ChannelType } = require('discord.js');
-const { modLog, COLORS } = require('../../utils/logger');
-const { errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /lock + /unlock
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { successEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
   data: new SlashCommandBuilder()
     .setName('lock')
-    .setDescription('🔒 Verrouiller / Déverrouiller un salon')
-    .addSubcommand(sub =>
-      sub.setName('on')
-        .setDescription('🔒 Verrouiller le salon')
-        .addChannelOption(opt =>
-          opt.setName('salon')
-            .setDescription('Le salon à verrouiller (par défaut: salon actuel)')
-            .addChannelTypes(ChannelType.GuildText)
-        )
-        .addStringOption(opt => opt.setName('raison').setDescription('Raison du verrouillage'))
+    .setDescription('Verrouille ou déverrouille un salon')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addSubcommand((sub) =>
+      sub
+        .setName('on')
+        .setDescription('Verrouille le salon')
+        .addChannelOption((opt) => opt.setName('salon').setDescription('Salon cible'))
     )
-    .addSubcommand(sub =>
-      sub.setName('off')
-        .setDescription('🔓 Déverrouiller le salon')
-        .addChannelOption(opt =>
-          opt.setName('salon')
-            .setDescription('Le salon à déverrouiller (par défaut: salon actuel)')
-            .addChannelTypes(ChannelType.GuildText)
-        )
-        .addStringOption(opt => opt.setName('raison').setDescription('Raison du déverrouillage'))
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
+    .addSubcommand((sub) =>
+      sub
+        .setName('off')
+        .setDescription('Déverrouille le salon')
+        .addChannelOption((opt) => opt.setName('salon').setDescription('Salon cible'))
+    ),
 
   async execute(interaction) {
     const sub = interaction.options.getSubcommand();
     const channel = interaction.options.getChannel('salon') || interaction.channel;
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
-    const everyone = interaction.guild.roles.everyone;
+    const lock = sub === 'on';
 
-    try {
-      if (sub === 'on') {
-        // Verrouiller
-        await channel.permissionOverwrites.edit(everyone, {
-          SendMessages: false,
-          AddReactions: false,
-          CreatePublicThreads: false,
-        });
+    await channel.permissionOverwrites.edit(interaction.guild.roles.everyone, {
+      SendMessages: lock ? false : null,
+    });
 
-        const embed = new EmbedBuilder()
-          .setTitle('🔒 Salon verrouillé')
-          .setColor(COLORS.RED)
-          .setDescription(`Ce salon a été verrouillé par ${interaction.user}.`)
-          .addFields({ name: '📝 Raison', value: reason })
-          .setTimestamp();
-
-        await channel.send({ embeds: [embed] });
-
-        await modLog(interaction.guild, {
-          action: 'Salon verrouillé',
-          moderator: interaction.user,
-          target: { toString: () => channel.toString(), id: channel.id, displayAvatarURL: () => null },
-          reason,
-          color: COLORS.RED,
-        });
-
-        if (channel.id !== interaction.channel.id) {
-          await interaction.reply({ content: `✅ ${channel} a été verrouillé.`, ephemeral: true });
-        } else {
-          await interaction.reply({ content: '✅ Salon verrouillé.', ephemeral: true });
-        }
-
-      } else {
-        // Déverrouiller
-        await channel.permissionOverwrites.edit(everyone, {
-          SendMessages: null,
-          AddReactions: null,
-          CreatePublicThreads: null,
-        });
-
-        const embed = new EmbedBuilder()
-          .setTitle('🔓 Salon déverrouillé')
-          .setColor(COLORS.GREEN)
-          .setDescription(`Ce salon a été déverrouillé par ${interaction.user}.`)
-          .addFields({ name: '📝 Raison', value: reason })
-          .setTimestamp();
-
-        await channel.send({ embeds: [embed] });
-
-        await modLog(interaction.guild, {
-          action: 'Salon déverrouillé',
-          moderator: interaction.user,
-          target: { toString: () => channel.toString(), id: channel.id, displayAvatarURL: () => null },
-          reason,
-          color: COLORS.GREEN,
-        });
-
-        if (channel.id !== interaction.channel.id) {
-          await interaction.reply({ content: `✅ ${channel} a été déverrouillé.`, ephemeral: true });
-        } else {
-          await interaction.reply({ content: '✅ Salon déverrouillé.', ephemeral: true });
-        }
-      }
-    } catch (error) {
-      console.error('[LOCK]', error);
-      await interaction.reply(errorReply('❌ Impossible de modifier les permissions du salon.'));
-    }
+    const key = lock ? 'mod.lock.locked' : 'mod.lock.unlocked';
+    await interaction.reply({
+      embeds: [successEmbed(t(key, undefined, { channel: channel.toString() }))],
+    });
   },
 };

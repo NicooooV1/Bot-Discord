@@ -1,52 +1,62 @@
+// ===================================
+// Ultra Suite — deploy-commands.js
+// Enregistre les slash commands Discord
+// ===================================
+
 require('dotenv').config();
+
 const { REST, Routes } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const logger = require('./core/logger');
 
 const commands = [];
+const commandsPath = path.join(__dirname, 'commands');
 
-// Charger toutes les commandes récursivement
-function loadCommands(dir) {
-  const items = fs.readdirSync(dir, { withFileTypes: true });
-  for (const item of items) {
-    const fullPath = path.join(dir, item.name);
-    if (item.isDirectory()) {
-      loadCommands(fullPath);
-    } else if (item.name.endsWith('.js')) {
-      const command = require(fullPath);
-      if (command.data) {
-        commands.push(command.data.toJSON());
-        console.log(`  ✅ ${command.data.name}`);
+function loadCommandsRecursive(dir) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      loadCommandsRecursive(fullPath);
+    } else if (entry.name.endsWith('.js')) {
+      try {
+        const cmd = require(fullPath);
+        if (cmd?.data?.toJSON) {
+          commands.push(cmd.data.toJSON());
+          logger.info(`[Deploy] Chargé : ${cmd.data.name}`);
+        }
+      } catch (err) {
+        logger.error(`[Deploy] Erreur chargement ${fullPath}: ${err.message}`);
       }
     }
   }
 }
 
-console.log('📋 Chargement des commandes...');
-loadCommands(path.join(__dirname, 'commands'));
+loadCommandsRecursive(commandsPath);
 
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 
 (async () => {
   try {
-    console.log(`\n🔄 Enregistrement de ${commands.length} commandes...`);
+    logger.info(`[Deploy] Enregistrement de ${commands.length} commandes...`);
 
     if (process.env.GUILD_ID) {
-      // Déploiement sur un serveur spécifique (instantané, pour le développement)
-      await rest.put(
-        Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-        { body: commands },
-      );
-      console.log(`✅ Commandes enregistrées sur le serveur ${process.env.GUILD_ID}`);
+      // Deploy sur un serveur spécifique (instantané, pour le dev)
+      await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), {
+        body: commands,
+      });
+      logger.info(`[Deploy] ✅ ${commands.length} commandes enregistrées sur le serveur ${process.env.GUILD_ID}`);
     } else {
-      // Déploiement global (peut prendre jusqu'à 1h)
-      await rest.put(
-        Routes.applicationCommands(process.env.CLIENT_ID),
-        { body: commands },
-      );
-      console.log('✅ Commandes enregistrées globalement (peut prendre ~1h pour se propager)');
+      // Deploy global (peut prendre ~1h pour se propager)
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), {
+        body: commands,
+      });
+      logger.info(`[Deploy] ✅ ${commands.length} commandes enregistrées globalement`);
     }
-  } catch (error) {
-    console.error('❌ Erreur:', error);
+  } catch (err) {
+    logger.error(`[Deploy] Erreur : ${err.message}`);
+    console.error(err);
+    process.exit(1);
   }
 })();

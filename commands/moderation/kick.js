@@ -1,63 +1,78 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { canModerate, errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /kick
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const configService = require('../../core/configService');
+const { canModerate } = require('../../utils/permissions');
+const { modEmbed, errorEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('kick')
-    .setDescription('👢 Expulser un utilisateur du serveur')
-    .addUserOption(opt => opt.setName('utilisateur').setDescription('L\'utilisateur à expulser').setRequired(true))
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison de l\'expulsion'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
+    .setDescription('Expulse un membre du serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à expulser').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison de l\'expulsion')),
 
   async execute(interaction) {
-    const target = interaction.options.getUser('utilisateur');
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
+    const target = interaction.options.getMember('membre');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
 
-    const member = interaction.guild.members.cache.get(target.id);
-    if (!member) return interaction.reply(errorReply('❌ Cet utilisateur n\'est pas sur le serveur.'));
+    if (!target) {
+      return interaction.reply({ embeds: [errorEmbed(t('common.invalid_user'))], ephemeral: true });
+    }
 
-    const check = canModerate(interaction, target);
-    if (!check.ok) return interaction.reply(errorReply(check.reason));
+    const check = canModerate(interaction.member, target);
+    if (!check.allowed) {
+      return interaction.reply({ embeds: [errorEmbed(t(`common.${check.reason}`))], ephemeral: true });
+    }
 
+    // DM
     try {
-      try {
-        const dmEmbed = new EmbedBuilder()
-          .setTitle('👢 Vous avez été expulsé')
-          .setColor(COLORS.ORANGE)
-          .addFields(
-            { name: 'Serveur', value: interaction.guild.name },
-            { name: 'Raison', value: reason },
-            { name: 'Modérateur', value: interaction.user.tag },
-          )
-          .setTimestamp();
-        await target.send({ embeds: [dmEmbed] });
-      } catch { /* DMs fermés */ }
+      await target.user.send(t('mod.kick.dm', undefined, { guild: interaction.guild.name, reason }));
+    } catch {}
 
-      await member.kick(`${interaction.user.tag}: ${reason}`);
+    // Kick
+    await target.kick(`${reason} — par ${interaction.user.tag}`);
 
-      addModLog(interaction.guild.id, 'KICK', target.id, interaction.user.id, reason);
+    // DB
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type: 'KICK',
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      reason,
+    });
 
-      await modLog(interaction.guild, {
-        action: 'Expulsion',
-        moderator: interaction.user,
-        target,
-        reason,
-        color: COLORS.ORANGE,
-      });
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: target.id,
+      targetType: 'user',
+      details: { action: 'KICK', reason, caseNumber },
+    });
 
-      const embed = new EmbedBuilder()
-        .setTitle('👢 Utilisateur expulsé')
-        .setColor(COLORS.ORANGE)
-        .setDescription(`**${target.tag}** a été expulsé du serveur.`)
-        .addFields({ name: '📝 Raison', value: reason })
-        .setTimestamp();
+    const embed = modEmbed({
+      type: '👢 Kick',
+      target: target.user.tag,
+      moderator: interaction.user.tag,
+      reason,
+      caseNumber,
+    });
 
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[KICK]', error);
-      await interaction.reply(errorReply('❌ Impossible d\'expulser cet utilisateur.'));
+    await interaction.reply({ embeds: [embed] });
+
+    const config = await configService.get(interaction.guild.id);
+    if (config.modLogChannel) {
+      const logChannel = interaction.guild.channels.cache.get(config.modLogChannel);
+      if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
     }
   },
 };

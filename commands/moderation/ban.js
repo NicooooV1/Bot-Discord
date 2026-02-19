@@ -1,73 +1,103 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { canModerate, errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /ban
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const configService = require('../../core/configService');
+const { canModerate } = require('../../utils/permissions');
+const { modEmbed, errorEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
+const { parseDuration, formatDuration } = require('../../utils/formatters');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('ban')
-    .setDescription('🔨 Bannir un utilisateur du serveur')
-    .addUserOption(opt => opt.setName('utilisateur').setDescription('L\'utilisateur à bannir').setRequired(true))
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison du ban'))
-    .addIntegerOption(opt => opt.setName('supprimer_messages').setDescription('Supprimer les messages des X derniers jours (0-7)').setMinValue(0).setMaxValue(7))
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+    .setDescription('Bannit un membre du serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à bannir').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison du ban'))
+    .addStringOption((opt) => opt.setName('duree').setDescription('Durée (ex: 7d, 24h) — laissez vide pour permanent'))
+    .addIntegerOption((opt) =>
+      opt
+        .setName('purge')
+        .setDescription('Supprimer les messages des X derniers jours')
+        .setMinValue(0)
+        .setMaxValue(7)
+    ),
 
   async execute(interaction) {
-    const target = interaction.options.getUser('utilisateur');
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
-    const deleteMessages = interaction.options.getInteger('supprimer_messages') || 0;
+    const target = interaction.options.getMember('membre');
+    const user = interaction.options.getUser('membre');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
+    const durationStr = interaction.options.getString('duree');
+    const purge = interaction.options.getInteger('purge') || 0;
 
-    // Vérifications
-    const check = canModerate(interaction, target);
-    if (!check.ok) return interaction.reply(errorReply(check.reason));
-
-    try {
-      // Envoyer un DM à l'utilisateur avant le ban
-      try {
-        const dmEmbed = new EmbedBuilder()
-          .setTitle('🔨 Vous avez été banni')
-          .setColor(COLORS.RED)
-          .addFields(
-            { name: 'Serveur', value: interaction.guild.name },
-            { name: 'Raison', value: reason },
-            { name: 'Modérateur', value: interaction.user.tag },
-          )
-          .setTimestamp();
-        await target.send({ embeds: [dmEmbed] });
-      } catch {
-        // DMs fermés
+    // Vérifications de hiérarchie
+    if (target) {
+      const check = canModerate(interaction.member, target);
+      if (!check.allowed) {
+        return interaction.reply({ embeds: [errorEmbed(t(`common.${check.reason}`))], ephemeral: true });
       }
+    }
 
-      // Bannir
-      await interaction.guild.members.ban(target, {
-        reason: `${interaction.user.tag}: ${reason}`,
-        deleteMessageSeconds: deleteMessages * 86400,
-      });
+    // Durée (tempban)
+    const duration = durationStr ? parseDuration(durationStr) : null;
+    const type = duration ? 'TEMPBAN' : 'BAN';
+    const expiresAt = duration ? new Date(Date.now() + duration * 1000).toISOString() : null;
 
-      // Log en base de données
-      addModLog(interaction.guild.id, 'BAN', target.id, interaction.user.id, reason);
+    // DM avant ban
+    try {
+      await user.send(t('mod.ban.dm', undefined, { guild: interaction.guild.name, reason }));
+    } catch {}
 
-      // Log dans le salon de logs
-      await modLog(interaction.guild, {
-        action: 'Bannissement',
-        moderator: interaction.user,
-        target,
-        reason,
-        color: COLORS.RED,
-      });
+    // Ban
+    await interaction.guild.members.ban(user.id, {
+      reason: `${reason} — par ${interaction.user.tag}`,
+      deleteMessageSeconds: purge * 86400,
+    });
 
-      // Réponse
-      const embed = new EmbedBuilder()
-        .setTitle('🔨 Utilisateur banni')
-        .setColor(COLORS.RED)
-        .setDescription(`**${target.tag}** a été banni du serveur.`)
-        .addFields({ name: '📝 Raison', value: reason })
-        .setTimestamp();
+    // Enregistrer en DB
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type,
+      targetId: user.id,
+      moderatorId: interaction.user.id,
+      reason,
+      duration,
+      expiresAt,
+    });
 
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[BAN]', error);
-      await interaction.reply(errorReply('❌ Impossible de bannir cet utilisateur.'));
+    // Log en DB
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: user.id,
+      targetType: 'user',
+      details: { action: type, reason, caseNumber, duration },
+    });
+
+    // Embed de confirmation
+    const embed = modEmbed({
+      type: type === 'TEMPBAN' ? '🔨 Tempban' : '🔨 Ban',
+      target: user.tag,
+      moderator: interaction.user.tag,
+      reason,
+      caseNumber,
+      duration: duration ? formatDuration(duration) : null,
+    });
+
+    await interaction.reply({ embeds: [embed] });
+
+    // Envoyer dans le salon modlogs
+    const config = await configService.get(interaction.guild.id);
+    if (config.modLogChannel) {
+      const logChannel = interaction.guild.channels.cache.get(config.modLogChannel);
+      if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
     }
   },
 };

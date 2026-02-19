@@ -1,7 +1,21 @@
+// ===================================
+// Ultra Suite — Point d'entrée principal
+// Node.js 20+ / discord.js v14
+// ===================================
+
 require('dotenv').config();
-const { Client, GatewayIntentBits, Collection, Partials } = require('discord.js');
-const fs = require('fs');
-const path = require('path');
+
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { logger, createModuleLogger } = require('./core/logger');
+const db = require('./database');
+const { loadCommands } = require('./core/commandHandler');
+const { loadEvents } = require('./core/eventHandler');
+const { loadComponents } = require('./core/componentHandler');
+const { loadLocales } = require('./core/i18n');
+const { startScheduler, stopScheduler } = require('./core/scheduler');
+const { startApi, stopApi } = require('./core/api');
+
+const log = createModuleLogger('Main');
 
 // ===================================
 // Création du client Discord
@@ -10,81 +24,95 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
   partials: [
     Partials.Message,
     Partials.Channel,
+    Partials.Reaction,
     Partials.GuildMember,
+    Partials.User,
   ],
+  allowedMentions: { parse: ['users', 'roles'], repliedUser: true },
 });
 
 // ===================================
-// Chargement des commandes
+// Démarrage séquentiel
 // ===================================
-client.commands = new Collection();
+async function start() {
+  log.info('=== Ultra Suite Bot v2.0 ===');
+  log.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
 
-function loadCommands(dir) {
-  const items = fs.readdirSync(dir, { withFileTypes: true });
-  for (const item of items) {
-    const fullPath = path.join(dir, item.name);
-    if (item.isDirectory()) {
-      loadCommands(fullPath);
-    } else if (item.name.endsWith('.js')) {
-      const command = require(fullPath);
-      if (command.data && command.execute) {
-        client.commands.set(command.data.name, command);
-        console.log(`  📌 Commande chargée: /${command.data.name}`);
-      }
-    }
-  }
-}
+  // 1. Charger les locales i18n
+  loadLocales();
+  log.info('i18n loaded');
 
-console.log('\n📋 Chargement des commandes...');
-loadCommands(path.join(__dirname, 'commands'));
+  // 2. Initialiser la base de données
+  await db.init();
+  log.info('Database initialized');
 
-// ===================================
-// Chargement des événements
-// ===================================
-console.log('\n📡 Chargement des événements...');
-const eventsPath = path.join(__dirname, 'events');
-const eventFiles = fs.readdirSync(eventsPath).filter(f => f.endsWith('.js'));
+  // 3. Charger les commandes
+  loadCommands(client);
 
-for (const file of eventFiles) {
-  const event = require(path.join(eventsPath, file));
-  if (event.once) {
-    client.once(event.name, (...args) => event.execute(...args));
-  } else {
-    client.on(event.name, (...args) => event.execute(...args));
-  }
-  console.log(`  📡 Événement chargé: ${event.name}`);
+  // 4. Charger les composants (boutons/selects/modals)
+  loadComponents(client);
+
+  // 5. Charger les événements
+  loadEvents(client);
+
+  // 6. Connexion à Discord
+  await client.login(process.env.BOT_TOKEN);
+  log.info(`Logged in as ${client.user.tag}`);
+
+  // 7. Démarrer le scheduler CRON
+  startScheduler(client);
+
+  // 8. Démarrer l'API (si activée)
+  startApi(client);
+
+  log.info('Bot fully started!');
 }
 
 // ===================================
-// Gestion des erreurs
+// Arrêt propre (SIGINT / SIGTERM)
 // ===================================
-client.on('error', (error) => {
-  console.error('[CLIENT ERROR]', error);
+async function shutdown(signal) {
+  log.info(`Received ${signal}, shutting down...`);
+
+  stopScheduler();
+  stopApi();
+  client.destroy();
+  await db.close();
+
+  log.info('Goodbye!');
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ===================================
+// Gestion des erreurs non interceptées
+// ===================================
+process.on('unhandledRejection', (err) => {
+  log.error('Unhandled rejection:', err);
 });
 
-process.on('unhandledRejection', (error) => {
-  console.error('[UNHANDLED REJECTION]', error);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('[UNCAUGHT EXCEPTION]', error);
+process.on('uncaughtException', (err) => {
+  log.error('Uncaught exception:', err);
+  // On sort proprement après une exception fatale
+  shutdown('uncaughtException');
 });
 
 // ===================================
-// Connexion
+// GO!
 // ===================================
-if (!process.env.BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN manquant dans le fichier .env');
-  console.error('   Copiez .env.example en .env et ajoutez votre token.');
+start().catch((err) => {
+  log.error('Failed to start bot:', err);
   process.exit(1);
-}
-
-client.login(process.env.BOT_TOKEN);
+});

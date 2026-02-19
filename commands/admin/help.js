@@ -1,108 +1,143 @@
-const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { COLORS } = require('../../utils/logger');
+// ===================================
+// Ultra Suite — Admin: /help
+// Aide interactive avec catégories
+// ===================================
+
+const {
+  SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  ActionRowBuilder,
+  ComponentType,
+} = require('discord.js');
+const { createEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'admin',
   data: new SlashCommandBuilder()
     .setName('help')
-    .setDescription('❓ Afficher la liste des commandes disponibles')
-    .addStringOption(opt =>
-      opt.setName('catégorie')
-        .setDescription('Filtrer par catégorie')
-        .addChoices(
-          { name: '🔨 Modération', value: 'moderation' },
-          { name: '🎫 Tickets', value: 'tickets' },
-          { name: '⚙️ Administration', value: 'admin' },
-        )
+    .setDescription('Affiche l\'aide du bot')
+    .addStringOption((opt) =>
+      opt
+        .setName('commande')
+        .setDescription('Nom d\'une commande spécifique')
+        .setRequired(false)
     ),
 
-  async execute(interaction) {
-    const category = interaction.options.getString('catégorie');
+  async execute(interaction, client) {
+    const specificCmd = interaction.options.getString('commande');
 
-    const categories = {
-      moderation: {
-        emoji: '🔨',
-        title: 'Modération',
-        commands: [
-          { name: '/ban', desc: 'Bannir un utilisateur' },
-          { name: '/unban', desc: 'Débannir un utilisateur' },
-          { name: '/kick', desc: 'Expulser un utilisateur' },
-          { name: '/softban', desc: 'Softban (expulser + supprimer messages)' },
-          { name: '/mute', desc: 'Rendre muet un utilisateur (timeout)' },
-          { name: '/unmute', desc: 'Retirer le mute' },
-          { name: '/warn', desc: 'Avertir un utilisateur' },
-          { name: '/warnings list', desc: 'Voir les avertissements' },
-          { name: '/warnings remove', desc: 'Retirer un avertissement' },
-          { name: '/warnings clear', desc: 'Supprimer tous les avertissements' },
-          { name: '/clear', desc: 'Supprimer des messages' },
-          { name: '/lock on/off', desc: 'Verrouiller/Déverrouiller un salon' },
-          { name: '/slowmode', desc: 'Définir le mode lent' },
-          { name: '/nick', desc: 'Modifier un surnom' },
-          { name: '/userinfo', desc: 'Infos et historique d\'un utilisateur' },
-          { name: '/modlogs', desc: 'Historique de modération' },
-          { name: '/banlist', desc: 'Liste des utilisateurs bannis' },
-        ],
-      },
-      tickets: {
-        emoji: '🎫',
-        title: 'Tickets',
-        commands: [
-          { name: '/ticket panel', desc: 'Créer un panneau de tickets' },
-          { name: '/ticket close', desc: 'Fermer le ticket actuel' },
-          { name: '/ticket add', desc: 'Ajouter un utilisateur au ticket' },
-          { name: '/ticket remove', desc: 'Retirer un utilisateur du ticket' },
-        ],
-      },
-      admin: {
-        emoji: '⚙️',
-        title: 'Administration',
-        commands: [
-          { name: '/setup logs', desc: 'Définir le salon de logs' },
-          { name: '/setup welcome', desc: 'Définir le salon de bienvenue' },
-          { name: '/setup welcome-message', desc: 'Message de bienvenue personnalisé' },
-          { name: '/setup leave-message', desc: 'Message de départ personnalisé' },
-          { name: '/setup ticket-category', desc: 'Catégorie des tickets' },
-          { name: '/setup ticket-logs', desc: 'Salon de logs des tickets' },
-          { name: '/setup mod-role', desc: 'Rôle modérateur' },
-          { name: '/setup antispam', desc: 'Activer/Désactiver l\'anti-spam' },
-          { name: '/setup view', desc: 'Voir la configuration' },
-          { name: '/serverinfo', desc: 'Informations du serveur' },
-          { name: '/help', desc: 'Cette commande' },
-        ],
-      },
-    };
+    // === Aide pour une commande spécifique ===
+    if (specificCmd) {
+      const cmd = client.commands.get(specificCmd);
+      if (!cmd) {
+        return interaction.reply({ content: `❌ Commande \`/${specificCmd}\` introuvable.`, ephemeral: true });
+      }
 
-    if (category && categories[category]) {
-      const cat = categories[category];
-      const embed = new EmbedBuilder()
-        .setTitle(`${cat.emoji} ${cat.title}`)
-        .setColor(COLORS.BLUE)
-        .setDescription(
-          cat.commands.map(c => `\`${c.name}\` — ${c.desc}`).join('\n')
-        )
-        .setTimestamp();
+      const embed = createEmbed('info')
+        .setTitle(`📖 /${cmd.data.name}`)
+        .setDescription(cmd.data.description || 'Aucune description')
+        .addFields(
+          { name: 'Module', value: cmd.module || 'N/A', inline: true },
+          { name: 'Cooldown', value: cmd.cooldown ? `${cmd.cooldown}s` : 'Aucun', inline: true }
+        );
+
+      // Sous-commandes
+      const subs = cmd.data.options?.filter((o) => o.toJSON?.().type === 1); // SUB_COMMAND
+      if (subs?.length) {
+        embed.addFields({
+          name: 'Sous-commandes',
+          value: subs.map((s) => {
+            const json = s.toJSON();
+            return `\`/${cmd.data.name} ${json.name}\` — ${json.description}`;
+          }).join('\n'),
+        });
+      }
 
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    // Afficher toutes les catégories
-    const embed = new EmbedBuilder()
-      .setTitle('❓ Aide — Liste des commandes')
-      .setColor(COLORS.BLUE)
-      .setDescription('Utilisez `/help catégorie` pour voir les commandes d\'une catégorie spécifique.')
-      .setTimestamp();
-
-    for (const [key, cat] of Object.entries(categories)) {
-      embed.addFields({
-        name: `${cat.emoji} ${cat.title}`,
-        value: cat.commands.map(c => `\`${c.name}\``).join(', '),
-      });
-    }
-
-    embed.addFields({
-      name: '📋 Logs automatiques',
-      value: 'Messages supprimés/modifiés, arrivées/départs, changements de rôles, surnoms, vocaux, salons créés/supprimés, timeouts',
+    // === Menu d'aide par catégories ===
+    const categories = new Map();
+    client.commands.forEach((cmd) => {
+      const mod = cmd.module || 'other';
+      if (!categories.has(mod)) categories.set(mod, []);
+      categories.get(mod).push(cmd);
     });
 
-    await interaction.reply({ embeds: [embed], ephemeral: true });
+    const categoryLabels = {
+      admin: '⚙️ Administration',
+      moderation: '🔨 Modération',
+      logs: '📋 Logs',
+      security: '🛡️ Sécurité',
+      onboarding: '👋 Onboarding',
+      roles: '🏷️ Rôles',
+      tickets: '🎫 Tickets',
+      xp: '📊 XP & Niveaux',
+      economy: '💰 Économie',
+      utility: '🔧 Utilitaire',
+      fun: '🎮 Fun',
+      music: '🎵 Musique',
+      tempvoice: '🔊 Vocal Temp',
+      applications: '📝 Candidatures',
+      tags: '🏷️ Tags',
+      events: '📅 Événements',
+      rp: '🎭 RP',
+      other: '📦 Autres',
+    };
+
+    // Embed d'accueil
+    const homeEmbed = createEmbed('info')
+      .setTitle(t('admin.help.title'))
+      .setDescription(t('admin.help.description'))
+      .setThumbnail(client.user.displayAvatarURL())
+      .addFields(
+        [...categories.entries()].map(([mod, cmds]) => ({
+          name: categoryLabels[mod] || mod,
+          value: `${cmds.length} commande(s)`,
+          inline: true,
+        }))
+      );
+
+    // Select menu
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('help_category')
+      .setPlaceholder('Choisir une catégorie...')
+      .addOptions(
+        [...categories.entries()].map(([mod, cmds]) => ({
+          label: (categoryLabels[mod] || mod).replace(/[^\w\s]/g, '').trim(),
+          value: mod,
+          description: `${cmds.length} commande(s)`,
+          emoji: (categoryLabels[mod] || '📦').match(/[\p{Emoji_Presentation}]/u)?.[0] || '📦',
+        }))
+      );
+
+    const row = new ActionRowBuilder().addComponents(select);
+    const reply = await interaction.reply({ embeds: [homeEmbed], components: [row], ephemeral: true });
+
+    // Collector pour le select
+    const collector = reply.createMessageComponentCollector({
+      componentType: ComponentType.StringSelect,
+      time: 120_000,
+    });
+
+    collector.on('collect', async (i) => {
+      const mod = i.values[0];
+      const cmds = categories.get(mod) || [];
+
+      const embed = createEmbed('info')
+        .setTitle(categoryLabels[mod] || mod)
+        .setDescription(
+          cmds
+            .map((c) => `\`/${c.data.name}\` — ${c.data.description || 'N/A'}`)
+            .join('\n') || 'Aucune commande.'
+        );
+
+      await i.update({ embeds: [embed], components: [row] });
+    });
+
+    collector.on('end', () => {
+      interaction.editReply({ components: [] }).catch(() => {});
+    });
   },
 };

@@ -1,65 +1,51 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /unban
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const { successEmbed, errorEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('unban')
-    .setDescription('🔓 Débannir un utilisateur')
-    .addStringOption(opt =>
-      opt.setName('utilisateur_id')
-        .setDescription('L\'ID de l\'utilisateur à débannir')
-        .setRequired(true)
-    )
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison du débannissement'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+    .setDescription('Débannit un utilisateur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addStringOption((opt) => opt.setName('id').setDescription('ID de l\'utilisateur').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison du débannissement')),
 
   async execute(interaction) {
-    const userId = interaction.options.getString('utilisateur_id');
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
-
-    // Vérifier que l'ID est valide
-    if (!/^\d{17,20}$/.test(userId)) {
-      return interaction.reply(errorReply('❌ ID invalide. Un ID Discord est composé de 17 à 20 chiffres.'));
-    }
+    const userId = interaction.options.getString('id');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
 
     try {
-      // Vérifier que l'utilisateur est bien banni
-      const banList = await interaction.guild.bans.fetch();
-      const bannedUser = banList.get(userId);
-
-      if (!bannedUser) {
-        return interaction.reply(errorReply('❌ Cet utilisateur n\'est pas banni.'));
-      }
-
-      // Débannir
-      await interaction.guild.members.unban(userId, `${interaction.user.tag}: ${reason}`);
-
-      const target = bannedUser.user;
-
-      addModLog(interaction.guild.id, 'UNBAN', userId, interaction.user.id, reason);
-
-      await modLog(interaction.guild, {
-        action: 'Débannissement',
-        moderator: interaction.user,
-        target,
-        reason,
-        color: COLORS.GREEN,
-      });
-
-      const embed = new EmbedBuilder()
-        .setTitle('🔓 Utilisateur débanni')
-        .setColor(COLORS.GREEN)
-        .setDescription(`**${target.tag}** a été débanni du serveur.`)
-        .addFields({ name: '📝 Raison', value: reason })
-        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
-        .setTimestamp();
-
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[UNBAN]', error);
-      await interaction.reply(errorReply('❌ Impossible de débannir cet utilisateur.'));
+      await interaction.guild.bans.remove(userId, `${reason} — par ${interaction.user.tag}`);
+    } catch {
+      return interaction.reply({ embeds: [errorEmbed('❌ Utilisateur non banni ou ID invalide.')], ephemeral: true });
     }
+
+    // Enregistrer
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type: 'UNBAN',
+      targetId: userId,
+      moderatorId: interaction.user.id,
+      reason,
+    });
+
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: userId,
+      targetType: 'user',
+      details: { action: 'UNBAN', reason, caseNumber },
+    });
+
+    await interaction.reply({ embeds: [successEmbed(t('mod.unban.success', undefined, { user: userId }))] });
   },
 };
