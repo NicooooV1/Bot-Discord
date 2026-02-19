@@ -193,5 +193,27 @@ module.exports = {
           db('daily_metrics').insert({ guild_id: message.guild.id, date: today, messages: 1 }).catch(() => {});
         });
     } catch {}
+
+    // ===================================
+    // CUSTOM COMMANDS : match triggers
+    // ===================================
+    try {
+      const db = getDb();
+      const customCmds = await db('custom_commands')
+        .where({ guild_id: message.guild.id, enabled: true });
+
+      for (const cmd of customCmds) {
+        if (message.content.toLowerCase().startsWith(cmd.trigger.toLowerCase())) {
+          const response = cmd.response
+            .replace(/\{\{user\}\}/g, message.author.toString())
+            .replace(/\{\{server\}\}/g, message.guild.name)
+            .replace(/\{\{channel\}\}/g, message.channel.toString())
+            .replace(/\{\{memberCount\}\}/g, message.guild.memberCount);
+
+          await message.channel.send(response).catch(() => {});
+          break;
+        }
+      }
+    } catch {}
   },
 };

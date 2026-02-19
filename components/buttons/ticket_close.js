@@ -12,7 +12,8 @@ module.exports = {
   id: 'ticket_close',
 
   async execute(interaction) {
-    const ticket = await ticketQueries.getByChannel(interaction.channel.id);
+    try {
+      const ticket = await ticketQueries.getByChannel(interaction.channel.id);
     if (!ticket) {
       return interaction.reply({ embeds: [errorEmbed(t('tickets.not_ticket'))], ephemeral: true });
     }
@@ -43,5 +44,8 @@ module.exports = {
 
     await interaction.reply({ embeds: [successEmbed(t('tickets.close', undefined, { user: interaction.user.tag }))] });
     setTimeout(() => interaction.channel.delete('Ticket fermé').catch(() => {}), 5000);
+    } catch (err) {
+      return interaction.reply({ content: '❌ Impossible de fermer le ticket.', ephemeral: true }).catch(() => {});
+    }
   },
 };

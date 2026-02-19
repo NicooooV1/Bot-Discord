@@ -11,6 +11,7 @@ const { formatDuration } = require('../../utils/formatters');
 
 module.exports = {
   module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('case')
     .setDescription('Voir ou révoquer un dossier de modération')

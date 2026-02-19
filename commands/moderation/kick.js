@@ -33,6 +33,8 @@ module.exports = {
       return interaction.reply({ embeds: [errorEmbed(t(`common.${check.reason}`))], ephemeral: true });
     }
 
+    await interaction.deferReply();
+
     // DM
     try {
       await target.user.send(t('mod.kick.dm', undefined, { guild: interaction.guild.name, reason }));
@@ -67,7 +69,7 @@ module.exports = {
       caseNumber,
     });
 
-    await interaction.reply({ embeds: [embed] });
+    await interaction.editReply({ embeds: [embed] });
 
     const config = await configService.get(interaction.guild.id);
     if (config.modLogChannel) {

@@ -8,6 +8,7 @@ const { infoEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'music',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('music')
     .setDescription('🎵 Module musique (bientôt disponible)')

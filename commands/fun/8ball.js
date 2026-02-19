@@ -28,6 +28,7 @@ const ANSWERS = [
 
 module.exports = {
   module: 'fun',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('8ball')
     .setDescription('Pose une question à la boule magique 🎱')

@@ -1,6 +1,7 @@
 // ===================================
 // Ultra Suite — Migration initiale
 // Toutes les tables du CDC v2.0
+// MySQL (mysql2) — utf8mb4
 // ===================================
 
 /**
@@ -13,14 +14,14 @@ exports.up = function (knex) {
     // Guilds (config JSON par serveur)
     // ===================================
     .createTable('guilds', (t) => {
-      t.text('id').primary();                    // Discord guild ID
-      t.text('name').notNullable();
-      t.text('owner_id').notNullable();
-      t.json('config').defaultTo('{}');          // Toute la config du serveur
-      t.json('modules_enabled').defaultTo('{}'); // { moderation: true, xp: false, ... }
-      t.json('theme').defaultTo('{}');           // { primary: "#5865F2", ... }
-      t.text('locale').defaultTo('fr');
-      t.text('api_token');                       // Hashé bcrypt — dashboard futur
+      t.string('id', 20).primary();             // Discord guild ID (snowflake)
+      t.string('name', 255).notNullable();
+      t.string('owner_id', 20).notNullable();
+      t.json('config');                          // Toute la config du serveur
+      t.json('modules_enabled');                 // { moderation: true, xp: false, ... }
+      t.json('theme');                           // { primary: "#5865F2", ... }
+      t.string('locale', 10).defaultTo('fr');
+      t.string('api_token', 255);               // Hashé bcrypt — dashboard futur
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.datetime('updated_at').defaultTo(knex.fn.now());
     })
@@ -30,8 +31,8 @@ exports.up = function (knex) {
     // ===================================
     .createTable('users', (t) => {
       t.increments('id').primary();
-      t.text('user_id').notNullable();           // Discord user ID
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('user_id', 20).notNullable();    // Discord user ID
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
       t.integer('xp').defaultTo(0);
       t.integer('level').defaultTo(0);
       t.integer('reputation').defaultTo(0);
@@ -39,7 +40,7 @@ exports.up = function (knex) {
       t.integer('bank').defaultTo(0);
       t.integer('total_messages').defaultTo(0);
       t.integer('voice_minutes').defaultTo(0);
-      t.json('inventory').defaultTo('[]');
+      t.json('inventory');                       // []
       t.datetime('last_daily');
       t.datetime('last_weekly');
       t.datetime('last_message_xp');
@@ -53,18 +54,18 @@ exports.up = function (knex) {
     // ===================================
     .createTable('sanctions', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
       t.integer('case_number').notNullable();
-      t.text('type').notNullable();              // WARN, TIMEOUT, KICK, BAN, SOFTBAN, TEMPBAN, UNBAN, UNMUTE
-      t.text('target_id').notNullable();
-      t.text('moderator_id').notNullable();
+      t.string('type', 20).notNullable();       // WARN, TIMEOUT, KICK, BAN, SOFTBAN, TEMPBAN, UNBAN, UNMUTE
+      t.string('target_id', 20).notNullable();
+      t.string('moderator_id', 20).notNullable();
       t.text('reason');
       t.integer('duration');                     // Secondes (pour timeout/tempban)
       t.boolean('active').defaultTo(true);
       t.json('evidence');                        // { links, messageIds }
       t.datetime('expires_at');
       t.datetime('revoked_at');
-      t.text('revoked_by');
+      t.string('revoked_by', 20);
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.unique(['guild_id', 'case_number']);
       t.index(['guild_id', 'target_id']);
@@ -77,12 +78,12 @@ exports.up = function (knex) {
     // ===================================
     .createTable('logs', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('type').notNullable();              // MESSAGE_DELETE, MEMBER_JOIN, MOD_ACTION, CONFIG_CHANGE, etc.
-      t.text('actor_id');
-      t.text('target_id');
-      t.text('target_type');                     // user, channel, role, message
-      t.json('details').defaultTo('{}');
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('type', 50).notNullable();       // MESSAGE_DELETE, MEMBER_JOIN, MOD_ACTION, CONFIG_CHANGE, etc.
+      t.string('actor_id', 20);
+      t.string('target_id', 20);
+      t.string('target_type', 20);              // user, channel, role, message
+      t.json('details');                         // {}
       t.datetime('timestamp').defaultTo(knex.fn.now());
       t.index(['guild_id', 'type', 'timestamp']);
       t.index(['guild_id', 'actor_id']);
@@ -94,19 +95,19 @@ exports.up = function (knex) {
     // ===================================
     .createTable('tickets', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('channel_id').unique();
-      t.text('opener_id').notNullable();
-      t.text('category').defaultTo('general');
-      t.text('subject');
-      t.text('status').defaultTo('open');        // open, in_progress, waiting, resolved, closed
-      t.text('priority').defaultTo('normal');     // low, normal, high, urgent
-      t.text('assignee_id');
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('channel_id', 20).unique();
+      t.string('opener_id', 20).notNullable();
+      t.string('category', 50).defaultTo('general');
+      t.string('subject', 255);
+      t.string('status', 20).defaultTo('open'); // open, in_progress, waiting, resolved, closed
+      t.string('priority', 20).defaultTo('normal'); // low, normal, high, urgent
+      t.string('assignee_id', 20);
       t.json('form_answers');
       t.text('transcript');                      // Contenu texte du transcript
       t.integer('rating');                       // 1-5
       t.text('rating_comment');
-      t.text('closed_by');
+      t.string('closed_by', 20);
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.datetime('closed_at');
       t.index(['guild_id', 'status']);
@@ -118,13 +119,13 @@ exports.up = function (knex) {
     // ===================================
     .createTable('applications', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('applicant_id').notNullable();
-      t.text('form_type').defaultTo('default');
-      t.json('answers').defaultTo('{}');
-      t.text('status').defaultTo('pending');     // pending, reviewing, interview, accepted, rejected
-      t.json('notes').defaultTo('[]');           // [{ staffId, note, date }]
-      t.text('reviewer_id');
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('applicant_id', 20).notNullable();
+      t.string('form_type', 50).defaultTo('default');
+      t.json('answers');                         // {}
+      t.string('status', 20).defaultTo('pending'); // pending, reviewing, interview, accepted, rejected
+      t.json('notes');                           // [{ staffId, note, date }]
+      t.string('reviewer_id', 20);
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.datetime('updated_at').defaultTo(knex.fn.now());
       t.index(['guild_id', 'status']);
@@ -135,15 +136,15 @@ exports.up = function (knex) {
     // ===================================
     .createTable('reports', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('reporter_id').notNullable();
-      t.text('target_type').notNullable();       // user, message
-      t.text('target_id').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('reporter_id', 20).notNullable();
+      t.string('target_type', 20).notNullable(); // user, message
+      t.string('target_id', 20).notNullable();
       t.text('reason').notNullable();
-      t.text('severity').defaultTo('normal');    // low, normal, high, critical
-      t.text('status').defaultTo('pending');     // pending, reviewing, resolved, dismissed
-      t.json('evidence').defaultTo('{}');
-      t.text('assignee_id');
+      t.string('severity', 20).defaultTo('normal'); // low, normal, high, critical
+      t.string('status', 20).defaultTo('pending'); // pending, reviewing, resolved, dismissed
+      t.json('evidence');                        // {}
+      t.string('assignee_id', 20);
       t.text('resolution');
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.datetime('resolved_at');
@@ -155,14 +156,14 @@ exports.up = function (knex) {
     // ===================================
     .createTable('role_menus', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('channel_id').notNullable();
-      t.text('message_id');
-      t.text('type').defaultTo('buttons');       // buttons, select, reactions
-      t.text('mode').defaultTo('multi');         // single, multi
-      t.text('title').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('channel_id', 20).notNullable();
+      t.string('message_id', 20);
+      t.string('type', 20).defaultTo('buttons'); // buttons, select, reactions
+      t.string('mode', 20).defaultTo('multi');   // single, multi
+      t.string('title', 255).notNullable();
       t.text('description');
-      t.json('options').defaultTo('[]');         // [{ roleId, label, emoji, description }]
+      t.json('options');                         // [{ roleId, label, emoji, description }]
     })
 
     // ===================================
@@ -170,9 +171,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('temp_roles', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
-      t.text('role_id').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
+      t.string('role_id', 20).notNullable();
       t.datetime('expires_at').notNullable();
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.index('expires_at');
@@ -183,15 +184,16 @@ exports.up = function (knex) {
     // ===================================
     .createTable('events', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('title').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('title', 255).notNullable();
       t.text('description');
-      t.text('channel_id');
-      t.text('creator_id').notNullable();
+      t.string('channel_id', 20);
+      t.string('creator_id', 20).notNullable();
       t.datetime('scheduled_at').notNullable();
       t.integer('duration');                     // minutes
-      t.json('participants').defaultTo('[]');
-      t.json('reminders').defaultTo('[1440, 60, 15]'); // minutes avant
+      t.json('participants');                    // []
+      t.json('reminders');                       // [1440, 60, 15]
+      t.integer('max_participants').unsigned();
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.index(['guild_id', 'scheduled_at']);
     })
@@ -201,12 +203,12 @@ exports.up = function (knex) {
     // ===================================
     .createTable('shop_items', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('name').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('name', 255).notNullable();
       t.text('description');
       t.integer('price').notNullable();
-      t.text('type').notNullable();              // role, item, perk
-      t.json('metadata').defaultTo('{}');        // { roleId, duration, ... }
+      t.string('type', 20).notNullable();       // role, item, perk
+      t.json('metadata');                        // { roleId, duration, ... }
       t.integer('stock');                        // null = illimité
       t.boolean('enabled').defaultTo(true);
     })
@@ -216,9 +218,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('inventories', (t) => {
       t.increments('id').primary();
-      t.text('user_id').notNullable();
-      t.text('guild_id').notNullable();
-      t.integer('item_id').notNullable().references('id').inTable('shop_items').onDelete('CASCADE');
+      t.string('user_id', 20).notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.integer('item_id').unsigned().notNullable().references('id').inTable('shop_items').onDelete('CASCADE');
       t.integer('quantity').defaultTo(1);
       t.datetime('acquired_at').defaultTo(knex.fn.now());
       t.unique(['user_id', 'guild_id', 'item_id']);
@@ -229,11 +231,11 @@ exports.up = function (knex) {
     // ===================================
     .createTable('transactions', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('from_id');                         // null = système
-      t.text('to_id').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('from_id', 20);                  // null = système
+      t.string('to_id', 20).notNullable();
       t.integer('amount').notNullable();
-      t.text('type').notNullable();              // earn, spend, transfer, tax, reward, daily, weekly
+      t.string('type', 30).notNullable();       // earn, spend, transfer, tax, reward, daily, weekly
       t.text('reason');
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.index(['guild_id', 'created_at']);
@@ -244,10 +246,10 @@ exports.up = function (knex) {
     // ===================================
     .createTable('tags', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('name').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('name', 100).notNullable();
       t.json('content').notNullable();           // { text, embeds }
-      t.text('creator_id').notNullable();
+      t.string('creator_id', 20).notNullable();
       t.integer('uses').defaultTo(0);
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.unique(['guild_id', 'name']);
@@ -258,9 +260,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('reminders', (t) => {
       t.increments('id').primary();
-      t.text('guild_id');
-      t.text('user_id').notNullable();
-      t.text('channel_id');                      // null = DM
+      t.string('guild_id', 20);
+      t.string('user_id', 20).notNullable();
+      t.string('channel_id', 20);               // null = DM
       t.text('message').notNullable();
       t.datetime('fire_at').notNullable();
       t.boolean('fired').defaultTo(false);
@@ -273,10 +275,10 @@ exports.up = function (knex) {
     // ===================================
     .createTable('announcements', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('channel_id').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('channel_id', 20).notNullable();
       t.json('content').notNullable();           // { text, embeds }
-      t.text('cron_expr');
+      t.string('cron_expr', 100);
       t.datetime('next_run_at');
       t.boolean('enabled').defaultTo(true);
       t.datetime('created_at').defaultTo(knex.fn.now());
@@ -287,14 +289,14 @@ exports.up = function (knex) {
     // ===================================
     .createTable('custom_commands', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('name').notNullable();
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('name', 100).notNullable();
       t.json('response').notNullable();          // { text, embeds, ephemeral }
-      t.json('required_roles').defaultTo('[]');
+      t.json('required_roles');                  // []
       t.integer('cooldown').defaultTo(0);        // secondes
       t.integer('uses').defaultTo(0);
       t.boolean('enabled').defaultTo(true);
-      t.text('creator_id').notNullable();
+      t.string('creator_id', 20).notNullable();
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.unique(['guild_id', 'name']);
     })
@@ -304,11 +306,11 @@ exports.up = function (knex) {
     // ===================================
     .createTable('cron_tasks', (t) => {
       t.increments('id').primary();
-      t.text('guild_id');
-      t.text('type').notNullable();              // tempban_expire, temprole_expire, reminder, announcement
-      t.text('cron_expr');                       // Expression cron (récurrent)
+      t.string('guild_id', 20);
+      t.string('type', 50).notNullable();       // tempban_expire, temprole_expire, reminder, announcement
+      t.string('cron_expr', 100);               // Expression cron (récurrent)
       t.datetime('run_at');                      // Exécution unique
-      t.json('payload').defaultTo('{}');
+      t.json('payload');                         // {}
       t.boolean('active').defaultTo(true);
       t.datetime('last_run_at');
       t.datetime('created_at').defaultTo(knex.fn.now());
@@ -321,22 +323,22 @@ exports.up = function (knex) {
     // ===================================
     .createTable('security_signals', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
-      t.text('signal_type').notNullable();       // SPAM, RAID, PHISHING, TOKEN_LEAK, MASS_MENTION
-      t.text('severity').defaultTo('medium');    // low, medium, high, critical
-      t.json('evidence').defaultTo('{}');
-      t.text('action_taken');
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
+      t.string('signal_type', 30).notNullable(); // SPAM, RAID, PHISHING, TOKEN_LEAK, MASS_MENTION
+      t.string('severity', 20).defaultTo('medium'); // low, medium, high, critical
+      t.json('evidence');                        // {}
+      t.string('action_taken', 100);
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.index(['guild_id', 'signal_type', 'created_at']);
     })
 
     .createTable('trust_scores', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
       t.integer('score').defaultTo(0);
-      t.json('factors').defaultTo('{}');
+      t.json('factors');                         // {}
       t.datetime('calculated_at').defaultTo(knex.fn.now());
       t.unique(['guild_id', 'user_id']);
     })
@@ -346,9 +348,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('onboarding_states', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
-      t.text('step').defaultTo('pending');       // pending, rules_accepted, quiz_passed, verified
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
+      t.string('step', 30).defaultTo('pending'); // pending, rules_accepted, quiz_passed, verified
       t.json('answers');
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.datetime('verified_at');
@@ -360,11 +362,11 @@ exports.up = function (knex) {
     // ===================================
     .createTable('permission_rules', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('scope_type').notNullable();        // role, user, channel
-      t.text('scope_id').notNullable();
-      t.text('command_key').notNullable();        // "ban", "ticket.close", "*"
-      t.text('effect').notNullable();            // allow, deny
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('scope_type', 20).notNullable();  // role, user, channel
+      t.string('scope_id', 20).notNullable();
+      t.string('command_key', 100).notNullable(); // "ban", "ticket.close", "*"
+      t.string('effect', 10).notNullable();      // allow, deny
       t.integer('priority').defaultTo(0);
       t.index(['guild_id', 'command_key']);
     })
@@ -374,7 +376,7 @@ exports.up = function (knex) {
     // ===================================
     .createTable('daily_metrics', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
+      t.string('guild_id', 20).notNullable();
       t.date('date').notNullable();
       t.integer('messages').defaultTo(0);
       t.integer('active_users').defaultTo(0);
@@ -392,9 +394,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('temp_voice_channels', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('channel_id').notNullable().unique();
-      t.text('owner_id').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('channel_id', 20).notNullable().unique();
+      t.string('owner_id', 20).notNullable();
       t.datetime('created_at').defaultTo(knex.fn.now());
     })
 
@@ -403,9 +405,9 @@ exports.up = function (knex) {
     // ===================================
     .createTable('voice_sessions', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
-      t.text('channel_id').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
+      t.string('channel_id', 20).notNullable();
       t.datetime('joined_at').defaultTo(knex.fn.now());
       t.datetime('left_at');
       t.integer('duration');                     // secondes
@@ -417,16 +419,16 @@ exports.up = function (knex) {
     // ===================================
     .createTable('rp_characters', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('user_id').notNullable();
-      t.text('first_name').notNullable();
-      t.text('last_name').notNullable();
+      t.string('guild_id', 20).notNullable();
+      t.string('user_id', 20).notNullable();
+      t.string('first_name', 100).notNullable();
+      t.string('last_name', 100).notNullable();
       t.integer('age');
       t.text('description');
       t.text('photo_url');
-      t.text('status').defaultTo('active');      // active, dead, archived
-      t.json('inventory').defaultTo('[]');
-      t.json('record').defaultTo('[]');          // Casier judiciaire RP
+      t.string('status', 20).defaultTo('active'); // active, dead, archived
+      t.json('inventory');                       // []
+      t.json('record');                          // [] — Casier judiciaire RP
       t.datetime('created_at').defaultTo(knex.fn.now());
       t.index(['guild_id', 'user_id']);
     })
@@ -436,12 +438,12 @@ exports.up = function (knex) {
     // ===================================
     .createTable('integrations', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable().references('id').inTable('guilds').onDelete('CASCADE');
-      t.text('provider').notNullable();          // twitch, youtube, github, etc.
-      t.text('channel_id').notNullable();        // Discord channel destination
-      t.json('settings').defaultTo('{}');
+      t.string('guild_id', 20).notNullable().references('id').inTable('guilds').onDelete('CASCADE');
+      t.string('provider', 50).notNullable();   // twitch, youtube, github, etc.
+      t.string('channel_id', 20).notNullable(); // Discord channel destination
+      t.json('settings');                        // {}
       t.boolean('enabled').defaultTo(true);
-      t.text('cursor');                          // Dernier event traité (polling)
+      t.string('cursor', 255);                  // Dernier event traité (polling)
       t.datetime('updated_at').defaultTo(knex.fn.now());
       t.unique(['guild_id', 'provider']);
     })
@@ -451,10 +453,10 @@ exports.up = function (knex) {
     // ===================================
     .createTable('automod_filters', (t) => {
       t.increments('id').primary();
-      t.text('guild_id').notNullable();
-      t.text('type').notNullable();              // word, regex, domain, filetype
+      t.string('guild_id', 20).notNullable();
+      t.string('type', 20).notNullable();       // word, regex, domain, filetype
       t.text('pattern').notNullable();
-      t.text('action').defaultTo('delete');      // delete, warn, timeout, ban
+      t.string('action', 20).defaultTo('delete'); // delete, warn, timeout, ban
       t.boolean('enabled').defaultTo(true);
       t.index(['guild_id', 'type']);
     });

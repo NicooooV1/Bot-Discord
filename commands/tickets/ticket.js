@@ -18,6 +18,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   module: 'tickets',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('ticket')
     .setDescription('Système de tickets')

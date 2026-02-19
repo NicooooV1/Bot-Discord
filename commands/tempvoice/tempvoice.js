@@ -9,6 +9,7 @@ const { successEmbed, errorEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'tempvoice',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('tempvoice')
     .setDescription('Gère ton salon vocal temporaire')

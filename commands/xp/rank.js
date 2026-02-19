@@ -27,7 +27,7 @@ module.exports = {
 
     const embed = createEmbed('primary')
       .setTitle(`📊 Rang de ${user.username}`)
-      .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+      .setThumbnail(user.displayAvatarURL({ size: 256 }))
       .addFields(
         { name: 'Niveau', value: `**${level}**`, inline: true },
         { name: 'XP', value: `**${dbUser.xp}** / ${needed}`, inline: true },

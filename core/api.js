@@ -41,7 +41,7 @@ function startApi(client) {
   app.get('/api/info', (req, res) => {
     res.json({
       name: 'Ultra Suite Bot',
-      version: require('../../package.json').version,
+      version: require('../package.json').version,
       guilds: client.guilds.cache.size,
     });
   });

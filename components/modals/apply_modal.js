@@ -11,7 +11,8 @@ module.exports = {
   id: 'apply_modal',
 
   async execute(interaction) {
-    const q1 = interaction.fields.getTextInputValue('apply_q1');
+    try {
+      const q1 = interaction.fields.getTextInputValue('apply_q1');
     const q2 = interaction.fields.getTextInputValue('apply_q2');
     const q3 = interaction.fields.getTextInputValue('apply_q3');
 
@@ -27,8 +28,8 @@ module.exports = {
 
     // Envoyer dans le salon de logs si configuré
     const config = await ConfigService.get(interaction.guild.id);
-    if (config.modules?.applications?.log_channel) {
-      const channel = interaction.guild.channels.cache.get(config.modules.applications.log_channel);
+    if (config.modLogChannel) {
+      const channel = interaction.guild.channels.cache.get(config.modLogChannel);
       if (channel) {
         const embed = createEmbed('primary')
           .setTitle(`📝 Nouvelle candidature #${id}`)
@@ -48,5 +49,8 @@ module.exports = {
       embeds: [successEmbed('✅ Candidature envoyée ! Tu seras notifié de la décision.')],
       ephemeral: true,
     });
+    } catch (err) {
+      return interaction.reply({ content: '❌ Impossible d\'envoyer la candidature.', ephemeral: true }).catch(() => {});
+    }
   },
 };

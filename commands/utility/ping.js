@@ -7,6 +7,7 @@ const { createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'utility',
+  cooldown: 3,
   data: new SlashCommandBuilder().setName('ping').setDescription('Affiche la latence du bot'),
 
   async execute(interaction) {

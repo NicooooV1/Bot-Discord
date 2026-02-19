@@ -9,6 +9,7 @@ const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'tags',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('tag')
     .setDescription('Gère les tags / FAQ')
@@ -58,8 +59,13 @@ module.exports = {
 
         await db('tags').where('id', tag.id).increment('uses', 1);
 
-        const tagContent = JSON.parse(tag.content);
-        return interaction.reply({ content: tagContent.text || tag.content });
+        let tagContent;
+        try {
+          tagContent = JSON.parse(tag.content);
+        } catch {
+          return interaction.reply({ content: String(tag.content) });
+        }
+        return interaction.reply({ content: tagContent.text || String(tag.content) });
       }
 
       case 'create': {

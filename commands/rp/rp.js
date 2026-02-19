@@ -9,6 +9,7 @@ const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'rp',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('rp')
     .setDescription('Module jeu de rôle')

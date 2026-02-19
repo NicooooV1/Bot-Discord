@@ -11,6 +11,7 @@ const { relativeTime, formatDuration } = require('../../utils/formatters');
 
 module.exports = {
   module: 'moderation',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('modlogs')
     .setDescription('Affiche l\'historique de modération d\'un membre')

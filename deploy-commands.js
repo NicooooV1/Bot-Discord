@@ -8,9 +8,9 @@ require('dotenv').config();
 const { REST, Routes } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
-const logger = require('./core/logger');
+const { logger } = require('./core/logger');
 
-const commands = [];
+const commandMap = new Map();
 const commandsPath = path.join(__dirname, 'commands');
 
 function loadCommandsRecursive(dir) {
@@ -23,8 +23,13 @@ function loadCommandsRecursive(dir) {
       try {
         const cmd = require(fullPath);
         if (cmd?.data?.toJSON) {
-          commands.push(cmd.data.toJSON());
-          logger.info(`[Deploy] Chargé : ${cmd.data.name}`);
+          const name = cmd.data.name;
+          if (commandMap.has(name)) {
+            logger.warn(`[Deploy] Doublon ignoré : ${name} (${fullPath})`);
+          } else {
+            commandMap.set(name, cmd.data.toJSON());
+            logger.info(`[Deploy] Chargé : ${name}`);
+          }
         }
       } catch (err) {
         logger.error(`[Deploy] Erreur chargement ${fullPath}: ${err.message}`);
@@ -34,6 +39,7 @@ function loadCommandsRecursive(dir) {
 }
 
 loadCommandsRecursive(commandsPath);
+const commands = [...commandMap.values()];
 
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 

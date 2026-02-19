@@ -6,6 +6,7 @@ const { SlashCommandBuilder } = require('discord.js');
 
 module.exports = {
   module: 'fun',
+  cooldown: 2,
   data: new SlashCommandBuilder()
     .setName('dice')
     .setDescription('Lance un dé 🎲')

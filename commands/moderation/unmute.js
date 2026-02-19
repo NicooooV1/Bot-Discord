@@ -1,51 +1,70 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /unmute
+// Retire le timeout d'un membre
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const configService = require('../../core/configService');
+const { modEmbed, errorEmbed, successEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('unmute')
     .setDescription('🔊 Retirer le mute d\'un utilisateur')
-    .addUserOption(opt => opt.setName('utilisateur').setDescription('L\'utilisateur à unmute').setRequired(true))
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison du unmute'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à unmute').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison du unmute')),
 
   async execute(interaction) {
-    const target = interaction.options.getUser('utilisateur');
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
+    const target = interaction.options.getMember('membre');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
 
-    const member = interaction.guild.members.cache.get(target.id);
-    if (!member) return interaction.reply(errorReply('❌ Cet utilisateur n\'est pas sur le serveur.'));
-
-    if (!member.isCommunicationDisabled()) {
-      return interaction.reply(errorReply('❌ Cet utilisateur n\'est pas muté.'));
+    if (!target) {
+      return interaction.reply({ embeds: [errorEmbed(t('common.invalid_user'))], ephemeral: true });
     }
 
-    try {
-      await member.timeout(null, `${interaction.user.tag}: ${reason}`);
+    if (!target.isCommunicationDisabled()) {
+      return interaction.reply({ embeds: [errorEmbed('❌ Cet utilisateur n\'est pas muté.')], ephemeral: true });
+    }
 
-      addModLog(interaction.guild.id, 'UNMUTE', target.id, interaction.user.id, reason);
+    await target.timeout(null, `${reason} — par ${interaction.user.tag}`);
 
-      await modLog(interaction.guild, {
-        action: 'Unmute',
-        moderator: interaction.user,
-        target,
-        reason,
-        color: COLORS.GREEN,
-      });
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type: 'UNMUTE',
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      reason,
+    });
 
-      const embed = new EmbedBuilder()
-        .setTitle('🔊 Utilisateur unmuté')
-        .setColor(COLORS.GREEN)
-        .setDescription(`**${target.tag}** n'est plus muté.`)
-        .addFields({ name: '📝 Raison', value: reason })
-        .setTimestamp();
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: target.id,
+      targetType: 'user',
+      details: { action: 'UNMUTE', reason, caseNumber },
+    });
 
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[UNMUTE]', error);
-      await interaction.reply(errorReply('❌ Impossible d\'unmute cet utilisateur.'));
+    const embed = modEmbed({
+      type: '🔊 Unmute',
+      target: target.user.tag,
+      moderator: interaction.user.tag,
+      reason,
+      caseNumber,
+    });
+
+    await interaction.reply({ embeds: [embed] });
+
+    const config = await configService.get(interaction.guild.id);
+    if (config.modLogChannel) {
+      const logChannel = interaction.guild.channels.cache.get(config.modLogChannel);
+      if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
     }
   },
 };

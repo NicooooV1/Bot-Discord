@@ -16,6 +16,7 @@ const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'applications',
+  cooldown: 10,
   data: new SlashCommandBuilder()
     .setName('apply')
     .setDescription('Gestion des candidatures')

@@ -18,23 +18,30 @@ const sanctionQueries = {
   },
 
   /**
-   * Crée une sanction
+   * Crée une sanction (transaction pour éviter les race conditions sur case_number)
    */
   async create({ guildId, type, targetId, moderatorId, reason, duration, expiresAt, evidence }) {
     const db = getDb();
-    const caseNumber = await this.nextCase(guildId);
-    const [id] = await db('sanctions').insert({
-      guild_id: guildId,
-      case_number: caseNumber,
-      type,
-      target_id: targetId,
-      moderator_id: moderatorId,
-      reason: reason || 'Aucune raison',
-      duration: duration || null,
-      expires_at: expiresAt || null,
-      evidence: evidence ? JSON.stringify(evidence) : null,
+    return db.transaction(async (trx) => {
+      const row = await trx('sanctions')
+        .where('guild_id', guildId)
+        .max('case_number as max')
+        .first();
+      const caseNumber = (row?.max || 0) + 1;
+
+      const [id] = await trx('sanctions').insert({
+        guild_id: guildId,
+        case_number: caseNumber,
+        type,
+        target_id: targetId,
+        moderator_id: moderatorId,
+        reason: reason || 'Aucune raison',
+        duration: duration || null,
+        expires_at: expiresAt || null,
+        evidence: evidence ? JSON.stringify(evidence) : null,
+      });
+      return { id, caseNumber };
     });
-    return { id, caseNumber };
   },
 
   /**

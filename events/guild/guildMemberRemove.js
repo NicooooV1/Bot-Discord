@@ -14,7 +14,12 @@ module.exports = {
   async execute(member) {
     if (member.user.bot) return;
 
-    const config = await configService.get(member.guild.id);
+    let config;
+    try {
+      config = await configService.get(member.guild.id);
+    } catch {
+      return;
+    }
 
     // === LOGS ===
     const logsEnabled = await configService.isModuleEnabled(member.guild.id, 'logs');

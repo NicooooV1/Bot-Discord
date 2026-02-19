@@ -1,78 +1,92 @@
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
-const { addModLog } = require('../../utils/database');
-const { modLog, COLORS } = require('../../utils/logger');
-const { canModerate, parseDuration, formatDuration, errorReply } = require('../../utils/helpers');
+// ===================================
+// Ultra Suite — Moderation: /mute
+// Alias de /timeout pour compatibilité
+// ===================================
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const sanctionQueries = require('../../database/sanctionQueries');
+const logQueries = require('../../database/logQueries');
+const configService = require('../../core/configService');
+const { canModerate } = require('../../utils/permissions');
+const { modEmbed, errorEmbed } = require('../../utils/embeds');
+const { t } = require('../../core/i18n');
+const { parseDuration, formatDuration } = require('../../utils/formatters');
 
 module.exports = {
+  module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('mute')
     .setDescription('🔇 Rendre muet un utilisateur (timeout)')
-    .addUserOption(opt => opt.setName('utilisateur').setDescription('L\'utilisateur à mute').setRequired(true))
-    .addStringOption(opt => opt.setName('durée').setDescription('Durée du mute (ex: 10m, 1h, 1d, 1w)').setRequired(true))
-    .addStringOption(opt => opt.setName('raison').setDescription('Raison du mute'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à mute').setRequired(true))
+    .addStringOption((opt) => opt.setName('duree').setDescription('Durée (ex: 10m, 1h, 1d, 1w)').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison du mute')),
 
   async execute(interaction) {
-    const target = interaction.options.getUser('utilisateur');
-    const durationStr = interaction.options.getString('durée');
-    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
+    const target = interaction.options.getMember('membre');
+    const durationStr = interaction.options.getString('duree');
+    const reason = interaction.options.getString('raison') || 'Aucune raison';
 
-    const member = interaction.guild.members.cache.get(target.id);
-    if (!member) return interaction.reply(errorReply('❌ Cet utilisateur n\'est pas sur le serveur.'));
+    if (!target) {
+      return interaction.reply({ embeds: [errorEmbed(t('common.invalid_user'))], ephemeral: true });
+    }
 
-    const check = canModerate(interaction, target);
-    if (!check.ok) return interaction.reply(errorReply(check.reason));
+    const check = canModerate(interaction.member, target);
+    if (!check.allowed) {
+      return interaction.reply({ embeds: [errorEmbed(t(`common.${check.reason}`))], ephemeral: true });
+    }
 
     const duration = parseDuration(durationStr);
-    if (!duration) return interaction.reply(errorReply('❌ Durée invalide. Utilisez un format comme: `10m`, `1h`, `1d`, `1w`'));
+    if (!duration || duration > 28 * 86400) {
+      return interaction.reply({ embeds: [errorEmbed('❌ Durée invalide (max 28 jours).')], ephemeral: true });
+    }
 
-    // Maximum 28 jours (limitation Discord)
-    const maxDuration = 28 * 24 * 60 * 60 * 1000;
-    if (duration > maxDuration) return interaction.reply(errorReply('❌ La durée maximale est de 28 jours.'));
+    // Discord timeout attend des ms, parseDuration retourne des secondes
+    await target.timeout(duration * 1000, `${reason} — par ${interaction.user.tag}`);
 
+    // DM
     try {
-      await member.timeout(duration, `${interaction.user.tag}: ${reason}`);
+      await target.user.send(`🔇 Vous avez été réduit au silence sur **${interaction.guild.name}** pour **${formatDuration(duration)}**.\nRaison : ${reason}`);
+    } catch {}
 
-      const formattedDuration = formatDuration(duration);
+    // DB
+    const expiresAt = new Date(Date.now() + duration * 1000).toISOString();
+    const { caseNumber } = await sanctionQueries.create({
+      guildId: interaction.guild.id,
+      type: 'TIMEOUT',
+      targetId: target.id,
+      moderatorId: interaction.user.id,
+      reason,
+      duration,
+      expiresAt,
+    });
 
-      addModLog(interaction.guild.id, 'MUTE', target.id, interaction.user.id, reason, formattedDuration);
+    await logQueries.create({
+      guildId: interaction.guild.id,
+      type: 'MOD_ACTION',
+      actorId: interaction.user.id,
+      targetId: target.id,
+      targetType: 'user',
+      details: { action: 'MUTE', reason, caseNumber, duration },
+    });
 
-      await modLog(interaction.guild, {
-        action: 'Mute (Timeout)',
-        moderator: interaction.user,
-        target,
-        reason,
-        duration: formattedDuration,
-        color: COLORS.YELLOW,
-      });
+    const embed = modEmbed({
+      type: '🔇 Mute',
+      target: target.user.tag,
+      moderator: interaction.user.tag,
+      reason,
+      caseNumber,
+      duration: formatDuration(duration),
+    });
 
-      try {
-        const dmEmbed = new EmbedBuilder()
-          .setTitle('🔇 Vous avez été rendu muet')
-          .setColor(COLORS.YELLOW)
-          .addFields(
-            { name: 'Serveur', value: interaction.guild.name },
-            { name: 'Durée', value: formattedDuration },
-            { name: 'Raison', value: reason },
-          )
-          .setTimestamp();
-        await target.send({ embeds: [dmEmbed] });
-      } catch { /* DMs fermés */ }
+    await interaction.reply({ embeds: [embed] });
 
-      const embed = new EmbedBuilder()
-        .setTitle('🔇 Utilisateur muté')
-        .setColor(COLORS.YELLOW)
-        .setDescription(`**${target.tag}** a été rendu muet.`)
-        .addFields(
-          { name: '⏱️ Durée', value: formattedDuration, inline: true },
-          { name: '📝 Raison', value: reason, inline: true },
-        )
-        .setTimestamp();
-
-      await interaction.reply({ embeds: [embed] });
-    } catch (error) {
-      console.error('[MUTE]', error);
-      await interaction.reply(errorReply('❌ Impossible de mute cet utilisateur.'));
+    // Modlog channel
+    const config = await configService.get(interaction.guild.id);
+    if (config.modLogChannel) {
+      const logChannel = interaction.guild.channels.cache.get(config.modLogChannel);
+      if (logChannel) logChannel.send({ embeds: [embed] }).catch(() => {});
     }
   },
 };

@@ -16,6 +16,7 @@ const { createEmbed, successEmbed, errorEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'roles',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('rolemenu')
     .setDescription('Crée un menu de rôles auto-assignables')

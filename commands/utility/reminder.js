@@ -9,6 +9,7 @@ const { successEmbed, errorEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'utility',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('reminder')
     .setDescription('Gère tes rappels')
@@ -35,16 +36,16 @@ module.exports = {
       case 'set': {
         const durationStr = interaction.options.getString('durée');
         const message = interaction.options.getString('message');
-        const ms = parseDuration(durationStr);
+        const seconds = parseDuration(durationStr); // returns seconds
 
-        if (!ms || ms < 60000) {
+        if (!seconds || seconds < 60) {
           return interaction.reply({ embeds: [errorEmbed('❌ Durée invalide (minimum 1m).')], ephemeral: true });
         }
-        if (ms > 30 * 24 * 60 * 60 * 1000) {
+        if (seconds > 30 * 24 * 60 * 60) {
           return interaction.reply({ embeds: [errorEmbed('❌ Maximum 30 jours.')], ephemeral: true });
         }
 
-        const expiresAt = new Date(Date.now() + ms).toISOString();
+        const expiresAt = new Date(Date.now() + seconds * 1000).toISOString();
 
         const [id] = await db('reminders').insert({
           guild_id: interaction.guild.id,
@@ -55,7 +56,7 @@ module.exports = {
         });
 
         return interaction.reply({
-          embeds: [successEmbed(`⏰ Rappel #${id} dans **${formatDuration(ms)}**\n> ${message}`)],
+          embeds: [successEmbed(`⏰ Rappel #${id} dans **${formatDuration(seconds)}**\n> ${message}`)],
           ephemeral: true,
         });
       }

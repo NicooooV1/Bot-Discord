@@ -1,25 +1,28 @@
 // ===================================
 // Ultra Suite — Knex Configuration
+// MySQL (mysql2) — phpMyAdmin compatible
 // ===================================
 
 const path = require('path');
 
 module.exports = {
-  client: 'better-sqlite3',
+  client: 'mysql2',
   connection: {
-    filename: path.join(__dirname, '..', '..', 'data', 'ultra.db'),
+    host: process.env.DB_HOST || '127.0.0.1',
+    port: parseInt(process.env.DB_PORT, 10) || 3306,
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'ultra_suite',
+    charset: 'utf8mb4',
+    // Retourner les dates en string ISO (cohérent avec le code existant)
+    dateStrings: true,
   },
-  useNullAsDefault: true,
+  pool: {
+    min: 2,
+    max: 10,
+  },
   migrations: {
     directory: path.join(__dirname, 'migrations'),
     tableName: 'knex_migrations',
-  },
-  pool: {
-    afterCreate: (conn, cb) => {
-      conn.pragma('journal_mode = WAL');
-      conn.pragma('foreign_keys = ON');
-      conn.pragma('busy_timeout = 5000');
-      cb();
-    },
   },
 };

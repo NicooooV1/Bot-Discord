@@ -49,6 +49,8 @@ module.exports = {
     const type = duration ? 'TEMPBAN' : 'BAN';
     const expiresAt = duration ? new Date(Date.now() + duration * 1000).toISOString() : null;
 
+    await interaction.deferReply();
+
     // DM avant ban
     try {
       await user.send(t('mod.ban.dm', undefined, { guild: interaction.guild.name, reason }));
@@ -91,7 +93,7 @@ module.exports = {
       duration: duration ? formatDuration(duration) : null,
     });
 
-    await interaction.reply({ embeds: [embed] });
+    await interaction.editReply({ embeds: [embed] });
 
     // Envoyer dans le salon modlogs
     const config = await configService.get(interaction.guild.id);

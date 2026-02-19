@@ -15,6 +15,7 @@ const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'events',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('event')
     .setDescription('Gère les événements')
@@ -67,6 +68,7 @@ module.exports = {
           description,
           creator_id: interaction.user.id,
           scheduled_at: date.toISOString(),
+          max_participants: max || 0,
           participants: JSON.stringify([]),
         });
 

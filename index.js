@@ -105,7 +105,12 @@ process.on('unhandledRejection', (err) => {
 
 process.on('uncaughtException', (err) => {
   log.error('Uncaught exception:', err);
-  // On sort proprement après une exception fatale
+  // Ne pas crash pour les erreurs Discord (interaction déjà répondue, etc.)
+  if (err.code === 40060 || err.code === 10062 || err.code === 'InteractionAlreadyReplied') {
+    log.warn('Non-fatal Discord error, continuing...');
+    return;
+  }
+  // Erreur vraiment fatale → shutdown
   shutdown('uncaughtException');
 });
 

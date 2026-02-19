@@ -7,6 +7,7 @@ const { createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'utility',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('avatar')
     .setDescription('Affiche l\'avatar d\'un utilisateur')
@@ -21,9 +22,9 @@ module.exports = {
     let avatarUrl;
 
     if (serverAvatar && member?.avatar) {
-      avatarUrl = member.displayAvatarURL({ dynamic: true, size: 1024 });
+      avatarUrl = member.displayAvatarURL({ size: 1024 });
     } else {
-      avatarUrl = user.displayAvatarURL({ dynamic: true, size: 1024 });
+      avatarUrl = user.displayAvatarURL({ size: 1024 });
     }
 
     const embed = createEmbed('primary')

@@ -7,11 +7,13 @@ const { createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'utility',
+  cooldown: 10,
   data: new SlashCommandBuilder()
     .setName('serverinfo')
     .setDescription('Affiche les informations du serveur'),
 
   async execute(interaction) {
+    await interaction.deferReply();
     const { guild } = interaction;
     await guild.members.fetch().catch(() => {});
 
@@ -30,7 +32,7 @@ module.exports = {
 
     const embed = createEmbed('primary')
       .setTitle(guild.name)
-      .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+      .setThumbnail(guild.iconURL({ size: 256 }))
       .addFields(
         { name: '👑 Propriétaire', value: `<@${guild.ownerId}>`, inline: true },
         { name: '📅 Création', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
@@ -45,6 +47,6 @@ module.exports = {
 
     if (guild.bannerURL()) embed.setImage(guild.bannerURL({ size: 512 }));
 
-    return interaction.reply({ embeds: [embed] });
+    return interaction.editReply({ embeds: [embed] });
   },
 };

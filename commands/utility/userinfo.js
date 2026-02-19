@@ -8,6 +8,7 @@ const { getDb } = require('../../database');
 
 module.exports = {
   module: 'utility',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('userinfo')
     .setDescription('Affiche les informations d\'un utilisateur')
@@ -19,7 +20,7 @@ module.exports = {
 
     const embed = createEmbed('primary')
       .setTitle(`Profil de ${user.tag}`)
-      .setThumbnail(user.displayAvatarURL({ dynamic: true, size: 256 }))
+      .setThumbnail(user.displayAvatarURL({ size: 256 }))
       .addFields(
         { name: '🆔 ID', value: user.id, inline: true },
         { name: '📅 Compte créé', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:R>`, inline: true },
@@ -47,7 +48,7 @@ module.exports = {
         embed.addFields(
           { name: '⭐ Niveau', value: `${userData.level}`, inline: true },
           { name: '✨ XP', value: `${userData.xp}`, inline: true },
-          { name: '💬 Messages', value: `${userData.messages}`, inline: true }
+          { name: '💬 Messages', value: `${userData.total_messages}`, inline: true }
         );
       }
     }

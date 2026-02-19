@@ -89,8 +89,8 @@ module.exports = {
         channel_id: newState.channel.id,
       });
     }
-    // Leave → fermer session
-    if (oldState.channel && !newState.channel) {
+    // Leave ou move → fermer session et incrémenter voice_minutes
+    if (oldState.channel && (!newState.channel || oldState.channelId !== newState.channelId)) {
       const session = await db('voice_sessions')
         .where({ guild_id: guild.id, user_id: member.id })
         .whereNull('left_at')
@@ -98,12 +98,27 @@ module.exports = {
         .first();
 
       if (session) {
-        const duration = Math.floor((Date.now() - new Date(session.joined_at).getTime()) / 1000);
+        const durationSec = Math.floor((Date.now() - new Date(session.joined_at).getTime()) / 1000);
         await db('voice_sessions').where('id', session.id).update({
           left_at: new Date().toISOString(),
-          duration,
+          duration: durationSec,
         });
+
+        // Incrémenter voice_minutes de l'utilisateur
+        const durationMin = Math.floor(durationSec / 60);
+        if (durationMin > 0) {
+          const userQueries = require('../../database/userQueries');
+          await userQueries.increment(member.id, guild.id, 'voice_minutes', durationMin);
+        }
       }
+    }
+    // Move → ouvrir nouvelle session
+    if (oldState.channel && newState.channel && oldState.channelId !== newState.channelId) {
+      await db('voice_sessions').insert({
+        guild_id: guild.id,
+        user_id: member.id,
+        channel_id: newState.channel.id,
+      });
     }
 
     // === TEMP VOICE ===
@@ -135,8 +150,8 @@ module.exports = {
         } catch {}
       }
 
-      // Quitte un salon temporaire → supprimer si vide
-      if (oldState.channel && !newState.channel) {
+      // Quitte ou se déplace d'un salon temporaire → supprimer si vide
+      if (oldState.channel && oldState.channelId !== newState.channelId) {
         const tempEntry = await db('temp_voice_channels').where('channel_id', oldState.channelId).first();
         if (tempEntry && oldState.channel.members.size === 0) {
           await oldState.channel.delete('Salon vocal temporaire vide').catch(() => {});

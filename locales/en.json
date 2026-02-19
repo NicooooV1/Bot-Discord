@@ -10,6 +10,8 @@
     "invalid_role": "❌ Role not found.",
     "self_action": "❌ You cannot perform this action on yourself.",
     "bot_action": "❌ You cannot perform this action on a bot.",
+    "target_is_owner": "❌ You cannot perform this action on the server owner.",
+    "bot_higher_role": "❌ I cannot act on this user (their role is higher than mine).",
     "higher_role": "❌ The target has a higher or equal role.",
     "success": "✅ Action completed successfully.",
     "cancelled": "❌ Action cancelled.",

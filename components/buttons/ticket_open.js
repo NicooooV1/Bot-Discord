@@ -13,7 +13,8 @@ module.exports = {
   id: 'ticket_open',
 
   async execute(interaction) {
-    const config = await configService.get(interaction.guild.id);
+    try {
+      const config = await configService.get(interaction.guild.id);
 
     if (!config.ticketCategory) {
       return interaction.reply({ embeds: [errorEmbed('❌ Tickets non configurés.')], ephemeral: true });
@@ -65,5 +66,8 @@ module.exports = {
 
     await channel.send({ embeds: [embed], components: [new ActionRowBuilder().addComponents(closeBtn)] });
     await interaction.reply({ embeds: [successEmbed(`✅ Ticket créé : ${channel}`)], ephemeral: true });
+    } catch (err) {
+      return interaction.reply({ content: '❌ Impossible de créer le ticket.', ephemeral: true }).catch(() => {});
+    }
   },
 };

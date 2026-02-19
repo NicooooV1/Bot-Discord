@@ -35,9 +35,21 @@ function loadEvents(client) {
       }
 
       if (event.once) {
-        client.once(event.name, (...args) => event.execute(...args, client));
+        client.once(event.name, async (...args) => {
+          try {
+            await event.execute(...args, client);
+          } catch (err) {
+            log.error(`Error in event ${event.name}:`, err);
+          }
+        });
       } else {
-        client.on(event.name, (...args) => event.execute(...args, client));
+        client.on(event.name, async (...args) => {
+          try {
+            await event.execute(...args, client);
+          } catch (err) {
+            log.error(`Error in event ${event.name}:`, err);
+          }
+        });
       }
 
       total++;

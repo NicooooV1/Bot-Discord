@@ -9,6 +9,7 @@ const { successEmbed, errorEmbed, createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'custom_commands',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('customcmd')
     .setDescription('Gère les commandes personnalisées')

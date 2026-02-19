@@ -8,6 +8,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   module: 'moderation',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('lock')
     .setDescription('Verrouille ou déverrouille un salon')

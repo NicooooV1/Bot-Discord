@@ -10,6 +10,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   module: 'economy',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('bank')
     .setDescription('Déposer ou retirer de la banque')

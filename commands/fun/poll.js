@@ -9,6 +9,7 @@ const EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣'
 
 module.exports = {
   module: 'fun',
+  cooldown: 10,
   data: new SlashCommandBuilder()
     .setName('poll')
     .setDescription('Crée un sondage')

@@ -10,6 +10,8 @@
     "invalid_role": "❌ Rôle introuvable.",
     "self_action": "❌ Vous ne pouvez pas effectuer cette action sur vous-même.",
     "bot_action": "❌ Vous ne pouvez pas effectuer cette action sur un bot.",
+    "target_is_owner": "❌ Vous ne pouvez pas effectuer cette action sur le propriétaire du serveur.",
+    "bot_higher_role": "❌ Je ne peux pas agir sur cet utilisateur (son rôle est supérieur au mien).",
     "higher_role": "❌ La cible a un rôle supérieur ou égal au vôtre.",
     "success": "✅ Action effectuée avec succès.",
     "cancelled": "❌ Action annulée.",

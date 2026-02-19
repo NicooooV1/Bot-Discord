@@ -9,6 +9,7 @@ const { createEmbed, errorEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'moderation',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('warnings')
     .setDescription('Affiche les avertissements actifs d\'un membre')

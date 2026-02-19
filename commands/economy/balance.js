@@ -9,6 +9,7 @@ const { createEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'economy',
+  cooldown: 3,
   data: new SlashCommandBuilder()
     .setName('balance')
     .setDescription('Affiche votre solde ou celui d\'un membre')
@@ -22,7 +23,7 @@ module.exports = {
 
     const embed = createEmbed('primary')
       .setTitle(`💰 Solde de ${user.username}`)
-      .setThumbnail(user.displayAvatarURL({ dynamic: true }))
+      .setThumbnail(user.displayAvatarURL({ size: 256 }))
       .addFields(
         { name: '👛 Portefeuille', value: `**${dbUser.balance}** ${symbol}`, inline: true },
         { name: '🏦 Banque', value: `**${dbUser.bank}** ${symbol}`, inline: true },

@@ -54,11 +54,12 @@ const userQueries = {
    */
   async rank(userId, guildId) {
     const db = getDb();
-    const result = await db.raw(
-      `SELECT COUNT(*) + 1 as rank FROM users WHERE guild_id = ? AND xp > (SELECT xp FROM users WHERE user_id = ? AND guild_id = ?)`,
+    const [rows] = await db.raw(
+      `SELECT COUNT(*) + 1 as \`rank\` FROM users WHERE guild_id = ? AND xp > (SELECT COALESCE(xp, 0) FROM users WHERE user_id = ? AND guild_id = ?)`,
       [guildId, userId, guildId]
     );
-    return result[0]?.rank ?? null;
+    // mysql2 raw renvoie [rows, fields]
+    return rows[0]?.rank ?? null;
   },
 
   /**
@@ -74,28 +75,30 @@ const userQueries = {
   },
 
   /**
-   * Transfère entre balance et bank
+   * Transfère entre balance et bank (transaction pour atomicité)
    */
   async transfer(userId, guildId, amount, direction = 'deposit') {
     const db = getDb();
     const user = await this.getOrCreate(userId, guildId);
 
-    if (direction === 'deposit') {
-      if (user.balance < amount) return { success: false, reason: 'insufficient_balance' };
-      await db('users').where({ user_id: userId, guild_id: guildId }).update({
-        balance: user.balance - amount,
-        bank: user.bank + amount,
-        updated_at: db.fn.now(),
-      });
-    } else {
-      if (user.bank < amount) return { success: false, reason: 'insufficient_bank' };
-      await db('users').where({ user_id: userId, guild_id: guildId }).update({
-        balance: user.balance + amount,
-        bank: user.bank - amount,
-        updated_at: db.fn.now(),
-      });
-    }
-    return { success: true };
+    return db.transaction(async (trx) => {
+      if (direction === 'deposit') {
+        if (user.balance < amount) return { success: false, reason: 'insufficient_balance' };
+        await trx('users').where({ user_id: userId, guild_id: guildId }).update({
+          balance: user.balance - amount,
+          bank: user.bank + amount,
+          updated_at: trx.fn.now(),
+        });
+      } else {
+        if (user.bank < amount) return { success: false, reason: 'insufficient_bank' };
+        await trx('users').where({ user_id: userId, guild_id: guildId }).update({
+          balance: user.balance + amount,
+          bank: user.bank - amount,
+          updated_at: trx.fn.now(),
+        });
+      }
+      return { success: true };
+    });
   },
 };
 

@@ -14,6 +14,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   module: 'admin',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('help')
     .setDescription('Affiche l\'aide du bot')

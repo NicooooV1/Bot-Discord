@@ -2,12 +2,12 @@
 
 # 🚀 Ultra Suite Bot — v2.0
 
-Bot Discord modulaire tout-en-un développé avec **discord.js v14** : 22 modules activables indépendamment, architecture Pterodactyl-ready, SQLite embarqué.
+Bot Discord modulaire tout-en-un développé avec **discord.js v14** : 22 modules activables indépendamment, architecture Pterodactyl-ready, MySQL (phpMyAdmin).
 
 [![Discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)](https://discord.js.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![SQLite](https://img.shields.io/badge/SQLite-better--sqlite3-003B57?logo=sqlite&logoColor=white)](https://github.com/WiseLibs/better-sqlite3)
+[![MySQL](https://img.shields.io/badge/MySQL-mysql2-4479A1?logo=mysql&logoColor=white)](https://github.com/sidorares/node-mysql2)
 
 </div>
 
@@ -61,7 +61,7 @@ Chaque module est **activable/désactivable indépendamment** via `/setup module
 ```
 JavaScript pur (CommonJS) — Pas de TypeScript, pas de build step
 ├── discord.js v14           — Framework Discord
-├── better-sqlite3 + Knex    — Base de données locale (WAL mode)
+├── mysql2 + Knex            — Base de données MySQL (phpMyAdmin)
 ├── node-cron                — Tâches planifiées (sanctions, rappels, nettoyage)
 ├── node-cache               — Cache mémoire TTL pour configs
 ├── winston                  — Logging rotatif fichier + console
@@ -69,7 +69,7 @@ JavaScript pur (CommonJS) — Pas de TypeScript, pas de build step
 └── Pterodactyl-ready        — Single process, pas de Docker-in-Docker
 ```
 
-**Zéro service externe** — SQLite embarqué, pas de Redis, pas de PostgreSQL.
+**MySQL uniquement** — pas de Redis, pas de PostgreSQL, compatible phpMyAdmin.
 
 ---
 
@@ -103,6 +103,13 @@ GUILD_ID=votre_guild_id_ici   # Dev = instantané, vide = global (~1h)
 NODE_ENV=production
 LOG_LEVEL=info
 DEFAULT_LOCALE=fr
+
+# MySQL (phpMyAdmin)
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=motdepasse
+DB_NAME=ultra_suite
 ```
 
 > ⚠️ **Ne partagez JAMAIS votre token !** Le fichier `.env` est exclu via `.gitignore`.
@@ -119,7 +126,7 @@ npm run deploy
 npm start
 ```
 
-La base de données SQLite et les tables sont créées automatiquement au premier lancement.
+Les tables MySQL sont créées automatiquement via les migrations au premier lancement.
 
 ### Intents requis (Developer Portal > Bot)
 
@@ -181,7 +188,7 @@ Bot-Discord/
 │   │   └── api.js                # API REST optionnelle
 │   │
 │   ├── database/                 # Couche données
-│   │   ├── knexfile.js           # Config Knex + SQLite
+│   │   ├── knexfile.js           # Config Knex + MySQL
 │   │   ├── index.js              # Init DB + migrations
 │   │   ├── migrations/           # Schéma (27 tables)
 │   │   ├── guildQueries.js       # Requêtes guilds
@@ -228,7 +235,7 @@ Bot-Discord/
 │       ├── fr.json               # Français
 │       └── en.json               # English
 │
-├── data/                         # SQLite DB (auto-créé, ignoré par git)
+├── data/                         # Données locales (logs, ignoré par git)
 ├── logs/                         # Fichiers de logs (auto-créé, ignoré par git)
 │
 ├── index.js                      # Legacy v1 (conservé)
@@ -321,7 +328,7 @@ Le bot est conçu pour fonctionner sur un hébergement **Pterodactyl** :
 4. **Variables** : Configurez via le panneau Pterodactyl (`.env`)
 
 > Le bot fonctionne en **single process**, pas de Docker-in-Docker, pas de services externes.
-> SQLite crée automatiquement `data/ultra.db` au premier lancement.
+> Les tables sont créées automatiquement dans la base MySQL via les migrations Knex.
 
 ---
 
@@ -330,7 +337,7 @@ Le bot est conçu pour fonctionner sur un hébergement **Pterodactyl** :
 | Technologie | Version | Usage |
 |-------------|---------|-------|
 | [discord.js](https://discord.js.org/) | v14 | Framework Discord |
-| [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) | v11 | Base de données embarquée |
+| [mysql2](https://github.com/sidorares/node-mysql2) | v3 | Driver MySQL pour Knex |
 | [Knex.js](https://knexjs.org/) | v3 | Query builder + migrations |
 | [node-cron](https://github.com/node-cron/node-cron) | v3 | Tâches planifiées |
 | [node-cache](https://github.com/node-cache/node-cache) | v5 | Cache mémoire TTL |

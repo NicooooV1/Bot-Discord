@@ -1,25 +1,28 @@
 // ===================================
 // Ultra Suite — Database Manager
-// Initialise Knex + run migrations
+// MySQL (mysql2) + Knex — migrations auto
 // ===================================
 
 const knex = require('knex');
 const knexConfig = require('./knexfile');
 const path = require('path');
-const fs = require('fs');
 
 let db = null;
 
 /**
- * Initialise la connexion et lance les migrations
+ * Initialise la connexion MySQL et lance les migrations
  * @returns {import('knex').Knex}
  */
 async function init() {
-  // Crée le dossier data/ s'il n'existe pas
-  const dataDir = path.join(__dirname, '..', '..', 'data');
-  if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-
   db = knex(knexConfig);
+
+  // Vérifier que MySQL est joignable
+  try {
+    await db.raw('SELECT 1');
+  } catch (err) {
+    console.error('[DB] Impossible de se connecter à MySQL :', err.message);
+    throw err;
+  }
 
   // Exécute les migrations en attente
   const [batch, migrations] = await db.migrate.latest();
@@ -43,7 +46,7 @@ function getDb() {
 }
 
 /**
- * Ferme proprement la connexion
+ * Ferme proprement le pool de connexions
  */
 async function close() {
   if (db) await db.destroy();

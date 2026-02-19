@@ -7,7 +7,9 @@ const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
 
-const logsDir = path.join(__dirname, '..', '..', 'logs');
+
+// Place logs in the working directory (Pterodactyl compatible)
+const logsDir = path.resolve('logs');
 if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';

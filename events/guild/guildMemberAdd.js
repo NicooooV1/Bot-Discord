@@ -16,10 +16,17 @@ module.exports = {
   async execute(member) {
     if (member.user.bot) return;
 
-    // Initialiser la guild en DB si nécessaire
-    await guildQueries.getOrCreate(member.guild.id, member.guild.name, member.guild.ownerId);
+    try {
+      // Initialiser la guild en DB si nécessaire
+      await guildQueries.getOrCreate(member.guild.id, member.guild.name, member.guild.ownerId);
+    } catch {}
 
-    const config = await configService.get(member.guild.id);
+    let config;
+    try {
+      config = await configService.get(member.guild.id);
+    } catch {
+      return;
+    }
 
     // === LOGS ===
     const logsEnabled = await configService.isModuleEnabled(member.guild.id, 'logs');
@@ -66,7 +73,7 @@ module.exports = {
           .replace(/\{\{count\}\}/g, member.guild.memberCount);
 
         const embed = createEmbed('success')
-          .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+          .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
           .setDescription(msg);
 
         welcomeChannel.send({ embeds: [embed] }).catch(() => {});

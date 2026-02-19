@@ -2,18 +2,15 @@
   "name": "ultra-suite-bot",
   "version": "2.0.0",
   "description": "Bot Discord Ultra Suite — 22 modules, modulaire, configurable, Pterodactyl-ready",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "deploy": "node src/deploy-commands.js",
-    "migrate": "node src/database/migrate.js",
-    "test": "jest --passWithNoTests",
-    "legacy:start": "node index.js",
-    "legacy:deploy": "node deploy-commands.js"
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js",
+    "test": "jest --passWithNoTests"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "better-sqlite3": "^11.7.0",
+    "mysql2": "^3.11.0",
     "dotenv": "^16.4.7",
     "knex": "^3.1.0",
     "node-cron": "^3.0.3",

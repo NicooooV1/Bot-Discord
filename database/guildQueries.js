@@ -4,6 +4,29 @@
 
 const { getDb } = require('./index');
 
+/**
+ * Deep merge : fusionne récursivement les objets imbriqués
+ * au lieu d'écraser les sous-objets entiers
+ */
+function deepMerge(target, source) {
+  const output = { ...target };
+  for (const key of Object.keys(source)) {
+    if (
+      source[key] &&
+      typeof source[key] === 'object' &&
+      !Array.isArray(source[key]) &&
+      target[key] &&
+      typeof target[key] === 'object' &&
+      !Array.isArray(target[key])
+    ) {
+      output[key] = deepMerge(target[key], source[key]);
+    } else {
+      output[key] = source[key];
+    }
+  }
+  return output;
+}
+
 const guildQueries = {
   /**
    * Récupère ou crée une guild
@@ -39,7 +62,7 @@ const guildQueries = {
     const guild = await db('guilds').where('id', guildId).first();
     if (!guild) return null;
     const current = JSON.parse(guild.config || '{}');
-    const merged = { ...current, ...configPatch };
+    const merged = deepMerge(current, configPatch);
     await db('guilds').where('id', guildId).update({
       config: JSON.stringify(merged),
       updated_at: db.fn.now(),

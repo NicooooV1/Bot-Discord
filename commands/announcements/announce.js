@@ -10,6 +10,7 @@ const { createEmbed, successEmbed, errorEmbed } = require('../../utils/embeds');
 
 module.exports = {
   module: 'announcements',
+  cooldown: 5,
   data: new SlashCommandBuilder()
     .setName('announce')
     .setDescription('Envoie une annonce')
