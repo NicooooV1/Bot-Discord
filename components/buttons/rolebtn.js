@@ -7,6 +7,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   id: 'rolebtn_',
+  module: 'roles',
 
   async execute(interaction) {
     try {

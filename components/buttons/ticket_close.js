@@ -10,6 +10,7 @@ const { t } = require('../../core/i18n');
 
 module.exports = {
   id: 'ticket_close',
+  module: 'tickets',
 
   async execute(interaction) {
     try {

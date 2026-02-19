@@ -182,38 +182,60 @@ module.exports = {
     }
 
     // === Incrémenter daily_metrics.messages ===
-    try {
-      const db = getDb();
-      const today = new Date().toISOString().split('T')[0];
-      await db('daily_metrics')
-        .where({ guild_id: message.guild.id, date: today })
-        .increment('messages', 1)
-        .catch(() => {
-          // Créer la row si inexistante
-          db('daily_metrics').insert({ guild_id: message.guild.id, date: today, messages: 1 }).catch(() => {});
-        });
-    } catch {}
+    // === Incrémenter daily_metrics.messages (si module stats activé) ===
+    const statsEnabled = await configService.isModuleEnabled(message.guild.id, 'stats');
+    if (statsEnabled) {
+      try {
+        const db = getDb();
+        const today = new Date().toISOString().split('T')[0];
+        await db('daily_metrics')
+          .where({ guild_id: message.guild.id, date: today })
+          .increment('messages', 1)
+          .catch(() => {
+            db('daily_metrics').insert({ guild_id: message.guild.id, date: today, messages: 1 }).catch(() => {});
+          });
+      } catch {}
+    }
 
     // ===================================
     // CUSTOM COMMANDS : match triggers
     // ===================================
-    try {
-      const db = getDb();
-      const customCmds = await db('custom_commands')
-        .where({ guild_id: message.guild.id, enabled: true });
+    const customCmdsEnabled = await configService.isModuleEnabled(message.guild.id, 'custom_commands');
+    if (customCmdsEnabled) {
+      try {
+        const db = getDb();
+        const customCmds = await db('custom_commands')
+          .where({ guild_id: message.guild.id, enabled: true });
 
-      for (const cmd of customCmds) {
-        if (message.content.toLowerCase().startsWith(cmd.trigger.toLowerCase())) {
-          const response = cmd.response
-            .replace(/\{\{user\}\}/g, message.author.toString())
-            .replace(/\{\{server\}\}/g, message.guild.name)
-            .replace(/\{\{channel\}\}/g, message.channel.toString())
-            .replace(/\{\{memberCount\}\}/g, message.guild.memberCount);
+        for (const cmd of customCmds) {
+          if (message.content.toLowerCase().startsWith(cmd.name.toLowerCase())) {
+            // Incrémenter le compteur d'utilisation
+            await db('custom_commands').where('id', cmd.id).increment('uses', 1);
 
-          await message.channel.send(response).catch(() => {});
-          break;
+            // Parser la réponse JSON
+            let responseData;
+            try {
+              responseData = JSON.parse(cmd.response);
+            } catch {
+              responseData = { text: String(cmd.response), embed: false };
+            }
+
+            const text = (responseData.text || '')
+              .replace(/\{\{user\}\}/g, message.author.toString())
+              .replace(/\{\{server\}\}/g, message.guild.name)
+              .replace(/\{\{channel\}\}/g, message.channel.toString())
+              .replace(/\{\{memberCount\}\}/g, message.guild.memberCount);
+
+            if (responseData.embed) {
+              const { createEmbed } = require('../../utils/embeds');
+              await message.channel.send({ embeds: [createEmbed('primary').setDescription(text)] }).catch(() => {});
+            } else {
+              await message.channel.send(text).catch(() => {});
+            }
+            break;
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
   },
 };

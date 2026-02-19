@@ -7,6 +7,7 @@ const { getDb } = require('../../database/index');
 
 module.exports = {
   id: 'rolemenu_',
+  module: 'roles',
 
   async execute(interaction) {
     const selectedRoles = interaction.values; // Array de roleIds

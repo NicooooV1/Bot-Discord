@@ -7,6 +7,7 @@ const { getDb } = require('../../database');
 
 module.exports = {
   id: 'event_join_',
+  module: 'events',
 
   async execute(interaction) {
     try {

@@ -9,6 +9,7 @@ const ConfigService = require('../../core/configService');
 
 module.exports = {
   id: 'apply_modal',
+  module: 'applications',
 
   async execute(interaction) {
     try {

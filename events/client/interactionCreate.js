@@ -89,16 +89,19 @@ module.exports = {
     // BUTTONS
     // ===================================
     if (interaction.isButton()) {
-      // Format customId : "module_action" ou "module_action_extra"
-      const [prefix] = interaction.customId.split('_');
-
-      // Chercher un handler exact d'abord, puis par préfixe
       const handler =
         client.buttons?.get(interaction.customId) ||
         client.buttons?.find((b) => interaction.customId.startsWith(b.id));
 
       if (handler) {
         try {
+          // Vérifier si le module est activé
+          if (handler.module && interaction.guild) {
+            const enabled = await configService.isModuleEnabled(interaction.guild.id, handler.module);
+            if (!enabled) {
+              return interaction.reply({ embeds: [errorEmbed(t('common.module_disabled'))], ephemeral: true });
+            }
+          }
           await handler.execute(interaction, client);
         } catch (err) {
           log.error(`Button error (${interaction.customId}):`, err);
@@ -121,6 +124,12 @@ module.exports = {
 
       if (handler) {
         try {
+          if (handler.module && interaction.guild) {
+            const enabled = await configService.isModuleEnabled(interaction.guild.id, handler.module);
+            if (!enabled) {
+              return interaction.reply({ embeds: [errorEmbed(t('common.module_disabled'))], ephemeral: true });
+            }
+          }
           await handler.execute(interaction, client);
         } catch (err) {
           log.error(`Select error (${interaction.customId}):`, err);
@@ -143,6 +152,12 @@ module.exports = {
 
       if (handler) {
         try {
+          if (handler.module && interaction.guild) {
+            const enabled = await configService.isModuleEnabled(interaction.guild.id, handler.module);
+            if (!enabled) {
+              return interaction.reply({ embeds: [errorEmbed(t('common.module_disabled'))], ephemeral: true });
+            }
+          }
           await handler.execute(interaction, client);
         } catch (err) {
           log.error(`Modal error (${interaction.customId}):`, err);

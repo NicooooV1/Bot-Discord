@@ -81,44 +81,47 @@ module.exports = {
     }
 
     // === VOICE SESSIONS ===
-    // Join → créer session
-    if (!oldState.channel && newState.channel) {
-      await db('voice_sessions').insert({
-        guild_id: guild.id,
-        user_id: member.id,
-        channel_id: newState.channel.id,
-      });
-    }
-    // Leave ou move → fermer session et incrémenter voice_minutes
-    if (oldState.channel && (!newState.channel || oldState.channelId !== newState.channelId)) {
-      const session = await db('voice_sessions')
-        .where({ guild_id: guild.id, user_id: member.id })
-        .whereNull('left_at')
-        .orderBy('joined_at', 'desc')
-        .first();
-
-      if (session) {
-        const durationSec = Math.floor((Date.now() - new Date(session.joined_at).getTime()) / 1000);
-        await db('voice_sessions').where('id', session.id).update({
-          left_at: new Date().toISOString(),
-          duration: durationSec,
+    const statsEnabled = await configService.isModuleEnabled(guild.id, 'stats');
+    if (statsEnabled) {
+      // Join → créer session
+      if (!oldState.channel && newState.channel) {
+        await db('voice_sessions').insert({
+          guild_id: guild.id,
+          user_id: member.id,
+          channel_id: newState.channel.id,
         });
+      }
+      // Leave ou move → fermer session et incrémenter voice_minutes
+      if (oldState.channel && (!newState.channel || oldState.channelId !== newState.channelId)) {
+        const session = await db('voice_sessions')
+          .where({ guild_id: guild.id, user_id: member.id })
+          .whereNull('left_at')
+          .orderBy('joined_at', 'desc')
+          .first();
 
-        // Incrémenter voice_minutes de l'utilisateur
-        const durationMin = Math.floor(durationSec / 60);
-        if (durationMin > 0) {
-          const userQueries = require('../../database/userQueries');
-          await userQueries.increment(member.id, guild.id, 'voice_minutes', durationMin);
+        if (session) {
+          const durationSec = Math.floor((Date.now() - new Date(session.joined_at).getTime()) / 1000);
+          await db('voice_sessions').where('id', session.id).update({
+            left_at: new Date().toISOString(),
+            duration: durationSec,
+          });
+
+          // Incrémenter voice_minutes de l'utilisateur
+          const durationMin = Math.floor(durationSec / 60);
+          if (durationMin > 0) {
+            const userQueries = require('../../database/userQueries');
+            await userQueries.increment(member.id, guild.id, 'voice_minutes', durationMin);
+          }
         }
       }
-    }
-    // Move → ouvrir nouvelle session
-    if (oldState.channel && newState.channel && oldState.channelId !== newState.channelId) {
-      await db('voice_sessions').insert({
-        guild_id: guild.id,
-        user_id: member.id,
-        channel_id: newState.channel.id,
-      });
+      // Move → ouvrir nouvelle session
+      if (oldState.channel && newState.channel && oldState.channelId !== newState.channelId) {
+        await db('voice_sessions').insert({
+          guild_id: guild.id,
+          user_id: member.id,
+          channel_id: newState.channel.id,
+        });
+      }
     }
 
     // === TEMP VOICE ===

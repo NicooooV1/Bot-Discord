@@ -40,6 +40,7 @@ module.exports = {
               { name: 'Candidatures', value: 'applications' },
               { name: 'Tags/FAQ', value: 'tags' },
               { name: 'Événements', value: 'events' },
+              { name: 'Commandes custom', value: 'custom_commands' },
               { name: 'RP', value: 'rp' },
               { name: 'Intégrations', value: 'integrations' },
               { name: 'Annonces', value: 'announcements' },

@@ -1,6 +1,7 @@
 // ===================================
 // Ultra Suite — Config Service
 // Cache mémoire + DB pour config guild
+// Données séparées par serveur (guild_id)
 // ===================================
 
 const NodeCache = require('node-cache');
@@ -47,17 +48,31 @@ const DEFAULT_CONFIG = {
   muteRole: null,
 };
 
+/**
+ * Charge la guild depuis la DB et met en cache config + modules
+ * @param {string} guildId
+ * @returns {{ config: object, modules: object }}
+ */
+async function loadGuild(guildId) {
+  const guild = await guildQueries.getOrCreate(guildId, 'Unknown', '0');
+  const config = { ...DEFAULT_CONFIG, ...guild.config };
+  const modules = guild.modules_enabled || {};
+
+  cache.set(`cfg:${guildId}`, config);
+  cache.set(`mod:${guildId}`, modules);
+
+  return { config, modules };
+}
+
 const configService = {
   /**
    * Récupère la config complète d'une guild (cache → DB)
    */
   async get(guildId) {
-    const cached = cache.get(`guild:${guildId}`);
+    const cached = cache.get(`cfg:${guildId}`);
     if (cached) return cached;
 
-    const guild = await guildQueries.getOrCreate(guildId, 'Unknown', '0');
-    const config = { ...DEFAULT_CONFIG, ...guild.config };
-    cache.set(`guild:${guildId}`, config);
+    const { config } = await loadGuild(guildId);
     return config;
   },
 
@@ -68,7 +83,7 @@ const configService = {
     const merged = await guildQueries.updateConfig(guildId, patch);
     if (!merged) return null;
     const full = { ...DEFAULT_CONFIG, ...merged };
-    cache.set(`guild:${guildId}`, full);
+    cache.set(`cfg:${guildId}`, full);
     log.info(`Config updated for guild ${guildId}`, { keys: Object.keys(patch) });
     return full;
   },
@@ -82,11 +97,14 @@ const configService = {
   },
 
   /**
-   * Modules activés
+   * Modules activés (cache → DB)
    */
   async getModules(guildId) {
-    const guild = await guildQueries.getOrCreate(guildId, 'Unknown', '0');
-    return guild.modules_enabled;
+    const cached = cache.get(`mod:${guildId}`);
+    if (cached) return cached;
+
+    const { modules } = await loadGuild(guildId);
+    return modules;
   },
 
   /**
@@ -94,23 +112,26 @@ const configService = {
    */
   async setModule(guildId, moduleName, enabled) {
     const modules = await guildQueries.updateModules(guildId, { [moduleName]: enabled });
-    cache.del(`guild:${guildId}`);
+    cache.set(`mod:${guildId}`, modules);
+    cache.del(`cfg:${guildId}`); // invalider la config aussi
     log.info(`Module ${moduleName} ${enabled ? 'enabled' : 'disabled'} for ${guildId}`);
     return modules;
   },
 
   /**
-   * Vérifie si un module est activé
+   * Vérifie si un module est activé (cache → DB)
    */
   async isModuleEnabled(guildId, moduleName) {
-    return guildQueries.isModuleEnabled(guildId, moduleName);
+    const modules = await this.getModules(guildId);
+    return modules[moduleName] === true;
   },
 
   /**
    * Invalide le cache d'une guild
    */
   invalidate(guildId) {
-    cache.del(`guild:${guildId}`);
+    cache.del(`cfg:${guildId}`);
+    cache.del(`mod:${guildId}`);
   },
 
   /**
