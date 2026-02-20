@@ -131,6 +131,22 @@ function loadCommands(client) {
  */
 function registerInteractionListener(client) {
   client.on(Events.InteractionCreate, async (interaction) => {
+    // =======================================
+    // Autocomplete (dispatch séparé)
+    // =======================================
+    if (interaction.isAutocomplete()) {
+      const command = client.commands.get(interaction.commandName);
+      if (!command || typeof command.autocomplete !== 'function') return;
+
+      try {
+        await command.autocomplete(interaction);
+      } catch (err) {
+        log.error(`Erreur autocomplete /${interaction.commandName}: ${err.message}`);
+        try { await interaction.respond([]); } catch { /* expired */ }
+      }
+      return;
+    }
+
     // Ne traiter que les slash commands et le context menu
     if (!interaction.isChatInputCommand() && !interaction.isContextMenuCommand()) return;
 

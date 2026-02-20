@@ -20,8 +20,8 @@ module.exports = {
     .addSubcommand((sub) =>
       sub.setName('setup').setDescription('Configurer les candidatures (admin)')
         .addChannelOption((opt) => opt.setName('channel').setDescription('Channel de réception des candidatures').setRequired(true))
-        .addRoleOption((opt) => opt.setName('reviewer_role').setDescription('Rôle des reviewers'))
-        .addStringOption((opt) => opt.setName('questions').setDescription('Questions séparées par | (max 5)').setRequired(true)))
+        .addStringOption((opt) => opt.setName('questions').setDescription('Questions séparées par | (max 5)').setRequired(true))
+        .addRoleOption((opt) => opt.setName('reviewer_role').setDescription('Rôle des reviewers')))
     .addSubcommand((sub) =>
       sub.setName('list').setDescription('Voir les candidatures (staff)')
         .addStringOption((opt) => opt.setName('statut').setDescription('Filtrer par statut')

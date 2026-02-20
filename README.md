@@ -1,6 +1,6 @@
 # 🚀 Ultra Suite v2.0
 
-Bot Discord modulaire tout-en-un — **19 modules**, **35+ commandes slash**, **architecture multi-serveur** avec base de données, système de configuration par serveur, et déploiement Docker.
+Bot Discord modulaire tout-en-un — **22 modules**, **42+ commandes slash**, **architecture multi-serveur** avec base de données optimisée, système de configuration par serveur, et déploiement Pterodactyl.
 
 ---
 
@@ -10,7 +10,6 @@ Bot Discord modulaire tout-en-un — **19 modules**, **35+ commandes slash**, **
 - [Prérequis](#-prérequis)
 - [Installation](#-installation)
 - [Configuration](#-configuration)
-- [Déploiement Docker](#-déploiement-docker)
 - [Architecture](#-architecture)
 - [Modules](#-modules)
 - [Commandes](#-commandes)
@@ -22,8 +21,8 @@ Bot Discord modulaire tout-en-un — **19 modules**, **35+ commandes slash**, **
 ## ✨ Fonctionnalités
 
 - **Multi-serveur** : configuration indépendante par serveur avec cache mémoire
-- **19 modules** activables/désactivables individuellement par serveur
-- **35+ commandes slash** avec sous-commandes, autocomplete et modals
+- **22 modules** activables/désactivables individuellement par serveur
+- **42+ commandes slash** avec sous-commandes, autocomplete et modals
 - **Automod** : anti-spam, anti-lien, anti-mention, filtres regex/mots/domaines
 - **Système de sanctions** : case system avec numérotation séquentielle, historique, DM
 - **XP & Niveaux** : cooldown, rôles récompenses, leaderboard paginé
@@ -109,29 +108,6 @@ node index.js
 
 ---
 
-## 🐳 Déploiement Docker
-
-```bash
-# Démarrer le bot + MariaDB
-docker compose up -d
-
-# Voir les logs
-docker compose logs -f bot
-
-# Arrêter
-docker compose down
-
-# Rebuild après modification
-docker compose up -d --build
-```
-
-Variables dans `.env` :
-- `DB_PASSWORD` : mot de passe MariaDB (défaut: ultrasuite)
-- `DB_ROOT_PASSWORD` : mot de passe root MariaDB
-- `DB_EXTERNAL_PORT` : port externe MariaDB (défaut: 3307)
-
----
-
 ## 🏗️ Architecture
 
 ```
@@ -140,8 +116,6 @@ ultra-suite/
 ├── deploy.js                # Déploiement des commandes slash
 ├── package.json
 ├── .env.example
-├── Dockerfile
-├── docker-compose.yml
 │
 ├── core/
 │   ├── configService.js     # Cache config multi-serveur
@@ -159,9 +133,10 @@ ultra-suite/
 │       └── eventCleanupTask.js
 │
 ├── database/
-│   ├── index.js             # Pool Knex + healthcheck
-│   ├── guildQueries.js      # Requêtes guild helpers
-│   ├── knexfile.js
+│   ├── index.js             # Pool Knex + healthcheck + reconnexion auto
+│   ├── guildQueries.js      # Requêtes guild helpers (CRUD, export/import)
+│   ├── queryHelpers.js      # Helpers multi-serveur (users, sanctions, logs, leaderboards)
+│   ├── knexfile.js          # Config MySQL multi-serveur
 │   └── migrations/
 │       ├── 001_initial_schema.js
 │       ├── 002_extended_tables.js
@@ -287,7 +262,19 @@ ultra-suite/
 
 ## 🗄️ Base de données
 
-### 3 migrations
+### Architecture multi-serveur
+
+Un seul pool de connexions MySQL, les données séparées par `guild_id` dans chaque table. Les FK CASCADE assurent le nettoyage automatique quand une guild est supprimée.
+
+**Fonctionnalités du layer DB :**
+- Retry exponentiel avec jitter à l'initialisation
+- Health monitoring périodique (60s) avec reconnexion automatique
+- Migration lock cleanup (récupération après crash)
+- Transaction helper pour les opérations atomiques
+- Query helpers : pagination, bulk insert, leaderboards
+- Export/Import de configuration par guild
+
+### 3 migrations (idempotentes)
 
 **001** — Tables fondamentales : `guilds`, `guild_config`, `guild_modules`, `users`, `sanctions`, `tickets`, `transactions`, `daily_metrics`
 
@@ -307,6 +294,21 @@ npx knex migrate:rollback --knexfile database/knexfile.js
 # Status
 npx knex migrate:status --knexfile database/knexfile.js
 ```
+
+### Variables DB (.env)
+
+| Variable | Description | Défaut |
+|----------|-------------|--------|
+| `DB_HOST` | Hôte MySQL | `127.0.0.1` |
+| `DB_PORT` | Port MySQL | `3306` |
+| `DB_USER` | Utilisateur | `root` |
+| `DB_PASSWORD` | Mot de passe | |
+| `DB_NAME` | Base de données | `ultra_suite` |
+| `DB_POOL_MAX` | Max connexions pool | `10` |
+| `DB_MAX_RETRIES` | Tentatives de connexion | `7` |
+| `DB_HEALTH_INTERVAL` | Intervalle health check (ms) | `60000` |
+| `DB_SSL` | Activer SSL | `false` |
+| `DB_DEBUG` | Mode debug SQL | `false` |
 
 ---
 
@@ -342,11 +344,11 @@ npx knex migrate:status --knexfile database/knexfile.js
 
 | Métrique | Valeur |
 |----------|--------|
-| Fichiers | ~85 |
-| Commandes slash | 35+ |
+| Fichiers | ~90 |
+| Commandes slash | 42+ |
 | Sous-commandes | ~100 |
-| Modules | 19 |
-| Tables DB | 18 |
+| Modules | 22 |
+| Tables DB | 25+ |
 | Migrations | 3 |
 | Locales | 2 (FR, EN) |
 | Tâches planifiées | 4 |
@@ -360,4 +362,4 @@ MIT — Usage libre, attribution appréciée.
 
 ---
 
-*Ultra Suite v2.0 — Développé avec discord.js v14 & Knex.js*
+*Ultra Suite v2.0 — Développé avec discord.js v14 & Knex.js — Déployé via Pterodactyl*

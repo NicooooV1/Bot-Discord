@@ -1,160 +1,110 @@
 // ===================================
-// Ultra Suite — /setup
-// Assistant de configuration guidé
-// Active les modules essentiels et configure les channels
+// Ultra Suite — /ban
+// Bannir un membre avec case system
+// Supporte les tempbans (durée optionnelle)
 // ===================================
 
-const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, StringSelectMenuBuilder, ChannelType } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
+const { t } = require('../../core/i18n');
+const { getDb } = require('../../database');
 const configService = require('../../core/configService');
-
-// Presets par type de serveur
-const PRESETS = {
-  community: {
-    label: 'Communauté',
-    modules: ['moderation', 'logs', 'onboarding', 'xp', 'roles', 'utility', 'fun', 'stats'],
-    description: 'Serveur communautaire classique avec XP, modération et rôles.',
-  },
-  gaming: {
-    label: 'Gaming',
-    modules: ['moderation', 'logs', 'onboarding', 'xp', 'economy', 'roles', 'utility', 'fun', 'tempvoice', 'stats'],
-    description: 'Serveur gaming avec XP, économie, salons vocaux temporaires.',
-  },
-  rp: {
-    label: 'Roleplay',
-    modules: ['moderation', 'logs', 'onboarding', 'xp', 'economy', 'roles', 'rp', 'events', 'utility'],
-    description: 'Serveur RP avec fiches personnages, économie et événements.',
-  },
-  business: {
-    label: 'Professionnel',
-    modules: ['moderation', 'logs', 'tickets', 'onboarding', 'tags', 'utility', 'announcements'],
-    description: 'Serveur pro avec tickets, tags FAQ et annonces.',
-  },
-  school: {
-    label: 'Éducation',
-    modules: ['moderation', 'logs', 'onboarding', 'tickets', 'tags', 'roles', 'utility', 'announcements'],
-    description: 'Serveur éducatif avec tickets, rôles et annonces.',
-  },
-};
+const { parseDuration } = require('../../utils/formatters');
 
 module.exports = {
-  module: 'admin',
-  adminOnly: true,
-  cooldown: 10,
+  module: 'moderation',
+  cooldown: 3,
 
   data: new SlashCommandBuilder()
-    .setName('setup')
-    .setDescription('Assistant de configuration guidé pour le serveur')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((opt) =>
-      opt.setName('preset')
-        .setDescription('Choisir un preset de configuration')
-        .addChoices(
-          { name: '🏘️ Communauté', value: 'community' },
-          { name: '🎮 Gaming', value: 'gaming' },
-          { name: '🎭 Roleplay', value: 'rp' },
-          { name: '💼 Professionnel', value: 'business' },
-          { name: '🎓 Éducation', value: 'school' },
-        ))
-    .addChannelOption((opt) =>
-      opt.setName('logs')
-        .setDescription('Channel pour les logs du bot')
-        .addChannelTypes(ChannelType.GuildText))
-    .addChannelOption((opt) =>
-      opt.setName('welcome')
-        .setDescription('Channel de bienvenue')
-        .addChannelTypes(ChannelType.GuildText))
-    .addChannelOption((opt) =>
-      opt.setName('modlog')
-        .setDescription('Channel pour les logs de modération')
-        .addChannelTypes(ChannelType.GuildText)),
+    .setName('ban')
+    .setDescription('Bannir un membre du serveur')
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à bannir').setRequired(true))
+    .addStringOption((opt) => opt.setName('raison').setDescription('Raison du bannissement'))
+    .addStringOption((opt) => opt.setName('durée').setDescription('Durée du ban temporaire (ex: 7d, 24h)'))
+    .addIntegerOption((opt) => opt.setName('delete_messages').setDescription('Supprimer les messages (jours, 0-7)')
+      .setMinValue(0).setMaxValue(7)),
 
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
+    const target = interaction.options.getUser('membre');
+    const reason = interaction.options.getString('raison') || 'Aucune raison spécifiée';
+    const durationStr = interaction.options.getString('durée');
+    const deleteMessageDays = interaction.options.getInteger('delete_messages') || 0;
     const guildId = interaction.guildId;
-    const preset = interaction.options.getString('preset');
-    const logsChannel = interaction.options.getChannel('logs');
-    const welcomeChannel = interaction.options.getChannel('welcome');
-    const modLogChannel = interaction.options.getChannel('modlog');
 
-    const changes = [];
+    const member = await interaction.guild.members.fetch(target.id).catch(() => null);
 
-    // 1. Appliquer le preset
-    if (preset && PRESETS[preset]) {
-      const p = PRESETS[preset];
-
-      // Réinitialiser tous les modules à false d'abord
-      const allModules = configService.AVAILABLE_MODULES;
-      for (const mod of allModules) {
-        await configService.setModule(guildId, mod, false);
+    // Vérifications de sécurité
+    if (member) {
+      if (member.id === interaction.user.id) {
+        return interaction.reply({ content: '❌ Vous ne pouvez pas vous bannir vous-même.', ephemeral: true });
       }
-
-      // Activer les modules du preset
-      for (const mod of p.modules) {
-        await configService.setModule(guildId, mod, true);
+      if (member.id === interaction.guild.ownerId) {
+        return interaction.reply({ content: '❌ Impossible de bannir le propriétaire du serveur.', ephemeral: true });
       }
-
-      changes.push(`📦 Preset **${p.label}** appliqué (${p.modules.length} modules activés)`);
+      if (member.roles.highest.position >= interaction.member.roles.highest.position) {
+        return interaction.reply({ content: '❌ Ce membre a un rôle supérieur ou égal au vôtre.', ephemeral: true });
+      }
+      if (!member.bannable) {
+        return interaction.reply({ content: '❌ Je ne peux pas bannir ce membre.', ephemeral: true });
+      }
     }
 
-    // 2. Configurer les channels
-    const configPatch = {};
-
-    if (logsChannel) {
-      configPatch.logChannel = logsChannel.id;
-      changes.push(`📋 Channel logs → ${logsChannel}`);
+    // Durée du tempban
+    let expiresAt = null;
+    let banType = 'BAN';
+    if (durationStr) {
+      const seconds = parseDuration(durationStr);
+      if (!seconds || seconds < 60) {
+        return interaction.reply({ content: '❌ Durée invalide. Exemples : `1h`, `7d`, `30d`', ephemeral: true });
+      }
+      expiresAt = new Date(Date.now() + seconds * 1000);
+      banType = 'TEMPBAN';
     }
 
-    if (welcomeChannel) {
-      configPatch.welcomeChannel = welcomeChannel.id;
-      configPatch.goodbyeChannel = welcomeChannel.id; // Même channel par défaut
-      changes.push(`👋 Channel bienvenue → ${welcomeChannel}`);
-    }
+    await interaction.deferReply();
 
-    if (modLogChannel) {
-      configPatch.modLogChannel = modLogChannel.id;
-      changes.push(`🔨 Channel logs modération → ${modLogChannel}`);
-    }
+    // DM avant ban
+    try {
+      const dmMsg = await t(guildId, 'moderation.ban.dm', { guild: interaction.guild.name, reason });
+      await target.send({ content: dmMsg }).catch(() => {});
+    } catch { /* DMs fermés */ }
 
-    if (Object.keys(configPatch).length > 0) {
-      await configService.set(guildId, configPatch);
-    }
-
-    // 3. Résumé
-    if (changes.length === 0) {
-      return interaction.editReply({
-        content:
-          '⚠️ Aucun paramètre spécifié.\n\n' +
-          '**Utilisation :**\n' +
-          '`/setup preset:Gaming logs:#logs welcome:#general`\n\n' +
-          '**Presets disponibles :** Communauté, Gaming, Roleplay, Professionnel, Éducation',
-      });
-    }
-
-    const embed = new EmbedBuilder()
-      .setTitle('✅ Configuration appliquée')
-      .setDescription(changes.join('\n'))
-      .setColor(0x57F287)
-      .setTimestamp();
-
-    if (preset && PRESETS[preset]) {
-      embed.addFields({
-        name: 'Modules activés',
-        value: PRESETS[preset].modules.map((m) => `\`${m}\``).join(', '),
-        inline: false,
-      });
-    }
-
-    embed.addFields({
-      name: 'Prochaines étapes',
-      value: [
-        '• `/config view` — Voir la configuration complète',
-        '• `/module list` — Voir les modules activés',
-        '• `/config set` — Ajuster les paramètres individuels',
-      ].join('\n'),
-      inline: false,
+    // Ban
+    await interaction.guild.members.ban(target.id, {
+      reason: `${reason} — par ${interaction.user.tag}`,
+      deleteMessageSeconds: deleteMessageDays * 86400,
     });
 
-    return interaction.editReply({ embeds: [embed] });
+    // Case
+    const db = getDb();
+    const last = await db('sanctions').where('guild_id', guildId).max('case_number as max').first();
+    const caseNumber = (last?.max || 0) + 1;
+    await db('sanctions').insert({
+      guild_id: guildId, case_number: caseNumber, type: banType,
+      target_id: target.id, moderator_id: interaction.user.id,
+      reason, active: true, expires_at: expiresAt,
+    });
+
+    const durationText = durationStr ? ` (${durationStr})` : ' (permanent)';
+    const embed = new EmbedBuilder()
+      .setDescription(`🔨 **${target.tag}** a été banni${durationText}.\nRaison : ${reason}`)
+      .setColor(0xED4245)
+      .addFields({ name: 'Case', value: `#${caseNumber}`, inline: true })
+      .setTimestamp();
+
+    if (expiresAt) {
+      embed.addFields({ name: 'Expire', value: `<t:${Math.floor(expiresAt.getTime() / 1000)}:R>`, inline: true });
+    }
+
+    await interaction.editReply({ embeds: [embed] });
+
+    // Mod log
+    try {
+      const config = await configService.get(guildId);
+      if (config.modLogChannel) {
+        const ch = interaction.guild.channels.cache.get(config.modLogChannel);
+        if (ch) await ch.send({ embeds: [embed] });
+      }
+    } catch { /* Non critique */ }
   },
 };

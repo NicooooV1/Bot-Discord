@@ -7,8 +7,6 @@ node_modules/
 # Variables d'environnement (SECRETS)
 # ===================================
 .env
-.env.local
-.env.production
 
 # ===================================
 # Base de données SQLite

@@ -1,6 +1,6 @@
 // ===================================
 // Ultra Suite — Knex Configuration
-// MySQL (mysql2) — phpMyAdmin compatible
+// MySQL (mysql2) — Multi-serveur
 //
 // Un seul pool de connexions pour tous les serveurs.
 // Les données sont séparées par guild_id dans chaque table.
@@ -26,17 +26,27 @@ const connection = {
   // Charset UTF-8 complet (emojis, caractères spéciaux)
   charset: 'utf8mb4',
 
+  // Fuseau horaire UTC pour cohérence multi-serveur
+  timezone: '+00:00',
+
   // Retourner les dates en string ISO (cohérent avec le code JS)
   dateStrings: true,
 
-  // Timeouts de connexion (évite de bloquer indéfiniment)
-  connectTimeout: 10000,    // 10s pour établir la connexion
-  acquireTimeout: 10000,    // 10s pour obtenir une connexion du pool
+  // Timeout de connexion initiale (évite de bloquer indéfiniment)
+  connectTimeout: 10000, // 10s
 
   // Reconnexion automatique si la connexion est perdue
   // (Pterodactyl peut redémarrer MySQL)
   enableKeepAlive: true,
   keepAliveInitialDelay: 30000, // 30s
+
+  // Autoriser plusieurs requêtes dans un seul appel (utile pour les migrations)
+  multipleStatements: false,
+
+  // Support SSL optionnel (si DB distante)
+  ...(process.env.DB_SSL === 'true' && {
+    ssl: { rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false' },
+  }),
 };
 
 // ===================================
@@ -56,17 +66,36 @@ const pool = {
   // Timeout pour obtenir une connexion du pool (ms)
   acquireTimeoutMillis: 15000, // 15s
 
+  // Timeout pour créer une nouvelle connexion (ms)
+  createTimeoutMillis: 10000, // 10s
+
+  // Intervalle de retry si la création échoue (ms)
+  createRetryIntervalMillis: 500,
+
   // Timeout d'inactivité avant de fermer une connexion (ms)
-  idleTimeoutMillis: 30000, // 30s
+  idleTimeoutMillis: isProduction ? 60000 : 30000,
 
   // Intervalle de vérification des connexions mortes (ms)
   reapIntervalMillis: 1000,
 
-  // Vérifier que la connexion est valide avant de la donner
+  // Propager les erreurs de création de connexion (ne pas rester bloqué)
+  propagateCreateError: false,
+
+  // Configurer chaque nouvelle connexion
   afterCreate(conn, done) {
+    // Exécuter les SETtings de session séquentiellement
+    // (multipleStatements est désactivé pour la sécurité)
     conn.query('SET SESSION wait_timeout = 28800', (err) => {
-      // 8h de timeout session (défaut MySQL)
-      done(err, conn);
+      if (err) return done(err, conn);
+      conn.query('SET SESSION interactive_timeout = 28800', (err2) => {
+        if (err2) return done(err2, conn);
+        conn.query("SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'", (err3) => {
+          if (err3) return done(err3, conn);
+          conn.query("SET SESSION time_zone = '+00:00'", (err4) => {
+            done(err4, conn);
+          });
+        });
+      });
     });
   },
 };
@@ -85,6 +114,8 @@ module.exports = {
     tableName: 'knex_migrations',
     // Trier les migrations par nom de fichier
     sortDirsSeparately: true,
+    // Charger les extensions .js
+    loadExtensions: ['.js'],
   },
 
   // Répertoire des seeds (optionnel, pour les données de test)
@@ -95,11 +126,19 @@ module.exports = {
   // Options de debug (désactivé en production)
   debug: process.env.DB_DEBUG === 'true',
 
-  // Log des requêtes lentes (> 1s)
+  // Wrapper de requête pour monitoring multi-serveur
+  wrapIdentifier: (value, origImpl) => origImpl(value),
+
+  // Log structuré
   log: {
     warn(message) {
-      if (message?.includes?.('long running')) {
-        console.warn('[DB SLOW]', message);
+      // Log les requêtes lentes et les avertissements
+      if (typeof message === 'string') {
+        if (message.includes('long running')) {
+          console.warn('[DB SLOW]', message);
+        } else if (message.includes('migration')) {
+          console.warn('[DB MIGRATION]', message);
+        }
       }
     },
     error(message) {

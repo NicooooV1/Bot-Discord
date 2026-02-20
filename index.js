@@ -16,6 +16,7 @@ const { loadLocales } = require('./core/i18n');
 const { startScheduler, stopScheduler } = require('./core/scheduler');
 const { startApi, stopApi } = require('./core/api');
 const guildQueries = require('./database/guildQueries');
+const moduleRegistry = require('./core/moduleRegistry');
 
 const log = createModuleLogger('Main');
 
@@ -110,6 +111,10 @@ async function start() {
   // 2. Initialiser la base de données (migrations auto)
   await db.init();
   log.info('✔ Base de données initialisée (MySQL)');
+
+  // 2b. Charger les manifests de modules
+  moduleRegistry.loadAll();
+  log.info(`✔ Module Registry : ${moduleRegistry.getAll().length} module(s) enregistré(s)`);
 
   // 3. Charger les commandes (toutes les slash commands)
   loadCommands(client);

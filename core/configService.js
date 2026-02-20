@@ -104,8 +104,8 @@ const DEFAULT_MODULES = {
   xp: false,
   economy: false,
   roles: false,
-  utility: true,     // Utilitaire activé par défaut (ping, serverinfo, etc.)
-  fun: true,          // Fun activé par défaut
+  utility: false,     // Zéro comportement par défaut — activer via /config
+  fun: false,          // Zéro comportement par défaut — activer via /config
   tags: false,
   announcements: false,
   stats: false,
@@ -312,10 +312,15 @@ const configService = {
   async setModule(guildId, moduleName, enabled) {
     if (!guildId || !moduleName) return null;
 
-    // Valider que le module existe
-    if (!(moduleName in DEFAULT_MODULES)) {
-      log.warn(`Module inconnu : "${moduleName}" (guild ${guildId})`);
-      // On l'accepte quand même pour la flexibilité (modules custom futurs)
+    // Valider que le module est enregistré dans le registry
+    // Accepté même si absent (flexibilité pour modules custom)
+    try {
+      const moduleRegistry = require('./moduleRegistry');
+      if (!moduleRegistry.has(moduleName) && !(moduleName in DEFAULT_MODULES)) {
+        log.warn(`Module inconnu : "${moduleName}" (guild ${guildId})`);
+      }
+    } catch {
+      // moduleRegistry pas encore chargé — pas grave
     }
 
     try {
