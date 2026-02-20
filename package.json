@@ -1,11 +1,15 @@
 {
-  "name": "ultra-suite-bot",
-  "version": "2.0.0",
-  "description": "Bot Discord Ultra Suite — 22 modules, modulaire, configurable, Pterodactyl-ready",
+  "name": "ultra-bot",
+  "version": "2.1.0",
+  "description": "Bot Discord Ultra — 22 modules, modulaire, multi-serveur, configurable, Pterodactyl-ready",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "deploy": "node deploy-commands.js",
+    "deploy": "node deploy-commands.js --global",
+    "deploy:dev": "node deploy-commands.js --dev",
+    "deploy:global": "node deploy-commands.js --global",
+    "deploy:clean": "node deploy-commands.js --clean",
+    "deploy:clean-global": "node deploy-commands.js --clean-global",
     "test": "jest --passWithNoTests"
   },
   "dependencies": {

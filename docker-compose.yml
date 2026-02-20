@@ -1,0 +1,54 @@
+# ===================================
+# Ultra Suite — Docker Compose
+# Déploiement simple : bot + MariaDB
+# ===================================
+
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: ultra-suite-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CLIENT_ID=${CLIENT_ID}
+      - GUILD_ID=${GUILD_ID:-}
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_USER=ultrasuite
+      - DB_PASSWORD=${DB_PASSWORD:-ultrasuite}
+      - DB_NAME=ultrasuite
+      - NODE_ENV=${NODE_ENV:-production}
+      - DEFAULT_LOCALE=${DEFAULT_LOCALE:-fr}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - OWNER_ID=${OWNER_ID:-}
+    volumes:
+      - ./logs:/app/logs
+
+  db:
+    image: mariadb:11
+    container_name: ultra-suite-db
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD:-rootpassword}
+      - MARIADB_DATABASE=ultrasuite
+      - MARIADB_USER=ultrasuite
+      - MARIADB_PASSWORD=${DB_PASSWORD:-ultrasuite}
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "${DB_EXTERNAL_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  db_data:
+    driver: local

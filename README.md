@@ -1,374 +1,363 @@
-<div align="center">
+# 🚀 Ultra Suite v2.0
 
-# 🚀 Ultra Suite Bot — v2.0
-
-Bot Discord modulaire tout-en-un développé avec **discord.js v14** : 22 modules activables indépendamment, architecture Pterodactyl-ready, MySQL (phpMyAdmin).
-
-[![Discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)](https://discord.js.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MySQL](https://img.shields.io/badge/MySQL-mysql2-4479A1?logo=mysql&logoColor=white)](https://github.com/sidorares/node-mysql2)
-
-</div>
+Bot Discord modulaire tout-en-un — **19 modules**, **35+ commandes slash**, **architecture multi-serveur** avec base de données, système de configuration par serveur, et déploiement Docker.
 
 ---
 
-## 📑 Table des matières
+## 📋 Table des matières
 
-- [Modules](#-modules)
-- [Architecture](#-architecture)
+- [Fonctionnalités](#-fonctionnalités)
+- [Prérequis](#-prérequis)
 - [Installation](#-installation)
 - [Configuration](#-configuration)
-- [Structure du projet](#-structure-du-projet)
+- [Déploiement Docker](#-déploiement-docker)
+- [Architecture](#-architecture)
+- [Modules](#-modules)
 - [Commandes](#-commandes)
-- [Déploiement Pterodactyl](#-déploiement-pterodactyl)
-- [Contribuer](#-contribuer)
-- [Licence](#-licence)
+- [Base de données](#-base-de-données)
+- [Développement](#-développement)
 
 ---
 
-## ✨ Modules
+## ✨ Fonctionnalités
 
-Chaque module est **activable/désactivable indépendamment** via `/setup module`.
+- **Multi-serveur** : configuration indépendante par serveur avec cache mémoire
+- **19 modules** activables/désactivables individuellement par serveur
+- **35+ commandes slash** avec sous-commandes, autocomplete et modals
+- **Automod** : anti-spam, anti-lien, anti-mention, filtres regex/mots/domaines
+- **Système de sanctions** : case system avec numérotation séquentielle, historique, DM
+- **XP & Niveaux** : cooldown, rôles récompenses, leaderboard paginé
+- **Économie** : monnaie virtuelle, daily/weekly avec streaks, boutique, vol, classement
+- **Tickets** : panel avec boutons persistants, claim, permissions dynamiques
+- **Rôles** : menus de rôles avec select menu persistant
+- **Tags/FAQ** : réponses rapides avec autocomplete et compteur d'utilisation
+- **Candidatures** : formulaire modal, review par boutons accept/reject, DM
+- **Événements** : RSVP avec boutons, max participants, statuts
+- **RP** : fiches personnage, inventaire, système MJ
+- **Commandes custom** : triggers texte personnalisés par serveur
+- **Vocaux temporaires** : création auto + gestion propriétaire (lock/rename/kick)
+- **Stats** : dashboard serveur, métriques quotidiennes, graphiques ASCII
+- **Rappels** : système de rappels personnels avec durées flexibles
+- **i18n** : français + anglais avec système de traduction extensible
+- **API REST** : healthcheck et endpoints stats (optionnel)
 
-| # | Module | Commandes | Description |
-|---|--------|-----------|-------------|
-| 1 | 🔨 **Modération** | ban, kick, warn, timeout, unban, clear, slowmode, lock, nick, modlogs, warnings, case | Système complet avec cases, auto-actions, tempban |
-| 2 | 🎫 **Tickets** | ticket (panel, open, close, add, remove, assign) | Tickets support avec transcript, notation |
-| 3 | 📋 **Logs** | — (événements automatiques) | Messages, membres, voix, modération |
-| 4 | 🛡️ **Sécurité** | — (automatique) | Anti-spam, anti-lien, anti-mass-mention |
-| 5 | 👋 **Onboarding** | — (automatique) | Bienvenue, départ, auto-rôle |
-| 6 | ⭐ **XP & Niveaux** | rank, leaderboard | Niveaux, rôles récompenses, classement |
-| 7 | 💰 **Économie** | balance, daily, pay, bank | Monnaie virtuelle, banque, transactions |
-| 8 | 🎭 **Rôles** | rolemenu (create, add, send) | Menus de rôles auto-assignables (boutons/select) |
-| 9 | 🔧 **Utilitaire** | serverinfo, userinfo, avatar, reminder, ping | Outils pratiques |
-| 10 | 🎮 **Fun** | poll, 8ball, coinflip, dice | Mini-jeux et sondages |
-| 11 | 🏷️ **Tags / FAQ** | tag (show, create, delete, list) | Réponses pré-enregistrées avec autocomplete |
-| 12 | 📢 **Annonces** | announce | Embeds personnalisés dans n'importe quel salon |
-| 13 | 📊 **Statistiques** | stats | Métriques bot & serveur temps réel |
-| 14 | 🔊 **TempVoice** | tempvoice (name, limit, lock, unlock, permit, reject) | Salons vocaux temporaires personnalisables |
-| 15 | 📝 **Candidatures** | apply (start, review, accept, deny) | Système de candidatures avec formulaire modal |
-| 16 | 🎉 **Événements** | event (create, info, list, cancel) | Événements avec inscription par bouton |
-| 17 | ⚙️ **Commandes custom** | customcmd (create, delete, list) | Commandes personnalisées par serveur |
-| 18 | 🎵 **Musique** | music (play, stop, skip, queue, pause, volume) | Préparé pour intégration future |
-| 19 | 🎭 **RP** | rp (create, profile, delete) | Fiches personnage jeu de rôle |
-| 20 | ⚙️ **Admin** | setup, help | Configuration complète du bot |
+---
+
+## 📦 Prérequis
+
+| Outil | Version |
+|-------|---------|
+| Node.js | ≥ 18.0 |
+| npm | ≥ 9.0 |
+| MariaDB / MySQL | ≥ 10.6 / 8.0 |
+
+---
+
+## 🔧 Installation
+
+```bash
+# 1. Cloner le repo
+git clone https://github.com/votre-user/ultra-suite.git
+cd ultra-suite
+
+# 2. Installer les dépendances
+npm install
+
+# 3. Copier et configurer l'environnement
+cp .env.example .env
+# Éditer .env avec vos tokens et identifiants
+
+# 4. Exécuter les migrations
+npx knex migrate:latest --knexfile database/knexfile.js
+
+# 5. Déployer les commandes slash
+node deploy.js
+
+# 6. Lancer le bot
+node index.js
+```
+
+---
+
+## ⚙️ Configuration
+
+### Variables d'environnement (.env)
+
+| Variable | Description | Requis |
+|----------|-------------|--------|
+| `BOT_TOKEN` | Token du bot Discord | ✅ |
+| `CLIENT_ID` | ID de l'application Discord | ✅ |
+| `GUILD_ID` | ID du serveur de dev (commandes locales) | |
+| `DB_HOST` | Hôte de la base de données | ✅ |
+| `DB_PORT` | Port (défaut: 3306) | |
+| `DB_USER` | Utilisateur DB | ✅ |
+| `DB_PASSWORD` | Mot de passe DB | ✅ |
+| `DB_NAME` | Nom de la base (défaut: ultrasuite) | ✅ |
+| `NODE_ENV` | Environnement (development/production) | |
+| `DEFAULT_LOCALE` | Langue par défaut (fr/en) | |
+| `OWNER_ID` | ID du propriétaire du bot | |
+
+### Configuration en jeu
+
+```
+/setup        → Configuration guidée avec presets
+/config view  → Voir toute la configuration
+/config set   → Modifier une clé de config
+/module list  → État des modules
+/module enable/disable → Activer/désactiver un module
+```
+
+---
+
+## 🐳 Déploiement Docker
+
+```bash
+# Démarrer le bot + MariaDB
+docker compose up -d
+
+# Voir les logs
+docker compose logs -f bot
+
+# Arrêter
+docker compose down
+
+# Rebuild après modification
+docker compose up -d --build
+```
+
+Variables dans `.env` :
+- `DB_PASSWORD` : mot de passe MariaDB (défaut: ultrasuite)
+- `DB_ROOT_PASSWORD` : mot de passe root MariaDB
+- `DB_EXTERNAL_PORT` : port externe MariaDB (défaut: 3307)
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-JavaScript pur (CommonJS) — Pas de TypeScript, pas de build step
-├── discord.js v14           — Framework Discord
-├── mysql2 + Knex            — Base de données MySQL (phpMyAdmin)
-├── node-cron                — Tâches planifiées (sanctions, rappels, nettoyage)
-├── node-cache               — Cache mémoire TTL pour configs
-├── winston                  — Logging rotatif fichier + console
-├── express                  — API REST optionnelle (health check)
-└── Pterodactyl-ready        — Single process, pas de Docker-in-Docker
-```
-
-**MySQL uniquement** — pas de Redis, pas de PostgreSQL, compatible phpMyAdmin.
-
----
-
-## 🚀 Installation
-
-### 1. Cloner le dépôt
-
-```bash
-git clone https://github.com/NicooooV1/Bot-Discord.git
-cd Bot-Discord
-```
-
-### 2. Installer les dépendances
-
-```bash
-npm install
-```
-
-### 3. Configurer les variables d'environnement
-
-```bash
-cp .env.example .env
-```
-
-Éditez `.env` :
-
-```env
-BOT_TOKEN=votre_token_ici
-CLIENT_ID=votre_client_id_ici
-GUILD_ID=votre_guild_id_ici   # Dev = instantané, vide = global (~1h)
-NODE_ENV=production
-LOG_LEVEL=info
-DEFAULT_LOCALE=fr
-
-# MySQL (phpMyAdmin)
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_USER=root
-DB_PASSWORD=motdepasse
-DB_NAME=ultra_suite
-```
-
-> ⚠️ **Ne partagez JAMAIS votre token !** Le fichier `.env` est exclu via `.gitignore`.
-
-### 4. Déployer les commandes slash
-
-```bash
-npm run deploy
-```
-
-### 5. Lancer le bot
-
-```bash
-npm start
-```
-
-Les tables MySQL sont créées automatiquement via les migrations au premier lancement.
-
-### Intents requis (Developer Portal > Bot)
-
-- ✅ **Presence Intent**
-- ✅ **Server Members Intent**
-- ✅ **Message Content Intent**
-
-> **Lien d'invitation** (remplacez `CLIENT_ID`) :
-> ```
-> https://discord.com/api/oauth2/authorize?client_id=CLIENT_ID&permissions=1632113078534&scope=bot%20applications.commands
-> ```
-
----
-
-## ⚙️ Configuration
-
-### Configuration par serveur via `/setup`
-
-```
-/setup module moderation true     → Active la modération
-/setup module xp true             → Active le système XP
-/setup logs #salon-logs           → Salon des logs
-/setup modlogs #mod-logs          → Salon des logs de modération
-/setup welcome #bienvenue         → Salon bienvenue/départ
-/setup tickets #catégorie         → Catégorie des tickets
-/setup muterole @Muted            → Rôle mute legacy
-/setup view                       → Voir la config actuelle
-/setup reset                      → Réinitialiser
-```
-
-### Modules activables
-
-Chaque module peut être activé/désactivé indépendamment :
-```
-/setup module <nom> <true|false>
-```
-
-Modules disponibles : `moderation`, `tickets`, `logs`, `security`, `onboarding`, `xp`, `economy`, `roles`, `utility`, `fun`, `tags`, `announcements`, `stats`, `tempvoice`, `applications`, `events`, `custom_commands`, `music`, `rp`
-
----
-
-## 📁 Structure du projet
-
-```
-Bot-Discord/
-├── src/                          # ← Code v2.0
-│   ├── index.js                  # Point d'entrée principal
-│   ├── deploy-commands.js        # Déploiement des slash commands
-│   │
-│   ├── core/                     # Framework
-│   │   ├── logger.js             # Winston (console + fichiers rotatifs)
-│   │   ├── configService.js      # Config par serveur avec cache
-│   │   ├── eventBus.js           # Bus d'événements interne
-│   │   ├── i18n.js               # Internationalisation (fr/en)
-│   │   ├── commandHandler.js     # Chargement dynamique des commandes
-│   │   ├── eventHandler.js       # Chargement dynamique des événements
-│   │   ├── componentHandler.js   # Chargement boutons/selects/modals
-│   │   ├── scheduler.js          # Tâches cron planifiées
-│   │   └── api.js                # API REST optionnelle
-│   │
-│   ├── database/                 # Couche données
-│   │   ├── knexfile.js           # Config Knex + MySQL
-│   │   ├── index.js              # Init DB + migrations
-│   │   ├── migrations/           # Schéma (27 tables)
-│   │   ├── guildQueries.js       # Requêtes guilds
-│   │   ├── userQueries.js        # Requêtes users
-│   │   ├── sanctionQueries.js    # Requêtes sanctions
-│   │   ├── logQueries.js         # Requêtes logs
-│   │   └── ticketQueries.js      # Requêtes tickets
-│   │
-│   ├── commands/                 # Commandes par module
-│   │   ├── admin/                # setup, help
-│   │   ├── moderation/           # ban, kick, warn, timeout, ...
-│   │   ├── tickets/              # ticket
-│   │   ├── xp/                   # rank, leaderboard
-│   │   ├── economy/              # balance, daily, pay, bank
-│   │   ├── roles/                # rolemenu
-│   │   ├── utility/              # serverinfo, userinfo, avatar, reminder, ping
-│   │   ├── fun/                  # poll, 8ball, coinflip, dice
-│   │   ├── tags/                 # tag
-│   │   ├── announcements/        # announce
-│   │   ├── stats/                # stats
-│   │   ├── tempvoice/            # tempvoice
-│   │   ├── applications/         # apply
-│   │   ├── events/               # event
-│   │   ├── custom_commands/      # customcmd
-│   │   ├── music/                # music (stub)
-│   │   └── rp/                   # rp
-│   │
-│   ├── events/                   # Événements Discord
-│   │   ├── client/               # ready, interactionCreate, guildCreate
-│   │   ├── logs/                 # messageDelete, messageUpdate
-│   │   └── guild/                # memberAdd/Remove, voiceState, messageCreate
-│   │
-│   ├── components/               # Composants interactifs
-│   │   ├── buttons/              # ticket_open, ticket_close, rolebtn, event_join/leave
-│   │   ├── selects/              # rolemenu
-│   │   └── modals/               # apply_modal
-│   │
-│   ├── utils/                    # Utilitaires
-│   │   ├── embeds.js             # Constructeurs d'embeds
-│   │   ├── permissions.js        # Vérifications hiérarchie
-│   │   └── formatters.js         # Durées, XP, barres de progression
-│   │
-│   └── locales/                  # Traductions
-│       ├── fr.json               # Français
-│       └── en.json               # English
+ultra-suite/
+├── index.js                 # Point d'entrée — boot, login, handlers
+├── deploy.js                # Déploiement des commandes slash
+├── package.json
+├── .env.example
+├── Dockerfile
+├── docker-compose.yml
 │
-├── data/                         # Données locales (logs, ignoré par git)
-├── logs/                         # Fichiers de logs (auto-créé, ignoré par git)
+├── core/
+│   ├── configService.js     # Cache config multi-serveur
+│   ├── commandHandler.js    # Chargement récursif des commandes
+│   ├── eventHandler.js      # Chargement des événements
+│   ├── componentHandler.js  # Chargement des composants (boutons/selects)
+│   ├── logger.js            # Winston logger avec rotation
+│   ├── i18n.js              # Système de traduction
+│   ├── scheduler.js         # Tâches planifiées
+│   ├── api.js               # API REST optionnelle
+│   └── tasks/
+│       ├── reminderTask.js
+│       ├── tempbanTask.js
+│       ├── tempvoiceTask.js
+│       └── eventCleanupTask.js
 │
-├── index.js                      # Legacy v1 (conservé)
-├── deploy-commands.js            # Legacy v1 (conservé)
-├── commands/                     # Legacy v1 (conservé)
-├── events/                       # Legacy v1 (conservé)
-└── utils/                        # Legacy v1 (conservé)
+├── database/
+│   ├── index.js             # Pool Knex + healthcheck
+│   ├── guildQueries.js      # Requêtes guild helpers
+│   ├── knexfile.js
+│   └── migrations/
+│       ├── 001_initial_schema.js
+│       ├── 002_extended_tables.js
+│       └── 003_modules_tables.js
+│
+├── events/
+│   ├── guildCreate.js
+│   ├── guildDelete.js
+│   ├── guildMemberAdd.js
+│   ├── guildMemberRemove.js
+│   ├── guildMemberUpdate.js
+│   ├── messageCreate.js
+│   ├── messageDelete.js
+│   ├── messageUpdate.js
+│   └── voiceStateUpdate.js
+│
+├── commands/
+│   ├── admin/
+│   │   ├── module.js         # /module list|enable|disable
+│   │   ├── config.js         # /config view|set|reset
+│   │   └── setup.js          # /setup (wizard avec presets)
+│   ├── moderation/
+│   │   ├── ban.js            # /ban (perma + tempban)
+│   │   ├── kick.js           # /kick
+│   │   ├── warn.js           # /warn (auto-action)
+│   │   ├── timeout.js        # /timeout
+│   │   ├── sanctions.js      # /sanctions user|case|clear
+│   │   ├── unban.js          # /unban
+│   │   ├── purge.js          # /purge (filtres avancés)
+│   │   ├── slowmode.js       # /slowmode
+│   │   ├── lock.js           # /lock on|off
+│   │   └── note.js           # /note add|list|delete
+│   ├── tickets/
+│   │   ├── ticket.js         # /ticket create|close|add|remove|claim
+│   │   └── ticketpanel.js    # /ticketpanel
+│   ├── xp/
+│   │   ├── rank.js           # /rank
+│   │   ├── leaderboard.js    # /leaderboard
+│   │   └── xpadmin.js        # /xpadmin set|add|remove|reset|config
+│   ├── economy/
+│   │   ├── daily.js          # /daily (streaks)
+│   │   ├── weekly.js         # /weekly
+│   │   ├── balance.js        # /balance
+│   │   ├── pay.js            # /pay
+│   │   ├── rob.js            # /rob (risque/récompense)
+│   │   ├── shop.js           # /shop list|buy|add|remove
+│   │   ├── ecoleaderboard.js # /richest
+│   │   └── ecoadmin.js       # /ecoadmin give|take|set|reset|config
+│   ├── security/
+│   │   └── automod.js        # /automod status|toggle|filter-*|config
+│   ├── tags/
+│   │   └── tag.js            # /tag use|create|edit|delete|list|info
+│   ├── stats/
+│   │   └── stats.js          # /stats overview|members|messages|moderation
+│   ├── utility/
+│   │   ├── userinfo.js       # /userinfo
+│   │   ├── serverinfo.js     # /serverinfo
+│   │   ├── help.js           # /help (dynamique)
+│   │   ├── ping.js           # /ping (latence + santé)
+│   │   ├── avatar.js         # /avatar
+│   │   ├── embed.js          # /embed
+│   │   ├── announce.js       # /announce
+│   │   ├── reminder.js       # /reminder set|list|delete
+│   │   └── tempvoice.js      # /voice name|limit|lock|unlock|invite|kick
+│   ├── fun/
+│   │   └── fun.js            # /fun 8ball|coinflip|dice|rps|rate|hug
+│   ├── roles/
+│   │   └── rolemenu.js       # /rolemenu create|add|remove|send
+│   ├── applications/
+│   │   └── apply.js          # /apply submit|setup|list
+│   ├── events/
+│   │   └── event.js          # /event create|list|cancel|info
+│   ├── customcmd/
+│   │   └── customcmd.js      # /customcmd create|edit|delete|list
+│   └── rp/
+│       ├── rpprofile.js      # /rpprofile create|view|edit|delete|list
+│       └── rpinventory.js    # /rpinventory view|give|use
+│
+├── components/
+│   ├── tickets/
+│   │   └── ticket-buttons.js
+│   ├── roles/
+│   │   └── rolemenu-select.js
+│   ├── help/
+│   │   └── help-select.js
+│   ├── applications/
+│   │   └── application-handlers.js
+│   └── events/
+│       └── event-buttons.js
+│
+└── locales/
+    ├── fr.json
+    └── en.json
 ```
 
 ---
 
-## 🔨 Commandes
+## 📦 Modules
 
-### Modération (12 commandes)
-
-| Commande | Description | Permission |
-|----------|-------------|-----------|
-| `/ban <user> [raison] [durée] [purge]` | Bannir / tempban | `BAN_MEMBERS` |
-| `/unban <id> [raison]` | Débannir | `BAN_MEMBERS` |
-| `/kick <user> [raison]` | Expulser | `KICK_MEMBERS` |
-| `/warn <user> <raison>` | Avertissement (auto-action au seuil) | `MODERATE_MEMBERS` |
-| `/timeout <user> <durée> [raison]` | Timeout | `MODERATE_MEMBERS` |
-| `/clear <nombre> [user]` | Purger messages (1–100) | `MANAGE_MESSAGES` |
-| `/lock on\|off [salon]` | Verrouiller/déverrouiller | `MANAGE_CHANNELS` |
-| `/slowmode <secondes>` | Mode lent (0–21600s) | `MANAGE_CHANNELS` |
-| `/nick <user> [surnom]` | Modifier surnom | `MANAGE_NICKNAMES` |
-| `/modlogs <user> [type]` | Historique avec filtre et stats | `MODERATE_MEMBERS` |
-| `/warnings <user>` | Warns actifs | `MODERATE_MEMBERS` |
-| `/case <numéro> [revoke]` | Voir/révoquer une sanction | `MODERATE_MEMBERS` |
-
-### Tickets
-
-| Commande | Description |
-|----------|-------------|
-| `/ticket panel` | Panel de création |
-| `/ticket open [sujet]` | Ouvrir manuellement |
-| `/ticket close` | Fermer avec transcript |
-| `/ticket add/remove <user>` | Gérer les accès |
-| `/ticket assign <user>` | Assigner un staff |
-
-### XP & Économie
-
-| Commande | Description |
-|----------|-------------|
-| `/rank [user]` | Rang, niveau, XP, progression |
-| `/leaderboard [type]` | Top 20 (XP, messages, voix) |
-| `/balance [user]` | Solde portefeuille + banque |
-| `/daily` | Récompense quotidienne |
-| `/pay <user> <montant>` | Transférer de l'argent |
-| `/bank deposit\|withdraw <montant>` | Gérer la banque |
-
-### Utilitaire & Fun
-
-| Commande | Description |
-|----------|-------------|
-| `/serverinfo` | Informations serveur |
-| `/userinfo [user]` | Profil utilisateur + stats |
-| `/avatar [user]` | Avatar en haute qualité |
-| `/reminder set\|list\|cancel` | Rappels personnels |
-| `/ping` | Latence API + WebSocket |
-| `/poll <question> [choix]` | Sondage avec réactions |
-| `/8ball <question>` | Boule magique |
-| `/coinflip` | Pile ou face |
-| `/dice [faces] [nombre]` | Lancer de dés |
-
-### Autres modules
-
-| Commande | Module | Description |
-|----------|--------|-------------|
-| `/rolemenu create\|add\|send` | Rôles | Menus de rôles (boutons/select) |
-| `/tag show\|create\|delete\|list` | Tags | FAQ avec autocomplete |
-| `/announce` | Annonces | Embeds personnalisés |
-| `/stats` | Stats | Métriques serveur + bot |
-| `/tempvoice name\|limit\|lock\|...` | TempVoice | Gérer son salon vocal |
-| `/apply start\|review\|accept\|deny` | Candidatures | Système de recrutement |
-| `/event create\|info\|list\|cancel` | Événements | Événements avec inscription |
-| `/customcmd create\|delete\|list` | Custom | Commandes personnalisées |
-| `/music play\|stop\|skip\|...` | Musique | *Préparé pour le futur* |
-| `/rp create\|profile\|delete` | RP | Fiches personnage |
+| Module | Description | Commandes |
+|--------|-------------|-----------|
+| ⚙️ admin | Configuration & modules | `/module`, `/config`, `/setup` |
+| 🔨 moderation | Sanctions & gestion | `/ban`, `/kick`, `/warn`, `/timeout`, `/sanctions`, `/unban`, `/purge`, `/slowmode`, `/lock`, `/note` |
+| 🎫 tickets | Support par tickets | `/ticket`, `/ticketpanel` |
+| 📋 logs | Journalisation | *Automatique via events* |
+| 🔒 security | Automodération | `/automod` |
+| 👋 onboarding | Bienvenue/au revoir | *Automatique via events* |
+| ⭐ xp | Niveaux & expérience | `/rank`, `/leaderboard`, `/xpadmin` |
+| 💰 economy | Monnaie virtuelle | `/daily`, `/weekly`, `/balance`, `/pay`, `/rob`, `/shop`, `/richest`, `/ecoadmin` |
+| 🎭 roles | Menus de rôles | `/rolemenu` |
+| 🔧 utility | Utilitaires | `/userinfo`, `/serverinfo`, `/help`, `/ping`, `/avatar`, `/embed`, `/announce`, `/reminder`, `/voice` |
+| 🎮 fun | Mini-jeux | `/fun` (8ball, coinflip, dice, rps, rate, hug) |
+| 📊 stats | Statistiques | `/stats` |
+| 🔊 tempvoice | Vocaux temporaires | `/voice` |
+| 🏷️ tags | FAQ/réponses rapides | `/tag` |
+| 📢 announcements | Annonces | `/announce` |
+| 📝 applications | Candidatures | `/apply` |
+| 🎉 events | Événements serveur | `/event` |
+| ⚡ custom_commands | Commandes custom | `/customcmd` |
+| 🎭 rp | Roleplay | `/rpprofile`, `/rpinventory` |
 
 ---
 
-## 🦾 Déploiement Pterodactyl
+## 🗄️ Base de données
 
-Le bot est conçu pour fonctionner sur un hébergement **Pterodactyl** :
+### 3 migrations
 
-1. **Egg** : Node.js Generic (ou équivalent)
-2. **Startup** : `node src/index.js`
-3. **Node version** : 20+
-4. **Variables** : Configurez via le panneau Pterodactyl (`.env`)
+**001** — Tables fondamentales : `guilds`, `guild_config`, `guild_modules`, `users`, `sanctions`, `tickets`, `transactions`, `daily_metrics`
 
-> Le bot fonctionne en **single process**, pas de Docker-in-Docker, pas de services externes.
-> Les tables sont créées automatiquement dans la base MySQL via les migrations Knex.
+**002** — Tables étendues : `tags`, `shop_items`, `role_menus`, `mod_notes`, `automod_filters`, `security_signals` + ALTER `users` + `sanctions`
 
----
+**003** — Tables modules : `applications`, `server_events`, `custom_commands`, `rp_characters`, `rp_inventory`, `reminders`, `temp_voice_channels`, `logs`
 
-## 🔧 Stack technique
+### Commandes Knex
 
-| Technologie | Version | Usage |
-|-------------|---------|-------|
-| [discord.js](https://discord.js.org/) | v14 | Framework Discord |
-| [mysql2](https://github.com/sidorares/node-mysql2) | v3 | Driver MySQL pour Knex |
-| [Knex.js](https://knexjs.org/) | v3 | Query builder + migrations |
-| [node-cron](https://github.com/node-cron/node-cron) | v3 | Tâches planifiées |
-| [node-cache](https://github.com/node-cache/node-cache) | v5 | Cache mémoire TTL |
-| [winston](https://github.com/winstonjs/winston) | v3 | Logging rotatif |
-| [express](https://expressjs.com/) | v4 | API REST optionnelle |
-| [Node.js](https://nodejs.org/) | 20+ | Runtime |
+```bash
+# Migrer
+npx knex migrate:latest --knexfile database/knexfile.js
+
+# Rollback
+npx knex migrate:rollback --knexfile database/knexfile.js
+
+# Status
+npx knex migrate:status --knexfile database/knexfile.js
+```
 
 ---
 
-## 🤝 Contribuer
+## 🛠️ Développement
 
-Les contributions sont les bienvenues ! Consultez [CONTRIBUTING.md](CONTRIBUTING.md).
+### Ajouter une commande
 
-1. **Fork** le projet
-2. **Créez** votre branche (`git checkout -b feature/ma-fonctionnalite`)
-3. **Committez** (`git commit -m 'feat: ajout de ma fonctionnalité'`)
-4. **Pushez** (`git push origin feature/ma-fonctionnalite`)
-5. **Ouvrez** une Pull Request
+1. Créer un fichier dans `commands/<module>/macommande.js`
+2. Exporter : `module`, `data` (SlashCommandBuilder), `execute(interaction)`
+3. Relancer `node deploy.js`
+4. Restart le bot
+
+### Ajouter un composant
+
+1. Créer un fichier dans `components/<module>/mon-composant.js`
+2. Exporter : `prefix`, `type` (button/select/mixed), `execute(interaction)`
+3. Le prefix doit correspondre au début du `customId` du composant
+
+### Ajouter une tâche planifiée
+
+1. Créer un fichier dans `core/tasks/maTache.js`
+2. Exporter : `name`, `interval` (ms), `execute(client)`
+3. Le scheduler les charge automatiquement au boot
+
+### Ajouter une locale
+
+1. Créer `locales/xx.json` en suivant la structure de `fr.json`
+2. Utiliser `t('key.subkey', { var: 'value' })` dans les commandes
 
 ---
 
-## 📝 Licence
+## 📊 Statistiques du projet
 
-Ce projet est sous licence [MIT](LICENSE) — libre d'utilisation et de modification.
+| Métrique | Valeur |
+|----------|--------|
+| Fichiers | ~85 |
+| Commandes slash | 35+ |
+| Sous-commandes | ~100 |
+| Modules | 19 |
+| Tables DB | 18 |
+| Migrations | 3 |
+| Locales | 2 (FR, EN) |
+| Tâches planifiées | 4 |
+| Composants UI | 5 |
 
 ---
 
-<div align="center">
+## 📄 Licence
 
-**Développé avec ❤️ par [NicooooV1](https://github.com/NicooooV1)**
+MIT — Usage libre, attribution appréciée.
 
-⭐ **N'hésitez pas à mettre une étoile si le projet vous plaît !** ⭐
+---
 
-</div>
+*Ultra Suite v2.0 — Développé avec discord.js v14 & Knex.js*

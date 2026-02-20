@@ -1,35 +1,75 @@
 // ===================================
-// Ultra Suite — Economy: /balance
+// Ultra Suite — /balance
+// Voir son solde ou celui d'un membre
 // ===================================
 
-const { SlashCommandBuilder } = require('discord.js');
-const userQueries = require('../../database/userQueries');
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const configService = require('../../core/configService');
-const { createEmbed } = require('../../utils/embeds');
+const { getDb } = require('../../database');
 
 module.exports = {
   module: 'economy',
   cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('balance')
-    .setDescription('Affiche votre solde ou celui d\'un membre')
+    .setDescription('Voir votre solde ou celui d\'un membre')
     .addUserOption((opt) => opt.setName('membre').setDescription('Membre à consulter')),
 
   async execute(interaction) {
-    const user = interaction.options.getUser('membre') || interaction.user;
-    const dbUser = await userQueries.getOrCreate(user.id, interaction.guild.id);
-    const config = await configService.get(interaction.guild.id);
-    const symbol = config.economy?.currencySymbol || '$';
+    const target = interaction.options.getUser('membre') || interaction.user;
+    const guildId = interaction.guildId;
+    const db = getDb();
+    const config = await configService.get(guildId);
+    const eco = config.economy || {};
+    const symbol = eco.currencySymbol || '🪙';
+    const name = eco.currencyName || 'pièces';
 
-    const embed = createEmbed('primary')
-      .setTitle(`💰 Solde de ${user.username}`)
-      .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    const user = await db('users').where('guild_id', guildId).where('user_id', target.id).first();
+
+    if (!user) {
+      return interaction.reply({
+        content: target.id === interaction.user.id
+          ? `💰 Vous n'avez pas encore de compte. Utilisez \`/daily\` pour commencer !`
+          : `💰 **${target.username}** n'a pas encore de compte.`,
+        ephemeral: true,
+      });
+    }
+
+    // Classement
+    const rank = await db('users')
+      .where('guild_id', guildId)
+      .where('balance', '>', user.balance || 0)
+      .count('id as count')
+      .first();
+    const position = (rank?.count || 0) + 1;
+
+    // Total gagné (transactions entrantes)
+    const earned = await db('transactions')
+      .where('guild_id', guildId)
+      .where('to_id', target.id)
+      .sum('amount as total')
+      .first();
+
+    // Total dépensé (transactions sortantes)
+    const spent = await db('transactions')
+      .where('guild_id', guildId)
+      .where('from_id', target.id)
+      .sum('amount as total')
+      .first();
+
+    const embed = new EmbedBuilder()
+      .setAuthor({ name: target.username, iconURL: target.displayAvatarURL() })
+      .setColor(0xFEE75C)
       .addFields(
-        { name: '👛 Portefeuille', value: `**${dbUser.balance}** ${symbol}`, inline: true },
-        { name: '🏦 Banque', value: `**${dbUser.bank}** ${symbol}`, inline: true },
-        { name: '📊 Total', value: `**${dbUser.balance + dbUser.bank}** ${symbol}`, inline: true }
-      );
+        { name: `💰 Solde`, value: `**${(user.balance || 0).toLocaleString('fr-FR')}** ${symbol}`, inline: true },
+        { name: '🏆 Rang', value: `#${position}`, inline: true },
+        { name: `🔥 Streak`, value: `${user.daily_streak || 0} jour(s)`, inline: true },
+        { name: '📈 Total gagné', value: `${(earned?.total || 0).toLocaleString('fr-FR')} ${symbol}`, inline: true },
+        { name: '📉 Total dépensé', value: `${(spent?.total || 0).toLocaleString('fr-FR')} ${symbol}`, inline: true },
+      )
+      .setTimestamp();
 
-    await interaction.reply({ embeds: [embed] });
+    return interaction.reply({ embeds: [embed] });
   },
 };

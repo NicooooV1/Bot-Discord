@@ -1,39 +1,49 @@
 // ===================================
-// Ultra Suite — Utility: /avatar
+// Ultra Suite — /avatar
+// Afficher l'avatar d'un membre en grand
 // ===================================
 
-const { SlashCommandBuilder } = require('discord.js');
-const { createEmbed } = require('../../utils/embeds');
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 module.exports = {
   module: 'utility',
   cooldown: 3,
+
   data: new SlashCommandBuilder()
     .setName('avatar')
-    .setDescription('Affiche l\'avatar d\'un utilisateur')
-    .addUserOption((opt) => opt.setName('user').setDescription('Utilisateur'))
-    .addBooleanOption((opt) => opt.setName('server').setDescription('Avatar serveur ?')),
+    .setDescription('Afficher l\'avatar d\'un membre')
+    .addUserOption((opt) => opt.setName('membre').setDescription('Membre à consulter'))
+    .addBooleanOption((opt) => opt.setName('serveur').setDescription('Afficher l\'avatar serveur au lieu du global')),
 
   async execute(interaction) {
-    const user = interaction.options.getUser('user') || interaction.user;
-    const serverAvatar = interaction.options.getBoolean('server');
+    const target = interaction.options.getUser('membre') || interaction.user;
+    const useServer = interaction.options.getBoolean('serveur') || false;
 
-    const member = await interaction.guild.members.fetch(user.id).catch(() => null);
     let avatarUrl;
+    let title;
 
-    if (serverAvatar && member?.avatar) {
-      avatarUrl = member.displayAvatarURL({ size: 1024 });
+    if (useServer) {
+      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+      if (member?.avatar) {
+        avatarUrl = member.displayAvatarURL({ size: 4096, dynamic: true });
+        title = `Avatar serveur — ${target.username}`;
+      } else {
+        avatarUrl = target.displayAvatarURL({ size: 4096, dynamic: true });
+        title = `Avatar — ${target.username} (pas d'avatar serveur)`;
+      }
     } else {
-      avatarUrl = user.displayAvatarURL({ size: 1024 });
+      avatarUrl = target.displayAvatarURL({ size: 4096, dynamic: true });
+      title = `Avatar — ${target.username}`;
     }
 
-    const embed = createEmbed('primary')
-      .setTitle(`Avatar de ${user.tag}`)
+    const embed = new EmbedBuilder()
+      .setTitle(title)
       .setImage(avatarUrl)
+      .setColor(0x5865F2)
       .setDescription(
-        `[PNG](${user.displayAvatarURL({ extension: 'png', size: 1024 })}) · ` +
-          `[JPG](${user.displayAvatarURL({ extension: 'jpg', size: 1024 })}) · ` +
-          `[WEBP](${user.displayAvatarURL({ extension: 'webp', size: 1024 })})`
+        `[PNG](${target.displayAvatarURL({ size: 4096, extension: 'png' })}) • ` +
+        `[JPG](${target.displayAvatarURL({ size: 4096, extension: 'jpg' })}) • ` +
+        `[WEBP](${target.displayAvatarURL({ size: 4096, extension: 'webp' })})`
       );
 
     return interaction.reply({ embeds: [embed] });

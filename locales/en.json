@@ -2,151 +2,54 @@
   "common": {
     "error": "❌ An error occurred.",
     "no_permission": "❌ You don't have permission to use this command.",
-    "bot_no_permission": "❌ I don't have the required permissions.",
     "module_disabled": "❌ This module is disabled on this server.",
-    "cooldown": "⏳ Please wait **{{remaining}}s** before using this command again.",
-    "invalid_user": "❌ User not found.",
-    "invalid_channel": "❌ Channel not found.",
-    "invalid_role": "❌ Role not found.",
-    "self_action": "❌ You cannot perform this action on yourself.",
-    "bot_action": "❌ You cannot perform this action on a bot.",
-    "target_is_owner": "❌ You cannot perform this action on the server owner.",
-    "bot_higher_role": "❌ I cannot act on this user (their role is higher than mine).",
-    "higher_role": "❌ The target has a higher or equal role.",
-    "success": "✅ Action completed successfully.",
-    "cancelled": "❌ Action cancelled.",
-    "confirm": "Confirm",
-    "cancel": "Cancel",
-    "page": "Page {{current}}/{{total}}",
-    "no_results": "No results found.",
-    "duration_format": "{{days}}d {{hours}}h {{minutes}}m {{seconds}}s"
+    "cooldown": "⏰ Please wait **{time}** seconds before using this command again.",
+    "bot_no_permission": "❌ I don't have the required permissions to perform this action.",
+    "user_not_found": "❌ User not found.",
+    "invalid_duration": "❌ Invalid duration. Examples: `5m`, `1h`, `7d`"
   },
-  "admin": {
-    "setup": {
-      "title": "⚙️ Bot Configuration",
-      "module_enabled": "✅ Module **{{module}}** enabled.",
-      "module_disabled": "❌ Module **{{module}}** disabled.",
-      "config_updated": "✅ Configuration updated: `{{key}}` → `{{value}}`.",
-      "config_reset": "✅ Configuration reset."
-    },
-    "help": {
-      "title": "📖 Help — Ultra Suite",
-      "description": "Use the menus below to browse categories.",
-      "no_description": "No description available."
-    }
-  },
-  "mod": {
+  "moderation": {
     "ban": {
-      "success": "🔨 **{{user}}** has been banned. (Case #{{case}})",
-      "reason": "Reason: {{reason}}",
-      "dm": "You have been banned from **{{guild}}**.\nReason: {{reason}}"
+      "success": "**{user}** has been banned. Reason: {reason}",
+      "dm": "🔨 You have been banned from **{guild}**.\nReason: {reason}"
     },
     "kick": {
-      "success": "👢 **{{user}}** has been kicked. (Case #{{case}})",
-      "dm": "You have been kicked from **{{guild}}**.\nReason: {{reason}}"
-    },
-    "timeout": {
-      "success": "🔇 **{{user}}** has been timed out for **{{duration}}**. (Case #{{case}})",
-      "removed": "🔊 Timeout removed for **{{user}}**."
+      "success": "**{user}** has been kicked. Reason: {reason}",
+      "dm": "👢 You have been kicked from **{guild}**.\nReason: {reason}"
     },
     "warn": {
-      "success": "⚠️ **{{user}}** has been warned. (Case #{{case}}, total: {{total}})",
-      "dm": "You have been warned on **{{guild}}**.\nReason: {{reason}}"
+      "success": "**{user}** has been warned ({count}/{max}). Reason: {reason}",
+      "dm": "⚠️ You have received a warning on **{guild}**.\nReason: {reason}"
     },
-    "unban": {
-      "success": "✅ **{{user}}** has been unbanned."
-    },
-    "clear": {
-      "success": "🗑️ **{{count}}** messages deleted.",
-      "none": "No messages to delete."
-    },
-    "slowmode": {
-      "success": "🐌 Slowmode set to **{{seconds}}s** in {{channel}}.",
-      "removed": "✅ Slowmode removed from {{channel}}."
-    },
-    "lock": {
-      "locked": "🔒 Channel {{channel}} locked.",
-      "unlocked": "🔓 Channel {{channel}} unlocked."
-    },
-    "nick": {
-      "success": "✏️ Nickname of **{{user}}** changed to **{{nick}}**.",
-      "reset": "✏️ Nickname of **{{user}}** reset."
-    },
-    "case": {
-      "not_found": "❌ Case #{{case}} not found.",
-      "revoked": "✅ Case #{{case}} revoked."
-    },
-    "modlogs": {
-      "title": "📋 Moderation History — {{user}}",
-      "empty": "No sanctions recorded."
+    "timeout": {
+      "success": "**{user}** has been timed out for **{duration}**. Reason: {reason}"
     }
   },
-  "logs": {
-    "message_delete": "🗑️ Message deleted in {{channel}}",
-    "message_edit": "✏️ Message edited in {{channel}}",
-    "member_join": "📥 {{user}} joined the server",
-    "member_leave": "📤 {{user}} left the server",
-    "member_update": "🔄 {{user}} was updated",
-    "channel_create": "📁 Channel **{{channel}}** created",
-    "channel_delete": "📁 Channel **{{channel}}** deleted",
-    "role_create": "🏷️ Role **{{role}}** created",
-    "role_delete": "🏷️ Role **{{role}}** deleted",
-    "voice_join": "🔊 {{user}} joined **{{channel}}**",
-    "voice_leave": "🔇 {{user}} left **{{channel}}**",
-    "voice_move": "🔀 {{user}} moved to **{{channel}}**"
-  },
   "tickets": {
-    "open": "🎫 Ticket opened by {{user}}",
-    "close": "🎫 Ticket closed by {{user}}",
-    "already_open": "❌ You already have an open ticket.",
-    "max_tickets": "❌ Maximum number of tickets reached ({{max}}).",
-    "not_ticket": "❌ This channel is not a ticket.",
-    "panel_title": "🎫 Ticket System",
-    "panel_description": "Click the button below to open a ticket.",
-    "panel_button": "📩 Open a ticket",
-    "rating_prompt": "How would you rate the support you received?",
-    "transcript_saved": "📝 Transcript saved."
+    "created": "Ticket **#{id}** created successfully.",
+    "closed": "Ticket **#{id}** closed by **{user}**.",
+    "max_reached": "You have already reached the limit of **{max}** open tickets."
   },
   "xp": {
-    "level_up": "🎉 Congratulations {{user}}! You reached **level {{level}}**!",
-    "rank": "📊 **{{user}}** — Level {{level}} ({{xp}}/{{needed}} XP) — Rank #{{rank}}",
-    "leaderboard_title": "🏆 XP Leaderboard",
-    "no_xp": "You don't have any XP yet."
+    "level_up": "🎉 {user} reached **level {level}**!"
   },
   "economy": {
-    "balance": "💰 **{{user}}** — Wallet: {{balance}}{{symbol}} | Bank: {{bank}}{{symbol}}",
-    "daily": "✅ You received **{{amount}}{{symbol}}**! Come back tomorrow.",
-    "daily_cooldown": "⏳ You already claimed your daily reward. Come back in **{{remaining}}**.",
-    "insufficient": "❌ Insufficient funds.",
-    "transfer_success": "✅ **{{amount}}{{symbol}}** transferred to **{{user}}**.",
-    "deposit_success": "🏦 **{{amount}}{{symbol}}** deposited.",
-    "withdraw_success": "💸 **{{amount}}{{symbol}}** withdrawn."
-  },
-  "security": {
-    "raid_detected": "🚨 **RAID DETECTED** — {{count}} members joined in {{seconds}}s",
-    "spam_detected": "⚠️ Spam detected from {{user}}",
-    "phishing_detected": "🛡️ Phishing link detected from {{user}}",
-    "action_taken": "Action: {{action}}"
+    "daily_claimed": "You received **{amount}** {currency}! Balance: **{balance}** {currency}",
+    "daily_cooldown": "You already claimed your reward. Come back in **{time}**.",
+    "insufficient": "Insufficient funds. Balance: **{balance}** {currency}",
+    "transfer_success": "**{amount}** {currency} sent to **{target}**."
   },
   "onboarding": {
-    "welcome": "Welcome {{user}} to **{{guild}}**! 🎉",
-    "goodbye": "{{user}} left the server. 👋",
-    "rules_prompt": "Please accept the rules to access the server.",
-    "rules_accepted": "✅ Rules accepted! Welcome!",
-    "verification_title": "🔐 Verification",
-    "verification_button": "✅ Verify"
+    "welcome": "Welcome {user} to **{guild}**! You are our **{count}th** member. 🎉",
+    "goodbye": "{user} left **{guild}**. We are now **{count}** members."
   },
-  "roles": {
-    "menu_title": "🏷️ Available Roles",
-    "added": "✅ Role **{{role}}** added.",
-    "removed": "❌ Role **{{role}}** removed.",
-    "max_reached": "❌ Maximum number of roles reached."
-  },
-  "utility": {
-    "serverinfo_title": "📊 Server Info — {{guild}}",
-    "userinfo_title": "👤 User Info — {{user}}",
-    "avatar_title": "🖼️ Avatar of {{user}}",
-    "reminder_set": "⏰ Reminder set for **{{time}}**: {{message}}",
-    "reminder_fire": "⏰ **Reminder**: {{message}}"
+  "logs": {
+    "join": "📥 **{user}** joined the server",
+    "leave": "📤 **{user}** left the server",
+    "message_delete": "🗑️ Message deleted in {channel}",
+    "message_edit": "✏️ Message edited in {channel}",
+    "voice_join": "🔊 **{user}** joined {channel}",
+    "voice_leave": "🔇 **{user}** left {channel}",
+    "voice_switch": "🔀 **{user}**: {from} → {to}"
   }
 }

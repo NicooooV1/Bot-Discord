@@ -1,52 +1,134 @@
 // ===================================
-// Ultra Suite — Utility: /serverinfo
+// Ultra Suite — /serverinfo
+// Informations détaillées sur le serveur
 // ===================================
 
-const { SlashCommandBuilder, ChannelType } = require('discord.js');
-const { createEmbed } = require('../../utils/embeds');
+const { SlashCommandBuilder, EmbedBuilder, ChannelType } = require('discord.js');
+const { getDb } = require('../../database');
+const configService = require('../../core/configService');
 
 module.exports = {
   module: 'utility',
-  cooldown: 10,
+  cooldown: 5,
+
   data: new SlashCommandBuilder()
     .setName('serverinfo')
-    .setDescription('Affiche les informations du serveur'),
+    .setDescription('Voir les informations du serveur'),
 
   async execute(interaction) {
-    await interaction.deferReply();
-    const { guild } = interaction;
-    await guild.members.fetch().catch(() => {});
+    const guild = interaction.guild;
+    const guildId = guild.id;
+    const db = getDb();
 
-    const online = guild.members.cache.filter((m) => m.presence?.status && m.presence.status !== 'offline').size;
-    const bots = guild.members.cache.filter((m) => m.user.bot).size;
-    const humans = guild.memberCount - bots;
-    const textChannels = guild.channels.cache.filter((c) => c.type === ChannelType.GuildText).size;
-    const voiceChannels = guild.channels.cache.filter((c) => c.type === ChannelType.GuildVoice).size;
-    const categories = guild.channels.cache.filter((c) => c.type === ChannelType.GuildCategory).size;
-    const roles = guild.roles.cache.size - 1; // exclude @everyone
-    const emojis = guild.emojis.cache.size;
+    // Fetch le owner
+    const owner = await guild.fetchOwner().catch(() => null);
+
+    // Compteurs de channels
+    const channels = guild.channels.cache;
+    const textChannels = channels.filter((c) => c.type === ChannelType.GuildText).size;
+    const voiceChannels = channels.filter((c) => c.type === ChannelType.GuildVoice).size;
+    const categories = channels.filter((c) => c.type === ChannelType.GuildCategory).size;
+    const forumChannels = channels.filter((c) => c.type === ChannelType.GuildForum).size;
+    const stageChannels = channels.filter((c) => c.type === ChannelType.GuildStageVoice).size;
+
+    // Compteur de rôles
+    const roles = guild.roles.cache.size - 1; // -1 pour @everyone
+
+    // Emojis et stickers
+    const emojis = guild.emojis.cache;
+    const animatedEmojis = emojis.filter((e) => e.animated).size;
+    const staticEmojis = emojis.size - animatedEmojis;
+
+    // Niveau de boost
     const boostLevel = guild.premiumTier;
-    const boosts = guild.premiumSubscriptionCount || 0;
+    const boostCount = guild.premiumSubscriptionCount || 0;
 
-    const verificationLevels = { 0: 'Aucun', 1: 'Faible', 2: 'Moyen', 3: 'Élevé', 4: 'Très élevé' };
+    // Vérification
+    const verificationLevels = {
+      0: 'Aucune',
+      1: 'Faible (email vérifié)',
+      2: 'Moyenne (inscrit > 5min)',
+      3: 'Haute (membre > 10min)',
+      4: 'Très haute (téléphone vérifié)',
+    };
 
-    const embed = createEmbed('primary')
+    const embed = new EmbedBuilder()
       .setTitle(guild.name)
-      .setThumbnail(guild.iconURL({ size: 256 }))
+      .setThumbnail(guild.iconURL({ size: 512 }))
+      .setColor(0x5865F2)
       .addFields(
-        { name: '👑 Propriétaire', value: `<@${guild.ownerId}>`, inline: true },
-        { name: '📅 Création', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
         { name: '🆔 ID', value: guild.id, inline: true },
-        { name: `👥 Membres (${guild.memberCount})`, value: `Humains: ${humans}\nBots: ${bots}\nEn ligne: ${online}`, inline: true },
-        { name: `💬 Salons (${guild.channels.cache.size})`, value: `Texte: ${textChannels}\nVocal: ${voiceChannels}\nCatégories: ${categories}`, inline: true },
-        { name: `🎭 Rôles`, value: `${roles}`, inline: true },
-        { name: '😀 Emojis', value: `${emojis}`, inline: true },
-        { name: '🔒 Vérification', value: verificationLevels[guild.verificationLevel] || 'N/A', inline: true },
-        { name: '🚀 Boosts', value: `Niveau ${boostLevel} (${boosts} boosts)`, inline: true }
-      );
+        { name: '👑 Propriétaire', value: owner?.user?.tag || 'Inconnu', inline: true },
+        {
+          name: '📅 Créé le',
+          value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:f>\n(<t:${Math.floor(guild.createdTimestamp / 1000)}:R>)`,
+          inline: true,
+        },
+        {
+          name: `👥 Membres (${guild.memberCount})`,
+          value: `En ligne estimé : ~${guild.approximatePresenceCount || '?'}`,
+          inline: true,
+        },
+        {
+          name: `💬 Channels (${channels.size})`,
+          value: [
+            `📝 Texte : ${textChannels}`,
+            `🔊 Vocal : ${voiceChannels}`,
+            `📁 Catégories : ${categories}`,
+            forumChannels > 0 ? `💬 Forums : ${forumChannels}` : null,
+            stageChannels > 0 ? `🎤 Stage : ${stageChannels}` : null,
+          ].filter(Boolean).join('\n'),
+          inline: true,
+        },
+        { name: `🎭 Rôles`, value: String(roles), inline: true },
+        {
+          name: `😀 Emojis (${emojis.size})`,
+          value: `Statiques : ${staticEmojis} | Animés : ${animatedEmojis}`,
+          inline: true,
+        },
+        {
+          name: `💎 Boost`,
+          value: `Niveau ${boostLevel} (${boostCount} boost${boostCount > 1 ? 's' : ''})`,
+          inline: true,
+        },
+        { name: '🔒 Vérification', value: verificationLevels[guild.verificationLevel] || 'Inconnue', inline: true },
+      )
+      .setTimestamp();
 
-    if (guild.bannerURL()) embed.setImage(guild.bannerURL({ size: 512 }));
+    // Banner si disponible
+    if (guild.bannerURL()) {
+      embed.setImage(guild.bannerURL({ size: 1024 }));
+    }
 
-    return interaction.editReply({ embeds: [embed] });
+    // Stats DB
+    try {
+      const modules = await configService.getModules(guildId);
+      const enabledCount = Object.values(modules).filter(Boolean).length;
+      const totalCount = Object.keys(modules).length;
+
+      const totalMessages = await db('users')
+        .where('guild_id', guildId)
+        .sum('total_messages as total')
+        .first();
+
+      const totalSanctions = await db('sanctions')
+        .where('guild_id', guildId)
+        .count('id as count')
+        .first();
+
+      embed.addFields({
+        name: '🤖 Ultra Suite',
+        value: [
+          `Modules : ${enabledCount}/${totalCount} activés`,
+          `Messages trackés : ${(totalMessages?.total || 0).toLocaleString('fr-FR')}`,
+          `Sanctions : ${totalSanctions?.count || 0}`,
+        ].join('\n'),
+        inline: false,
+      });
+    } catch {
+      // DB pas dispo — pas grave
+    }
+
+    return interaction.reply({ embeds: [embed] });
   },
 };
