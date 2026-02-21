@@ -1,0 +1,105 @@
+# ============================================
+# Ultra Suite — Docker Compose
+# Full stack: Bot + MySQL + Redis
+# ============================================
+
+version: '3.8'
+
+services:
+  # ─── MySQL Database ───────────────────────
+  db:
+    image: mysql:8.0
+    container_name: ultra-suite-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-ultra_suite}
+      MYSQL_USER: ${DB_USER:-ultra}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-ultrapassword}
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./database/init:/docker-entrypoint-initdb.d
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max-connections=200
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-rootpassword}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ultra-net
+
+  # ─── Redis Cache ──────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ultra-suite-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ultra-net
+
+  # ─── Bot Application ─────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ultra-suite-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Discord
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      CLIENT_ID: ${CLIENT_ID}
+      # Database
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: ${DB_USER:-ultra}
+      DB_PASSWORD: ${DB_PASSWORD:-ultrapassword}
+      DB_NAME: ${DB_NAME:-ultra_suite}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # API
+      API_PORT: ${API_PORT:-3000}
+      API_SECRET: ${API_SECRET:-change-me-in-production}
+      # Features
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY:-}
+      PERSPECTIVE_API_KEY: ${PERSPECTIVE_API_KEY:-}
+    ports:
+      - "${API_PORT:-3000}:${API_PORT:-3000}"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - ultra-net
+
+volumes:
+  db_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  ultra-net:
+    driver: bridge

@@ -68,43 +68,47 @@ function loadEvents(client) {
       try {
         // Nettoyer le cache pour le hot-reload
         delete require.cache[require.resolve(fullPath)];
-        const event = require(fullPath);
-
-        if (!event?.name || typeof event.execute !== 'function') {
-          log.warn(`Ignoré (structure invalide) : ${path.relative(eventsDir, fullPath)}`);
-          skipped++;
-          continue;
-        }
-
+        const exported = require(fullPath);
         const relativePath = path.relative(eventsDir, fullPath);
 
-        // Tracking des fichiers par événement (info)
-        if (!eventMap.has(event.name)) {
-          eventMap.set(event.name, []);
-        }
-        eventMap.get(event.name).push(relativePath);
+        // Support both single event and array of events exports
+        const events = Array.isArray(exported) ? exported : [exported];
 
-        // Wrapper l'exécution dans un try/catch
-        // pour qu'un event crashé ne tue pas le bot
-        const wrappedExecute = async (...args) => {
-          try {
-            await event.execute(...args);
-          } catch (err) {
-            log.error(
-              `Erreur dans event "${event.name}" (${relativePath}): ${err.message}`
-            );
-            log.error(err.stack);
+        for (const event of events) {
+          if (!event?.name || typeof event.execute !== 'function') {
+            log.warn(`Ignoré (structure invalide) : ${relativePath}`);
+            skipped++;
+            continue;
           }
-        };
 
-        // Enregistrer l'événement
-        if (event.once) {
-          client.once(event.name, wrappedExecute);
-        } else {
-          client.on(event.name, wrappedExecute);
+          // Tracking des fichiers par événement (info)
+          if (!eventMap.has(event.name)) {
+            eventMap.set(event.name, []);
+          }
+          eventMap.get(event.name).push(relativePath);
+
+          // Wrapper l'exécution dans un try/catch
+          // pour qu'un event crashé ne tue pas le bot
+          const wrappedExecute = async (...args) => {
+            try {
+              await event.execute(...args);
+            } catch (err) {
+              log.error(
+                `Erreur dans event "${event.name}" (${relativePath}): ${err.message}`
+              );
+              log.error(err.stack);
+            }
+          };
+
+          // Enregistrer l'événement
+          if (event.once) {
+            client.once(event.name, wrappedExecute);
+          } else {
+            client.on(event.name, wrappedExecute);
+          }
+
+          loaded++;
         }
-
-        loaded++;
       } catch (err) {
         errors++;
         log.error(

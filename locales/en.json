@@ -6,12 +6,25 @@
     "cooldown": "⏰ Please wait **{time}** seconds before using this command again.",
     "bot_no_permission": "❌ I don't have the required permissions to perform this action.",
     "user_not_found": "❌ User not found.",
-    "invalid_duration": "❌ Invalid duration. Examples: `5m`, `1h`, `7d`"
+    "invalid_duration": "❌ Invalid duration. Examples: `5m`, `1h`, `7d`",
+    "success": "✅ Action completed successfully.",
+    "cancelled": "❌ Action cancelled.",
+    "not_found": "❌ Item not found.",
+    "already_exists": "❌ This item already exists.",
+    "confirm": "Do you confirm this action?",
+    "page": "Page {current}/{total}",
+    "no_results": "No results found.",
+    "loading": "⏳ Loading..."
   },
   "moderation": {
     "ban": {
       "success": "**{user}** has been banned. Reason: {reason}",
-      "dm": "🔨 You have been banned from **{guild}**.\nReason: {reason}"
+      "dm": "🔨 You have been banned from **{guild}**.\nReason: {reason}",
+      "already_banned": "This user is already banned."
+    },
+    "unban": {
+      "success": "**{user}** has been unbanned.",
+      "not_banned": "This user is not banned."
     },
     "kick": {
       "success": "**{user}** has been kicked. Reason: {reason}",
@@ -19,29 +32,98 @@
     },
     "warn": {
       "success": "**{user}** has been warned ({count}/{max}). Reason: {reason}",
-      "dm": "⚠️ You have received a warning on **{guild}**.\nReason: {reason}"
+      "dm": "⚠️ You have received a warning on **{guild}**.\nReason: {reason}",
+      "removed": "Warning #{id} removed.",
+      "list_empty": "No warnings found."
     },
     "timeout": {
-      "success": "**{user}** has been timed out for **{duration}**. Reason: {reason}"
+      "success": "**{user}** has been timed out for **{duration}**. Reason: {reason}",
+      "removed": "Timeout removed from **{user}**."
+    },
+    "purge": {
+      "success": "**{count}** message(s) deleted.",
+      "no_messages": "No messages to delete."
+    },
+    "lock": {
+      "locked": "🔒 Channel locked.",
+      "unlocked": "🔓 Channel unlocked."
+    },
+    "slowmode": {
+      "set": "Slowmode set to **{seconds}** seconds.",
+      "disabled": "Slowmode disabled."
+    },
+    "softban": {
+      "success": "**{user}** has been softbanned. Recent messages deleted.",
+      "dm": "🔨 You have been softbanned from **{guild}**.\nReason: {reason}"
+    },
+    "lockdown": {
+      "started": "🚨 Lockdown enabled on **{count}** channels.",
+      "ended": "✅ Lockdown disabled on **{count}** channels."
+    },
+    "quarantine": {
+      "added": "**{user}** quarantined.",
+      "removed": "**{user}** removed from quarantine."
+    },
+    "massban": {
+      "success": "**{count}** users banned.",
+      "confirm": "You are about to ban **{count}** users. Do you confirm?"
+    },
+    "note": {
+      "added": "📝 Note added to **{user}**.",
+      "list_empty": "No notes for this user.",
+      "removed": "Note removed."
+    },
+    "sanctions": {
+      "title": "Sanctions for {user}",
+      "empty": "No sanctions recorded."
     }
   },
   "tickets": {
     "created": "Ticket **#{id}** created successfully.",
     "closed": "Ticket **#{id}** closed by **{user}**.",
-    "max_reached": "You have already reached the limit of **{max}** open tickets."
+    "max_reached": "You have already reached the limit of **{max}** open tickets.",
+    "transcript_generated": "Transcript generated — **{count}** messages.",
+    "blacklisted": "You are blacklisted from tickets.",
+    "not_a_ticket": "This channel is not a ticket.",
+    "claimed": "**{user}** claimed this ticket.",
+    "transferred": "Ticket transferred to **{user}**.",
+    "renamed": "Ticket renamed to **{name}**.",
+    "priority_set": "Priority updated: **{level}**."
   },
   "xp": {
-    "level_up": "🎉 {user} reached **level {level}**!"
+    "level_up": "🎉 {user} reached **level {level}**!",
+    "rank": "**{user}** — Level **{level}** — **{xp}** XP",
+    "leaderboard_title": "🏆 XP Leaderboard",
+    "xp_added": "**{amount}** XP added to **{user}**.",
+    "xp_removed": "**{amount}** XP removed from **{user}**.",
+    "xp_reset": "**{user}**'s XP has been reset.",
+    "role_reward": "🎁 **{user}** received the role **{role}** (level {level})!"
   },
   "economy": {
     "daily_claimed": "You received **{amount}** {currency}! Balance: **{balance}** {currency}",
     "daily_cooldown": "You already claimed your reward. Come back in **{time}**.",
+    "weekly_claimed": "You received **{amount}** {currency} (weekly)! Balance: **{balance}** {currency}",
+    "weekly_cooldown": "Weekly reward already claimed. Come back in **{time}**.",
     "insufficient": "Insufficient funds. Balance: **{balance}** {currency}",
-    "transfer_success": "**{amount}** {currency} sent to **{target}**."
+    "transfer_success": "**{amount}** {currency} sent to **{target}**.",
+    "balance": "💰 **{user}** has **{balance}** {currency}",
+    "balance_bank": "🏦 Bank: **{bank}** {currency}",
+    "rob_success": "You stole **{amount}** {currency} from **{target}**!",
+    "rob_fail": "You got caught and paid **{fine}** {currency} in fines.",
+    "rob_cooldown": "You can't steal before **{time}**.",
+    "work_success": "You worked as **{job}** and earned **{amount}** {currency}!",
+    "work_cooldown": "You already worked. Come back in **{time}**.",
+    "gamble_won": "🎰 You won **{amount}** {currency}!",
+    "gamble_lost": "😢 You lost **{amount}** {currency}.",
+    "shop_empty": "The shop is empty.",
+    "shop_bought": "You bought **{item}** for **{price}** {currency}.",
+    "leaderboard_title": "🏆 Economy Leaderboard"
   },
   "onboarding": {
     "welcome": "Welcome {user} to **{guild}**! You are our **{count}th** member. 🎉",
-    "goodbye": "{user} left **{guild}**. We are now **{count}** members."
+    "goodbye": "{user} left **{guild}**. We are now **{count}** members.",
+    "autorole_added": "Auto-role **{role}** added.",
+    "autorole_removed": "Auto-role **{role}** removed."
   },
   "logs": {
     "join": "📥 **{user}** joined the server",
@@ -50,6 +132,124 @@
     "message_edit": "✏️ Message edited in {channel}",
     "voice_join": "🔊 **{user}** joined {channel}",
     "voice_leave": "🔇 **{user}** left {channel}",
-    "voice_switch": "🔀 **{user}**: {from} → {to}"
+    "voice_switch": "🔀 **{user}**: {from} → {to}",
+    "role_create": "🟢 Role created: **{role}**",
+    "role_delete": "🔴 Role deleted: **{role}**",
+    "role_update": "🟡 Role updated: **{role}**",
+    "channel_create": "🟢 Channel created: **{channel}**",
+    "channel_delete": "🔴 Channel deleted: **{channel}**",
+    "channel_update": "🟡 Channel updated: **{channel}**",
+    "ban_add": "🔨 **{user}** banned by **{executor}**",
+    "ban_remove": "🔓 **{user}** unbanned by **{executor}**",
+    "member_update": "👤 Member updated: **{user}**",
+    "guild_update": "🏠 Server updated",
+    "emoji_create": "😀 Emoji added: **{emoji}**",
+    "emoji_delete": "❌ Emoji deleted: **{emoji}**",
+    "webhook_update": "🔗 Webhook updated in **{channel}**"
+  },
+  "giveaway": {
+    "started": "🎉 Giveaway started! **{prize}** — {winners} winner(s)",
+    "ended": "🎉 Giveaway ended! Winner(s): {winners}",
+    "no_participants": "No participants in the giveaway.",
+    "entered": "You entered the giveaway!",
+    "left": "You left the giveaway.",
+    "already_entered": "You already entered."
+  },
+  "starboard": {
+    "added": "⭐ A message was added to the starboard!",
+    "threshold_set": "Starboard threshold set to **{threshold}** ⭐."
+  },
+  "music": {
+    "playing": "🎶 Now playing: **{title}**",
+    "added_queue": "**{title}** added to queue (position #{position})",
+    "queue_empty": "The queue is empty.",
+    "not_in_voice": "You must be in a voice channel.",
+    "no_results": "No results found.",
+    "stopped": "⏹ Playback stopped.",
+    "skipped": "⏭ Next track.",
+    "paused": "⏸ Playback paused.",
+    "resumed": "▶ Playback resumed.",
+    "volume_set": "🔊 Volume set to **{volume}%**.",
+    "loop_enable": "🔂 Loop enabled.",
+    "loop_disable": "➡ Loop disabled.",
+    "shuffled": "🔀 Queue shuffled.",
+    "disconnected": "👋 Disconnected from voice channel."
+  },
+  "fun": {
+    "8ball_title": "🎱 Magic 8-Ball",
+    "ship_result": "The couple **{user1}** ❤️ **{user2}** has a compatibility score of **{score}%**!",
+    "trivia_correct": "✅ Correct answer!",
+    "trivia_wrong": "❌ Wrong answer! The answer was: **{answer}**",
+    "trivia_timeout": "⏰ Time's up! The answer was: **{answer}**"
+  },
+  "social": {
+    "rep_given": "You gave a reputation point to **{user}**! (+1 rep)",
+    "rep_cooldown": "You already gave your rep. Come back in **{time}**.",
+    "marry_proposed": "**{user1}** proposed to **{user2}**! 💍",
+    "marry_accepted": "**{user1}** and **{user2}** are now married! 💒",
+    "marry_declined": "💔 The marriage proposal was declined.",
+    "divorce_success": "💔 You divorced from **{user}**.",
+    "birthday_set": "🎂 Birthday set to **{date}**.",
+    "birthday_today": "🎂 Happy birthday **{user}**!"
+  },
+  "verify": {
+    "verified": "✅ You have been verified successfully!",
+    "already_verified": "You are already verified.",
+    "captcha_wrong": "❌ Incorrect captcha.",
+    "question_wrong": "❌ Wrong answer."
+  },
+  "utility": {
+    "ping": "🏓 Pong! Latency: **{latency}ms** | API: **{api}ms**",
+    "reminder_set": "⏰ Reminder set for **{time}**.",
+    "reminder_fired": "⏰ Reminder: {message}",
+    "afk_set": "😴 You are now AFK: {reason}",
+    "afk_removed": "👋 Welcome back! You are no longer AFK. (Away for **{duration}**)",
+    "afk_mention": "💤 **{user}** is AFK: {reason} (since **{time}**)",
+    "poll_created": "📊 Poll created!",
+    "poll_ended": "📊 Poll ended!",
+    "suggest_created": "💡 Suggestion #{id} submitted!",
+    "suggest_approved": "✅ Suggestion #{id} approved.",
+    "suggest_denied": "❌ Suggestion #{id} denied."
+  },
+  "backup": {
+    "created": "💾 Backup **{id}** created successfully.",
+    "restored": "♻️ Backup **{id}** restored.",
+    "deleted": "🗑️ Backup deleted.",
+    "not_found": "Backup not found."
+  },
+  "premium": {
+    "active": "⭐ Premium **{tier}** active until **{expires}**.",
+    "not_active": "You don't have a premium subscription.",
+    "activated": "✅ Premium **{tier}** activated!",
+    "code_invalid": "❌ Invalid or expired promo code."
+  },
+  "antinuke": {
+    "enabled": "🛡️ Anti-nuke enabled.",
+    "disabled": "Anti-nuke disabled.",
+    "alert": "🚨 **ANTI-NUKE ALERT** — Suspicious action detected: **{action}** by **{user}**",
+    "owner_only": "Only the server owner can use this command."
+  },
+  "roles": {
+    "reaction_role_created": "Reaction role created in {channel}.",
+    "autorole_added": "Auto-role **{role}** added.",
+    "autorole_removed": "Auto-role **{role}** removed.",
+    "rolemenu_created": "Role menu created."
+  },
+  "events": {
+    "created": "📅 Event **{name}** created!",
+    "joined": "You joined event **{name}**.",
+    "left": "You left event **{name}**.",
+    "started": "🎉 Event **{name}** is starting!",
+    "ended": "Event **{name}** has ended.",
+    "cancelled": "Event **{name}** was cancelled."
+  },
+  "integrations": {
+    "twitch_added": "📺 Twitch notifications enabled for **{channel}**.",
+    "youtube_added": "📺 YouTube notifications enabled for **{channel}**.",
+    "rss_added": "📰 RSS feed added: **{url}**."
+  },
+  "forums": {
+    "template_created": "📝 Forum template created.",
+    "auto_tag_set": "Auto-tag configured."
   }
 }

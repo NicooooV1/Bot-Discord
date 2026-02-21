@@ -1,6 +1,6 @@
 # 🚀 Ultra Suite v2.0
 
-Bot Discord modulaire tout-en-un — **22 modules**, **42+ commandes slash**, **architecture multi-serveur** avec base de données optimisée, système de configuration par serveur, et déploiement Pterodactyl.
+Bot Discord modulaire tout-en-un — **28 modules**, **70+ commandes slash**, **200+ sous-commandes**, architecture multi-serveur avec base de données optimisée, dashboard web, Docker ready.
 
 ---
 
@@ -9,36 +9,69 @@ Bot Discord modulaire tout-en-un — **22 modules**, **42+ commandes slash**, **
 - [Fonctionnalités](#-fonctionnalités)
 - [Prérequis](#-prérequis)
 - [Installation](#-installation)
+- [Docker](#-docker)
 - [Configuration](#-configuration)
 - [Architecture](#-architecture)
 - [Modules](#-modules)
 - [Commandes](#-commandes)
+- [Dashboard Web](#-dashboard-web)
 - [Base de données](#-base-de-données)
+- [Tests](#-tests)
 - [Développement](#-développement)
 
 ---
 
 ## ✨ Fonctionnalités
 
+### Infrastructure
 - **Multi-serveur** : configuration indépendante par serveur avec cache mémoire
-- **22 modules** activables/désactivables individuellement par serveur
-- **42+ commandes slash** avec sous-commandes, autocomplete et modals
+- **28 modules** activables/désactivables individuellement par serveur
+- **70+ commandes slash** avec sous-commandes, autocomplete et modals
+- **Dashboard web** : Express + Passport Discord OAuth2 + SPA
+- **Docker** : Dockerfile multi-stage + docker-compose (bot + MySQL + Redis)
+- **CI/CD** : GitHub Actions (lint, tests, build, Docker)
+- **i18n** : français + anglais (200+ clés de traduction)
+- **API REST** : healthcheck, stats, gestion de config
+
+### Modération
+- **Sanctions avancées** : ban, kick, warn, timeout, softban, quarantine, massban
+- **Lockdown** : verrouillage simultané de tous les channels
+- **Modération vocale** : mute, deafen, disconnect, move all
+- **Notes** : système de notes invisibles par l'utilisateur
+- **Case system** : numérotation séquentielle, historique, DM automatiques
 - **Automod** : anti-spam, anti-lien, anti-mention, filtres regex/mots/domaines
-- **Système de sanctions** : case system avec numérotation séquentielle, historique, DM
+
+### Engagement
 - **XP & Niveaux** : cooldown, rôles récompenses, leaderboard paginé
-- **Économie** : monnaie virtuelle, daily/weekly avec streaks, boutique, vol, classement
-- **Tickets** : panel avec boutons persistants, claim, permissions dynamiques
-- **Rôles** : menus de rôles avec select menu persistant
-- **Tags/FAQ** : réponses rapides avec autocomplete et compteur d'utilisation
-- **Candidatures** : formulaire modal, review par boutons accept/reject, DM
+- **Économie** : daily/weekly avec streaks, boutique, vol, work (13 métiers), casino (5 jeux)
+- **Giveaways** : création, reroll, multi-gagnants, boutons interactifs
+- **Starboard** : automatic star board avec threshold configurable
+- **Sondages** : vote par boutons, multi-choix, timer
+- **Suggestions** : upvote/downvote, statuts (approuvé/refusé/considéré)
+
+### Support
+- **Tickets** : panneaux, transcripts HTML, priorités, catégories, blacklist, stats
+- **Vérification** : 4 modes (bouton, captcha, rules, question/réponse)
+- **Tags/FAQ** : réponses rapides avec autocomplete et compteur
+
+### Social
+- **Profils** : bio, couleur, badges automatiques, anniversaires
+- **Réputation** : système de rep avec cooldown
+- **Mariages** : propose, accepte, divorce avec confirmation
+- **Anniversaires** : liste automatique avec tri
+
+### Systèmes
+- **Musique** : YouTube, Spotify, SoundCloud, playlists, paroles
+- **Reaction roles** : normal, unique, required + auto-roles (member/bot/human)
+- **Vocaux temporaires** : création auto + gestion propriétaire
 - **Événements** : RSVP avec boutons, max participants, statuts
-- **RP** : fiches personnage, inventaire, système MJ
-- **Commandes custom** : triggers texte personnalisés par serveur
-- **Vocaux temporaires** : création auto + gestion propriétaire (lock/rename/kick)
-- **Stats** : dashboard serveur, métriques quotidiennes, graphiques ASCII
-- **Rappels** : système de rappels personnels avec durées flexibles
-- **i18n** : français + anglais avec système de traduction extensible
-- **API REST** : healthcheck et endpoints stats (optionnel)
+- **Forums** : templates, auto-tag, auto-react
+- **Intégrations** : Twitch, YouTube, RSS
+
+### Sécurité
+- **Anti-nuke** : détection mass-delete, mass-ban, emergency lockdown
+- **Backup** : sauvegarde/restauration complète du serveur
+- **Premium** : 4 tiers avec fonctionnalités exclusives
 
 ---
 
@@ -46,9 +79,11 @@ Bot Discord modulaire tout-en-un — **22 modules**, **42+ commandes slash**, **
 
 | Outil | Version |
 |-------|---------|
-| Node.js | ≥ 18.0 |
+| Node.js | ≥ 20.0 |
 | npm | ≥ 9.0 |
-| MariaDB / MySQL | ≥ 10.6 / 8.0 |
+| MySQL | ≥ 8.0 |
+| Redis | ≥ 7.0 (optionnel) |
+| FFmpeg | Pour la musique |
 
 ---
 
@@ -67,13 +102,28 @@ cp .env.example .env
 # Éditer .env avec vos tokens et identifiants
 
 # 4. Exécuter les migrations
-npx knex migrate:latest --knexfile database/knexfile.js
+npm run migrate
 
 # 5. Déployer les commandes slash
-node deploy.js
+npm run deploy
 
 # 6. Lancer le bot
-node index.js
+npm start
+```
+
+---
+
+## 🐳 Docker
+
+```bash
+# Démarrer avec Docker Compose (bot + MySQL + Redis)
+docker-compose up -d
+
+# Voir les logs
+docker-compose logs -f bot
+
+# Arrêter
+docker-compose down
 ```
 
 ---
@@ -86,15 +136,17 @@ node index.js
 |----------|-------------|--------|
 | `BOT_TOKEN` | Token du bot Discord | ✅ |
 | `CLIENT_ID` | ID de l'application Discord | ✅ |
-| `GUILD_ID` | ID du serveur de dev (commandes locales) | |
 | `DB_HOST` | Hôte de la base de données | ✅ |
 | `DB_PORT` | Port (défaut: 3306) | |
 | `DB_USER` | Utilisateur DB | ✅ |
 | `DB_PASSWORD` | Mot de passe DB | ✅ |
-| `DB_NAME` | Nom de la base (défaut: ultrasuite) | ✅ |
-| `NODE_ENV` | Environnement (development/production) | |
-| `DEFAULT_LOCALE` | Langue par défaut (fr/en) | |
-| `OWNER_ID` | ID du propriétaire du bot | |
+| `DB_NAME` | Nom de la base | ✅ |
+| `REDIS_HOST` | Hôte Redis (optionnel) | |
+| `API_PORT` | Port du dashboard (défaut: 3000) | |
+| `OAUTH2_CLIENT_SECRET` | Secret OAuth2 pour dashboard | |
+| `OPENWEATHER_API_KEY` | Clé API OpenWeatherMap | |
+| `PERSPECTIVE_API_KEY` | Clé API Perspective (automod) | |
+| `SENTRY_DSN` | DSN Sentry (monitoring) | |
 
 ### Configuration en jeu
 
@@ -236,27 +288,55 @@ ultra-suite/
 
 ## 📦 Modules
 
-| Module | Description | Commandes |
+| Module | Description | Commandes principales |
 |--------|-------------|-----------|
 | ⚙️ admin | Configuration & modules | `/module`, `/config`, `/setup` |
-| 🔨 moderation | Sanctions & gestion | `/ban`, `/kick`, `/warn`, `/timeout`, `/sanctions`, `/unban`, `/purge`, `/slowmode`, `/lock`, `/note` |
-| 🎫 tickets | Support par tickets | `/ticket`, `/ticketpanel` |
-| 📋 logs | Journalisation | *Automatique via events* |
+| 🔨 moderation | Sanctions & gestion | `/ban`, `/kick`, `/warn`, `/timeout`, `/softban`, `/lockdown`, `/quarantine`, `/massban`, `/purge`, `/modlogs` |
+| 🎫 tickets | Support avancé | `/ticket create\|close\|transcript\|rename\|priority\|transfer\|blacklist\|stats`, `/ticketpanel` |
+| 📋 logs | Journalisation complète | *20+ événements automatiques* |
 | 🔒 security | Automodération | `/automod` |
+| 🛡️ antinuke | Protection anti-raid | `/antinuke enable\|disable\|whitelist\|threshold\|emergency` |
 | 👋 onboarding | Bienvenue/au revoir | *Automatique via events* |
 | ⭐ xp | Niveaux & expérience | `/rank`, `/leaderboard`, `/xpadmin` |
-| 💰 economy | Monnaie virtuelle | `/daily`, `/weekly`, `/balance`, `/pay`, `/rob`, `/shop`, `/richest`, `/ecoadmin` |
-| 🎭 roles | Menus de rôles | `/rolemenu` |
-| 🔧 utility | Utilitaires | `/userinfo`, `/serverinfo`, `/help`, `/ping`, `/avatar`, `/embed`, `/announce`, `/reminder`, `/voice` |
-| 🎮 fun | Mini-jeux | `/fun` (8ball, coinflip, dice, rps, rate, hug) |
-| 📊 stats | Statistiques | `/stats` |
-| 🔊 tempvoice | Vocaux temporaires | `/voice` |
-| 🏷️ tags | FAQ/réponses rapides | `/tag` |
+| 💰 economy | Monnaie virtuelle | `/daily`, `/weekly`, `/balance`, `/pay`, `/rob`, `/work`, `/gamble`, `/shop`, `/ecoadmin` |
+| 🎭 roles | Rôles automatiques | `/rolemenu`, `/reactionrole`, `/autorole` |
+| 🔧 utility | Utilitaires (15+) | `/ping`, `/help`, `/userinfo`, `/serverinfo`, `/poll`, `/suggest`, `/afk`, `/translate`, `/weather`, etc. |
+| 🎮 fun | Mini-jeux (7+) | `/8ball`, `/meme`, `/ship`, `/trivia`, `/joke`, `/games`, `/mock`, `/say` |
+| 🎵 music | Musique complète | `/music play\|pause\|skip\|queue\|volume\|loop\|shuffle\|lyrics\|playlist` |
+| 📊 stats | Statistiques | `/stats overview\|members\|messages\|moderation` |
+| 🔊 tempvoice | Vocaux temporaires | `/voice name\|limit\|lock\|unlock\|invite\|kick` |
+| 🏷️ tags | FAQ/réponses rapides | `/tag use\|create\|edit\|delete\|list` |
 | 📢 announcements | Annonces | `/announce` |
-| 📝 applications | Candidatures | `/apply` |
-| 🎉 events | Événements serveur | `/event` |
-| ⚡ custom_commands | Commandes custom | `/customcmd` |
+| 📝 applications | Candidatures | `/apply submit\|setup\|list` |
+| 🎉 events | Événements serveur | `/event create\|list\|cancel\|info` |
+| ⚡ custom_commands | Commandes custom | `/customcmd create\|edit\|delete\|list` |
 | 🎭 rp | Roleplay | `/rpprofile`, `/rpinventory` |
+| 🎁 giveaway | Giveaways | `/giveaway create\|end\|reroll\|list\|delete` |
+| ⭐ starboard | Starboard | `/starboard setup\|threshold\|channel\|stats` |
+| 👤 social | Profils & social | `/profile`, `/rep`, `/marry`, `/birthday` |
+| ✅ verify | Vérification | `/verify setup\|panel\|config\|stats` |
+| 📁 forums | Gestion forums | `/forum setup\|template\|config\|lock\|stats` |
+| 💾 backup | Sauvegarde serveur | `/backup create\|list\|info\|delete\|load` |
+| ⭐ premium | Premium tiers | `/premium status\|features\|activate` |
+| 🔌 integrations | Twitch/YouTube/RSS | `/integration twitch\|youtube\|rss` |
+| 📊 polls | Sondages & suggestions | `/poll`, `/suggest` |
+
+---
+
+## 🌐 Dashboard Web
+
+Le dashboard est accessible à `http://localhost:3000` (ou le port `API_PORT`).
+
+**Fonctionnalités :**
+- Authentification Discord OAuth2
+- Vue d'ensemble du bot (guilds, users, uptime, mémoire)
+- Liste des serveurs gérables
+- Activation/désactivation des modules par serveur
+- Configuration de chaque serveur (channels, rôles, paramètres)
+- Leaderboards XP & Économie
+- Statistiques par serveur
+
+**Configuration :** Ajouter `OAUTH2_CLIENT_SECRET` et `CLIENT_ID` dans `.env`.
 
 ---
 
@@ -274,7 +354,7 @@ Un seul pool de connexions MySQL, les données séparées par `guild_id` dans ch
 - Query helpers : pagination, bulk insert, leaderboards
 - Export/Import de configuration par guild
 
-### 3 migrations (idempotentes)
+### 5 migrations (idempotentes)
 
 **001** — Tables fondamentales : `guilds`, `guild_config`, `guild_modules`, `users`, `sanctions`, `tickets`, `transactions`, `daily_metrics`
 
@@ -282,17 +362,16 @@ Un seul pool de connexions MySQL, les données séparées par `guild_id` dans ch
 
 **003** — Tables modules : `applications`, `server_events`, `custom_commands`, `rp_characters`, `rp_inventory`, `reminders`, `temp_voice_channels`, `logs`
 
-### Commandes Knex
+**004** — Config system : tables config avancées
+
+**005** — Full features : `giveaways`, `starboard_*`, `verification_config`, `polls`, `suggestions`, `social_profiles`, `playlists`, `backups`, `premium_guilds`, `promo_codes`, `antinuke_*`, `afk_users`, `sticky_messages`, `auto_responders`, `invite_tracking`, `persistent_roles`, `warn_config`, `forum_config`, `ticket_blacklist`, `work_cooldowns`, `gamble_history` + ALTERs
+
+### Commandes DB
 
 ```bash
-# Migrer
-npx knex migrate:latest --knexfile database/knexfile.js
-
-# Rollback
-npx knex migrate:rollback --knexfile database/knexfile.js
-
-# Status
-npx knex migrate:status --knexfile database/knexfile.js
+npm run migrate              # Migrer
+npm run migrate:rollback     # Rollback
+npx knex migrate:status --knexfile database/knexfile.js  # Status
 ```
 
 ### Variables DB (.env)
@@ -314,18 +393,32 @@ npx knex migrate:status --knexfile database/knexfile.js
 
 ## 🛠️ Développement
 
+### Scripts npm
+
+```bash
+npm start              # Lancer le bot
+npm run dev            # Mode développement (watch)
+npm test               # Lancer les tests
+npm run test:coverage  # Tests avec couverture
+npm run lint           # Vérifier le code
+npm run lint:fix       # Corriger automatiquement
+npm run migrate        # Exécuter les migrations
+npm run deploy         # Déployer les commandes slash
+npm run docker:up      # Démarrer Docker
+npm run validate       # Valider toutes les commandes
+```
+
 ### Ajouter une commande
 
 1. Créer un fichier dans `commands/<module>/macommande.js`
 2. Exporter : `module`, `data` (SlashCommandBuilder), `execute(interaction)`
-3. Relancer `node deploy.js`
+3. Relancer `npm run deploy`
 4. Restart le bot
 
 ### Ajouter un composant
 
 1. Créer un fichier dans `components/<module>/mon-composant.js`
-2. Exporter : `prefix`, `type` (button/select/mixed), `execute(interaction)`
-3. Le prefix doit correspondre au début du `customId` du composant
+2. Exporter : `prefix` ou `customId` ou `customIds` (array), `type`, `execute(interaction)`
 
 ### Ajouter une tâche planifiée
 
@@ -335,8 +428,24 @@ npx knex migrate:status --knexfile database/knexfile.js
 
 ### Ajouter une locale
 
-1. Créer `locales/xx.json` en suivant la structure de `fr.json`
-2. Utiliser `t('key.subkey', { var: 'value' })` dans les commandes
+1. Créer/modifier `locales/xx.json` en suivant la structure de `fr.json`
+2. Utiliser `t(guildId, 'key.subkey', { var: 'value' })` dans les commandes
+
+---
+
+## 🧪 Tests
+
+```bash
+npm test               # Lancer tous les tests
+npm run test:coverage  # Avec rapport de couverture
+npm run test:watch     # Mode watch
+```
+
+**Suites de tests :**
+- `tests/core/` — Config, modules, i18n, commands, components
+- `tests/utils/` — Formatters, embeds, permissions
+- `tests/locales/` — Validation des fichiers de traduction
+- `tests/modules/` — Validation des manifestes
 
 ---
 
@@ -344,15 +453,18 @@ npx knex migrate:status --knexfile database/knexfile.js
 
 | Métrique | Valeur |
 |----------|--------|
-| Fichiers | ~90 |
-| Commandes slash | 42+ |
-| Sous-commandes | ~100 |
-| Modules | 22 |
-| Tables DB | 25+ |
-| Migrations | 3 |
+| Fichiers JS | ~130 |
+| Commandes slash | 70+ |
+| Sous-commandes | ~200 |
+| Modules | 28 |
+| Tables DB | 50+ |
+| Migrations | 5 |
 | Locales | 2 (FR, EN) |
-| Tâches planifiées | 4 |
-| Composants UI | 5 |
+| Clés de traduction | 200+ |
+| Événements Discord | 20+ |
+| Composants UI | 10+ |
+| Tests | 8 suites |
+| Tâches planifiées | 4+ |
 
 ---
 
@@ -362,4 +474,4 @@ MIT — Usage libre, attribution appréciée.
 
 ---
 
-*Ultra Suite v2.0 — Développé avec discord.js v14 & Knex.js — Déployé via Pterodactyl*
+*Ultra Suite v2.0 — Développé avec discord.js v14, Knex.js, Express — Docker & CI/CD ready*

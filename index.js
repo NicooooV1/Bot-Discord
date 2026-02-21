@@ -15,6 +15,7 @@ const { loadComponents } = require('./core/componentHandler');
 const { loadLocales } = require('./core/i18n');
 const { startScheduler, stopScheduler } = require('./core/scheduler');
 const { startApi, stopApi } = require('./core/api');
+const { startDashboard, stopDashboard } = require('./dashboard/server');
 const guildQueries = require('./database/guildQueries');
 const moduleRegistry = require('./core/moduleRegistry');
 
@@ -144,6 +145,9 @@ async function start() {
     // 9. Démarrer l'API REST (si activée)
     startApi(client);
 
+    // 10. Démarrer le Dashboard web (si configuré)
+    startDashboard(client);
+
     log.info('═══════════════════════════════════');
     log.info(`Bot opérationnel sur ${client.guilds.cache.size} serveur(s) !`);
     log.info('═══════════════════════════════════');
@@ -170,7 +174,8 @@ async function shutdown(signal) {
 
   try {
     stopApi();
-    log.info('✔ API arrêtée');
+    stopDashboard();
+    log.info('✔ API & Dashboard arrêtés');
   } catch (err) {
     log.error('Erreur arrêt API:', err.message);
   }

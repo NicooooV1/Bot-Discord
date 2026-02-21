@@ -1,0 +1,27 @@
+module.exports = {
+  id: 'starboard',
+  name: 'Starboard',
+  emoji: '⭐',
+  category: 'engagement',
+  description: 'Système de starboard multi-boards avec seuil configurable.',
+  dependencies: [],
+  requiredPermissions: ['ManageMessages'],
+  configSchema: {
+    enabled: { type: 'boolean', default: true },
+    boards: {
+      type: 'array',
+      default: [{ name: 'default', channelId: null, emoji: '⭐', threshold: 3 }],
+    },
+    selfStar: { type: 'boolean', default: false },
+    blacklistedChannels: { type: 'array', itemType: 'channel', default: [] },
+    blacklistedRoles: { type: 'array', itemType: 'role', default: [] },
+    autoPinThreshold: { type: 'number', default: 10 },
+    notifyAuthor: { type: 'boolean', default: false },
+    nsfwFilter: { type: 'boolean', default: true },
+    mediaOnly: { type: 'boolean', default: false },
+    embedColor: { type: 'string', default: '#FFD700' },
+  },
+  commands: ['starboard'],
+  events: ['messageReactionAdd', 'messageReactionRemove'],
+  jobs: [],
+};

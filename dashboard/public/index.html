@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ultra Suite — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-dark: #0d1117; --bg-card: #161b22; --bg-input: #21262d;
+      --border: #30363d; --text: #c9d1d9; --text-muted: #8b949e;
+      --primary: #5865f2; --primary-hover: #4752c4;
+      --success: #57f287; --danger: #ed4245; --warning: #fee75c;
+      --radius: 12px;
+    }
+    body { font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text); min-height: 100vh; }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ─── Header ─── */
+    .header { background: var(--bg-card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header .logo { display: flex; align-items: center; gap: 12px; font-size: 1.3rem; font-weight: 700; }
+    .header .logo span { background: linear-gradient(135deg, #5865f2, #eb459e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .header .user { display: flex; align-items: center; gap: 10px; }
+    .header .user img { width: 36px; height: 36px; border-radius: 50%; }
+    .btn { padding: 8px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; font-size: 0.9rem; transition: all 0.2s; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-sm { padding: 6px 14px; font-size: 0.8rem; }
+
+    /* ─── Layout ─── */
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+
+    /* ─── Cards ─── */
+    .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; transition: border-color 0.2s; }
+    .card:hover { border-color: var(--primary); }
+    .card h3 { font-size: 1rem; margin-bottom: 8px; }
+    .card .value { font-size: 2rem; font-weight: 700; color: #fff; }
+    .card .label { font-size: 0.85rem; color: var(--text-muted); }
+    .card .icon { font-size: 1.5rem; margin-bottom: 8px; }
+
+    /* ─── Stats ─── */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .stat-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; text-align: center; }
+    .stat-card .stat-value { font-size: 2.2rem; font-weight: 700; color: #fff; }
+    .stat-card .stat-label { color: var(--text-muted); font-size: 0.85rem; margin-top: 4px; }
+
+    /* ─── Guild card ─── */
+    .guild-card { display: flex; align-items: center; gap: 16px; cursor: pointer; }
+    .guild-card img { width: 48px; height: 48px; border-radius: 50%; }
+    .guild-card .guild-name { font-weight: 600; color: #fff; }
+    .guild-card .guild-members { color: var(--text-muted); font-size: 0.85rem; }
+    .guild-card .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
+    .badge-active { background: rgba(87, 242, 135, 0.15); color: var(--success); }
+    .badge-inactive { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); }
+
+    /* ─── Guild config ─── */
+    .config-section { margin-bottom: 24px; }
+    .config-section h2 { font-size: 1.2rem; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; margin-bottom: 6px; font-weight: 500; font-size: 0.9rem; }
+    .form-group input, .form-group select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-input); color: var(--text); font-size: 0.9rem; }
+    .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary); }
+    .toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+    .toggle input[type="checkbox"] { width: 44px; height: 24px; appearance: none; background: var(--bg-input); border-radius: 12px; position: relative; cursor: pointer; transition: background 0.2s; }
+    .toggle input[type="checkbox"]::after { content: ''; width: 20px; height: 20px; border-radius: 50%; background: var(--text-muted); position: absolute; top: 2px; left: 2px; transition: all 0.2s; }
+    .toggle input[type="checkbox"]:checked { background: var(--primary); }
+    .toggle input[type="checkbox"]:checked::after { left: 22px; background: #fff; }
+
+    /* ─── Hero ─── */
+    .hero { text-align: center; padding: 80px 24px; }
+    .hero h1 { font-size: 3rem; font-weight: 700; margin-bottom: 16px; background: linear-gradient(135deg, #5865f2, #eb459e); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .hero p { font-size: 1.2rem; color: var(--text-muted); margin-bottom: 32px; max-width: 600px; margin-left: auto; margin-right: auto; }
+
+    /* ─── Page transitions ─── */
+    .page { display: none; } .page.active { display: block; }
+    .back-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); margin-bottom: 16px; cursor: pointer; font-size: 0.9rem; }
+    .back-btn:hover { color: var(--text); }
+    .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+    .toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: 8px; color: #fff; font-weight: 500; display: none; z-index: 1000; animation: slideIn 0.3s; }
+    @keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">⚡ <span>Ultra Suite</span></div>
+    <div class="user" id="userArea"></div>
+  </div>
+
+  <!-- Landing Page -->
+  <div class="page active" id="page-landing">
+    <div class="hero">
+      <h1>Ultra Suite</h1>
+      <p>Le bot Discord ultime — Modération, XP, Économie, Tickets, Musique, et bien plus encore.</p>
+      <button class="btn btn-primary" onclick="login()" style="font-size:1.1rem;padding:12px 32px;">
+        🔑 Se connecter avec Discord
+      </button>
+      <div style="margin-top:24px;">
+        <div class="stats-grid" id="publicStats" style="max-width:600px;margin:0 auto;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard Page -->
+  <div class="page" id="page-dashboard">
+    <div class="container">
+      <h1 style="margin-bottom:24px;">📊 Dashboard</h1>
+      <div class="stats-grid" id="botStats"></div>
+      <h2 style="margin-bottom:16px;">🏠 Vos serveurs</h2>
+      <div class="grid" id="guildList"></div>
+    </div>
+  </div>
+
+  <!-- Guild Config Page -->
+  <div class="page" id="page-guild">
+    <div class="container">
+      <div class="back-btn" onclick="showPage('dashboard')">← Retour</div>
+      <div id="guildHeader" style="display:flex;align-items:center;gap:16px;margin-bottom:24px;"></div>
+      <div id="guildConfig"></div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+<script>
+  const API = '';
+  let currentUser = null;
+
+  // ─── Navigation ─────────────────────
+  function showPage(name) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById(`page-${name}`).classList.add('active');
+    if (name === 'dashboard') loadDashboard();
+  }
+
+  function login() { window.location.href = '/auth/login'; }
+  function logout() { window.location.href = '/auth/logout'; }
+
+  function toast(msg, type = 'success') {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.background = type === 'success' ? '#57f287' : type === 'danger' ? '#ed4245' : '#5865f2';
+    el.style.color = type === 'success' ? '#000' : '#fff';
+    el.style.display = 'block';
+    setTimeout(() => el.style.display = 'none', 3000);
+  }
+
+  // ─── API calls ──────────────────────
+  async function api(path) {
+    const res = await fetch(API + path, { credentials: 'include' });
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json();
+  }
+
+  async function apiPost(path, data) {
+    const res = await fetch(API + path, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json();
+  }
+
+  // ─── Init ───────────────────────────
+  async function init() {
+    // Load public stats
+    try {
+      const health = await api('/api/health');
+      document.getElementById('publicStats').innerHTML = `
+        <div class="stat-card"><div class="stat-value">${health.guilds}</div><div class="stat-label">Serveurs</div></div>
+        <div class="stat-card"><div class="stat-value">${Math.floor(health.uptime / 3600)}h</div><div class="stat-label">Uptime</div></div>
+        <div class="stat-card"><div class="stat-value">${health.memory} MB</div><div class="stat-label">Mémoire</div></div>
+      `;
+    } catch {}
+
+    // Check auth
+    try {
+      currentUser = await api('/auth/user');
+      document.getElementById('userArea').innerHTML = `
+        <img src="https://cdn.discordapp.com/avatars/${currentUser.id}/${currentUser.avatar}.png?size=64" alt="">
+        <span>${currentUser.username}</span>
+        <button class="btn btn-sm btn-danger" onclick="logout()">Déconnexion</button>
+      `;
+      showPage('dashboard');
+    } catch {
+      showPage('landing');
+    }
+  }
+
+  // ─── Dashboard ──────────────────────
+  async function loadDashboard() {
+    try {
+      const stats = await api('/api/stats');
+      document.getElementById('botStats').innerHTML = `
+        <div class="stat-card"><div class="stat-value">${stats.bot.guilds}</div><div class="stat-label">Serveurs</div></div>
+        <div class="stat-card"><div class="stat-value">${stats.bot.users.toLocaleString()}</div><div class="stat-label">Utilisateurs</div></div>
+        <div class="stat-card"><div class="stat-value">${stats.bot.commands}</div><div class="stat-label">Commandes</div></div>
+        <div class="stat-card"><div class="stat-value">${Math.floor(stats.bot.uptime / 3600)}h ${Math.floor((stats.bot.uptime % 3600) / 60)}m</div><div class="stat-label">Uptime</div></div>
+        <div class="stat-card"><div class="stat-value">${stats.memory.heap} MB</div><div class="stat-label">Mémoire Heap</div></div>
+      `;
+
+      const { guilds } = await api('/api/guilds');
+      document.getElementById('guildList').innerHTML = guilds.map(g => `
+        <div class="card guild-card" onclick="${g.inBot ? `loadGuild('${g.id}')` : ''}">
+          <img src="${g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=64` : 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22><rect fill=%22%235865f2%22 width=%221%22 height=%221%22/></svg>'}" alt="">
+          <div>
+            <div class="guild-name">${escapeHtml(g.name)}</div>
+            <div class="guild-members">${g.members.toLocaleString()} membres</div>
+          </div>
+          <span class="badge ${g.inBot ? 'badge-active' : 'badge-inactive'}">${g.inBot ? 'Actif' : 'Non ajouté'}</span>
+        </div>
+      `).join('');
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // ─── Guild Config ───────────────────
+  async function loadGuild(id) {
+    showPage('guild');
+    document.getElementById('guildConfig').innerHTML = '<div class="loading">Chargement...</div>';
+
+    try {
+      const data = await api(`/api/guilds/${id}`);
+
+      document.getElementById('guildHeader').innerHTML = `
+        <img src="${data.icon || ''}" style="width:64px;height:64px;border-radius:50%;" alt="">
+        <div><h1>${escapeHtml(data.name)}</h1><span style="color:var(--text-muted)">${data.members.toLocaleString()} membres</span></div>
+      `;
+
+      const moduleNames = Object.keys(data.modules || {});
+      const configKeys = Object.keys(data.config || {});
+
+      let html = '';
+
+      // Modules section
+      html += '<div class="config-section"><h2>🧩 Modules</h2><div class="grid">';
+      for (const mod of moduleNames) {
+        const enabled = data.modules[mod];
+        html += `<div class="card"><label class="toggle">
+          <input type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleModule('${id}','${mod}',this.checked)">
+          <span style="font-weight:600;text-transform:capitalize">${mod.replace(/_/g, ' ')}</span>
+        </label></div>`;
+      }
+      html += '</div></div>';
+
+      // Config section
+      html += '<div class="config-section"><h2>⚙️ Configuration</h2>';
+      const configGroups = { 'Général': [], 'Modération': [], 'Logs': [], 'Autre': [] };
+      for (const key of configKeys) {
+        const val = data.config[key];
+        if (typeof val === 'object') continue;
+        if (key.includes('log') || key.includes('Log')) configGroups['Logs'].push(key);
+        else if (key.includes('mod') || key.includes('warn') || key.includes('mute')) configGroups['Modération'].push(key);
+        else if (key.includes('prefix') || key.includes('lang') || key.includes('welcome')) configGroups['Général'].push(key);
+        else configGroups['Autre'].push(key);
+      }
+
+      for (const [group, keys] of Object.entries(configGroups)) {
+        if (keys.length === 0) continue;
+        html += `<h3 style="margin:16px 0 8px;color:var(--text-muted)">${group}</h3>`;
+        for (const key of keys) {
+          const val = data.config[key];
+          const isChannel = key.includes('Channel') || key.includes('channel');
+          const isRole = key.includes('Role') || key.includes('role');
+
+          html += `<div class="form-group"><label>${key}</label>`;
+          if (isChannel && data.channels) {
+            html += `<select data-config-key="${key}" onchange="updateConfig('${id}')">
+              <option value="">— Aucun —</option>
+              ${data.channels.map(c => `<option value="${c.id}" ${val === c.id ? 'selected' : ''}>#${escapeHtml(c.name)}</option>`).join('')}
+            </select>`;
+          } else if (isRole && data.roles) {
+            html += `<select data-config-key="${key}" onchange="updateConfig('${id}')">
+              <option value="">— Aucun —</option>
+              ${data.roles.map(r => `<option value="${r.id}" ${val === r.id ? 'selected' : ''}>@${escapeHtml(r.name)}</option>`).join('')}
+            </select>`;
+          } else if (typeof val === 'boolean') {
+            html += `<label class="toggle"><input type="checkbox" data-config-key="${key}" ${val ? 'checked' : ''} onchange="updateConfig('${id}')"> ${val ? 'Activé' : 'Désactivé'}</label>`;
+          } else {
+            html += `<input type="text" data-config-key="${key}" value="${escapeHtml(String(val || ''))}" onchange="updateConfig('${id}')">`;
+          }
+          html += '</div>';
+        }
+      }
+      html += '</div>';
+
+      // Save button
+      html += `<button class="btn btn-primary" onclick="saveConfig('${id}')" style="margin-top:16px;">💾 Sauvegarder</button>`;
+
+      document.getElementById('guildConfig').innerHTML = html;
+    } catch (e) {
+      document.getElementById('guildConfig').innerHTML = `<div class="card" style="color:var(--danger)">Erreur: ${e.message}</div>`;
+    }
+  }
+
+  async function toggleModule(guildId, module, enabled) {
+    try {
+      await apiPost(`/api/guilds/${guildId}/config`, { modules: { [module]: enabled } });
+      toast(`Module ${module} ${enabled ? 'activé' : 'désactivé'}`, 'success');
+    } catch (e) {
+      toast('Erreur: ' + e.message, 'danger');
+    }
+  }
+
+  async function saveConfig(guildId) {
+    const config = {};
+    document.querySelectorAll('[data-config-key]').forEach(el => {
+      const key = el.dataset.configKey;
+      if (el.type === 'checkbox') config[key] = el.checked;
+      else config[key] = el.value;
+    });
+
+    try {
+      await apiPost(`/api/guilds/${guildId}/config`, { config });
+      toast('Configuration sauvegardée !', 'success');
+    } catch (e) {
+      toast('Erreur: ' + e.message, 'danger');
+    }
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return str.replace(/[&<>"']/g, c => map[c]);
+  }
+
+  // Boot
+  init();
+</script>
+</body>
+</html>

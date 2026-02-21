@@ -79,7 +79,13 @@ function loadComponents(client) {
         // Type par défaut
         if (!handler.type) handler.type = 'any';
 
-        if (handler.customId) {
+        if (handler.customIds && Array.isArray(handler.customIds)) {
+          // Mode array — register each as a prefix match
+          for (const cid of handler.customIds) {
+            client.componentPrefixes.push({ ...handler, prefix: cid });
+          }
+          loaded++;
+        } else if (handler.customId) {
           // Mode exact match
           client.components.set(handler.customId, handler);
           loaded++;
@@ -88,7 +94,7 @@ function loadComponents(client) {
           client.componentPrefixes.push(handler);
           loaded++;
         } else {
-          log.warn(`Ignoré (ni customId ni prefix) : ${handler._sourcePath}`);
+          log.warn(`Ignoré (ni customId/customIds/prefix) : ${handler._sourcePath}`);
         }
       } catch (err) {
         errors++;

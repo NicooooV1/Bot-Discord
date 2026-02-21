@@ -6,12 +6,25 @@
     "cooldown": "⏰ Veuillez patienter **{time}** secondes avant de réutiliser cette commande.",
     "bot_no_permission": "❌ Je n'ai pas les permissions nécessaires pour effectuer cette action.",
     "user_not_found": "❌ Utilisateur introuvable.",
-    "invalid_duration": "❌ Durée invalide. Exemples : `5m`, `1h`, `7d`"
+    "invalid_duration": "❌ Durée invalide. Exemples : `5m`, `1h`, `7d`",
+    "success": "✅ Action effectuée avec succès.",
+    "cancelled": "❌ Action annulée.",
+    "not_found": "❌ Élément introuvable.",
+    "already_exists": "❌ Cet élément existe déjà.",
+    "confirm": "Confirmez-vous cette action ?",
+    "page": "Page {current}/{total}",
+    "no_results": "Aucun résultat trouvé.",
+    "loading": "⏳ Chargement en cours..."
   },
   "moderation": {
     "ban": {
       "success": "**{user}** a été banni. Raison : {reason}",
-      "dm": "🔨 Vous avez été banni de **{guild}**.\nRaison : {reason}"
+      "dm": "🔨 Vous avez été banni de **{guild}**.\nRaison : {reason}",
+      "already_banned": "Cet utilisateur est déjà banni."
+    },
+    "unban": {
+      "success": "**{user}** a été débanni.",
+      "not_banned": "Cet utilisateur n'est pas banni."
     },
     "kick": {
       "success": "**{user}** a été expulsé. Raison : {reason}",
@@ -19,29 +32,98 @@
     },
     "warn": {
       "success": "**{user}** a reçu un avertissement ({count}/{max}). Raison : {reason}",
-      "dm": "⚠️ Vous avez reçu un avertissement sur **{guild}**.\nRaison : {reason}"
+      "dm": "⚠️ Vous avez reçu un avertissement sur **{guild}**.\nRaison : {reason}",
+      "removed": "Avertissement #{id} supprimé.",
+      "list_empty": "Aucun avertissement trouvé."
     },
     "timeout": {
-      "success": "**{user}** a été réduit au silence pour **{duration}**. Raison : {reason}"
+      "success": "**{user}** a été réduit au silence pour **{duration}**. Raison : {reason}",
+      "removed": "Timeout retiré de **{user}**."
+    },
+    "purge": {
+      "success": "**{count}** message(s) supprimé(s).",
+      "no_messages": "Aucun message à supprimer."
+    },
+    "lock": {
+      "locked": "🔒 Channel verrouillé.",
+      "unlocked": "🔓 Channel déverrouillé."
+    },
+    "slowmode": {
+      "set": "Mode lent défini à **{seconds}** secondes.",
+      "disabled": "Mode lent désactivé."
+    },
+    "softban": {
+      "success": "**{user}** a été softban. Messages récents supprimés.",
+      "dm": "🔨 Vous avez été softban de **{guild}**.\nRaison : {reason}"
+    },
+    "lockdown": {
+      "started": "🚨 Lockdown activé sur **{count}** channels.",
+      "ended": "✅ Lockdown désactivé sur **{count}** channels."
+    },
+    "quarantine": {
+      "added": "**{user}** mis en quarantaine.",
+      "removed": "**{user}** retiré de la quarantaine."
+    },
+    "massban": {
+      "success": "**{count}** utilisateurs bannis.",
+      "confirm": "Vous êtes sur le point de bannir **{count}** utilisateurs. Confirmez-vous ?"
+    },
+    "note": {
+      "added": "📝 Note ajoutée à **{user}**.",
+      "list_empty": "Aucune note pour cet utilisateur.",
+      "removed": "Note supprimée."
+    },
+    "sanctions": {
+      "title": "Sanctions de {user}",
+      "empty": "Aucune sanction enregistrée."
     }
   },
   "tickets": {
     "created": "Ticket **#{id}** créé avec succès.",
     "closed": "Ticket **#{id}** fermé par **{user}**.",
-    "max_reached": "Vous avez déjà atteint la limite de **{max}** tickets ouverts."
+    "max_reached": "Vous avez déjà atteint la limite de **{max}** tickets ouverts.",
+    "transcript_generated": "Transcript généré — **{count}** messages.",
+    "blacklisted": "Vous êtes blacklist des tickets.",
+    "not_a_ticket": "Ce channel n'est pas un ticket.",
+    "claimed": "**{user}** prend en charge ce ticket.",
+    "transferred": "Ticket transféré à **{user}**.",
+    "renamed": "Ticket renommé en **{name}**.",
+    "priority_set": "Priorité mise à jour : **{level}**."
   },
   "xp": {
-    "level_up": "🎉 {user} est passé au **niveau {level}** !"
+    "level_up": "🎉 {user} est passé au **niveau {level}** !",
+    "rank": "**{user}** — Niveau **{level}** — **{xp}** XP",
+    "leaderboard_title": "🏆 Classement XP",
+    "xp_added": "**{amount}** XP ajouté(s) à **{user}**.",
+    "xp_removed": "**{amount}** XP retiré(s) à **{user}**.",
+    "xp_reset": "XP de **{user}** réinitialisé.",
+    "role_reward": "🎁 **{user}** a reçu le rôle **{role}** (niveau {level}) !"
   },
   "economy": {
     "daily_claimed": "Vous avez reçu **{amount}** {currency} ! Solde : **{balance}** {currency}",
     "daily_cooldown": "Vous avez déjà récupéré votre récompense. Revenez dans **{time}**.",
+    "weekly_claimed": "Vous avez reçu **{amount}** {currency} (hebdomadaire) ! Solde : **{balance}** {currency}",
+    "weekly_cooldown": "Récompense hebdomadaire déjà récupérée. Revenez dans **{time}**.",
     "insufficient": "Fonds insuffisants. Solde : **{balance}** {currency}",
-    "transfer_success": "**{amount}** {currency} envoyé(s) à **{target}**."
+    "transfer_success": "**{amount}** {currency} envoyé(s) à **{target}**.",
+    "balance": "💰 **{user}** possède **{balance}** {currency}",
+    "balance_bank": "🏦 Banque : **{bank}** {currency}",
+    "rob_success": "Vous avez volé **{amount}** {currency} à **{target}** !",
+    "rob_fail": "Vous vous êtes fait attraper et avez payé **{fine}** {currency} d'amende.",
+    "rob_cooldown": "Vous ne pouvez pas voler avant **{time}**.",
+    "work_success": "Vous avez travaillé comme **{job}** et gagné **{amount}** {currency} !",
+    "work_cooldown": "Vous avez déjà travaillé. Revenez dans **{time}**.",
+    "gamble_won": "🎰 Vous avez gagné **{amount}** {currency} !",
+    "gamble_lost": "😢 Vous avez perdu **{amount}** {currency}.",
+    "shop_empty": "La boutique est vide.",
+    "shop_bought": "Vous avez acheté **{item}** pour **{price}** {currency}.",
+    "leaderboard_title": "🏆 Classement Économie"
   },
   "onboarding": {
     "welcome": "Bienvenue {user} sur **{guild}** ! Tu es notre **{count}ème** membre. 🎉",
-    "goodbye": "{user} a quitté **{guild}**. Nous sommes maintenant **{count}** membres."
+    "goodbye": "{user} a quitté **{guild}**. Nous sommes maintenant **{count}** membres.",
+    "autorole_added": "Rôle automatique **{role}** ajouté.",
+    "autorole_removed": "Rôle automatique **{role}** retiré."
   },
   "logs": {
     "join": "📥 **{user}** a rejoint le serveur",
@@ -50,6 +132,124 @@
     "message_edit": "✏️ Message modifié dans {channel}",
     "voice_join": "🔊 **{user}** a rejoint {channel}",
     "voice_leave": "🔇 **{user}** a quitté {channel}",
-    "voice_switch": "🔀 **{user}** : {from} → {to}"
+    "voice_switch": "🔀 **{user}** : {from} → {to}",
+    "role_create": "🟢 Rôle créé : **{role}**",
+    "role_delete": "🔴 Rôle supprimé : **{role}**",
+    "role_update": "🟡 Rôle modifié : **{role}**",
+    "channel_create": "🟢 Channel créé : **{channel}**",
+    "channel_delete": "🔴 Channel supprimé : **{channel}**",
+    "channel_update": "🟡 Channel modifié : **{channel}**",
+    "ban_add": "🔨 **{user}** banni par **{executor}**",
+    "ban_remove": "🔓 **{user}** débanni par **{executor}**",
+    "member_update": "👤 Membre modifié : **{user}**",
+    "guild_update": "🏠 Serveur modifié",
+    "emoji_create": "😀 Emoji ajouté : **{emoji}**",
+    "emoji_delete": "❌ Emoji supprimé : **{emoji}**",
+    "webhook_update": "🔗 Webhook modifié dans **{channel}**"
+  },
+  "giveaway": {
+    "started": "🎉 Giveaway lancé ! **{prize}** — {winners} gagnant(s)",
+    "ended": "🎉 Le giveaway est terminé ! Gagnant(s) : {winners}",
+    "no_participants": "Aucun participant au giveaway.",
+    "entered": "Vous participez au giveaway !",
+    "left": "Vous ne participez plus au giveaway.",
+    "already_entered": "Vous participez déjà."
+  },
+  "starboard": {
+    "added": "⭐ Un message a été ajouté au starboard !",
+    "threshold_set": "Seuil du starboard défini à **{threshold}** ⭐."
+  },
+  "music": {
+    "playing": "🎶 **{title}** en cours de lecture",
+    "added_queue": "**{title}** ajouté à la file d'attente (position #{position})",
+    "queue_empty": "La file d'attente est vide.",
+    "not_in_voice": "Vous devez être dans un salon vocal.",
+    "no_results": "Aucun résultat trouvé.",
+    "stopped": "⏹ Lecture arrêtée.",
+    "skipped": "⏭ Piste suivante.",
+    "paused": "⏸ Lecture en pause.",
+    "resumed": "▶ Lecture reprise.",
+    "volume_set": "🔊 Volume défini à **{volume}%**.",
+    "loop_enable": "🔂 Boucle activée.",
+    "loop_disable": "➡ Boucle désactivée.",
+    "shuffled": "🔀 File d'attente mélangée.",
+    "disconnected": "👋 Déconnecté du salon vocal."
+  },
+  "fun": {
+    "8ball_title": "🎱 Boule magique",
+    "ship_result": "Le couple **{user1}** ❤️ **{user2}** a un score de compatibilité de **{score}%** !",
+    "trivia_correct": "✅ Bonne réponse !",
+    "trivia_wrong": "❌ Mauvaise réponse ! La réponse était : **{answer}**",
+    "trivia_timeout": "⏰ Temps écoulé ! La réponse était : **{answer}**"
+  },
+  "social": {
+    "rep_given": "Vous avez donné un point de réputation à **{user}** ! (+1 rep)",
+    "rep_cooldown": "Vous avez déjà donné votre rep. Revenez dans **{time}**.",
+    "marry_proposed": "**{user1}** a demandé **{user2}** en mariage ! 💍",
+    "marry_accepted": "**{user1}** et **{user2}** sont maintenant mariés ! 💒",
+    "marry_declined": "💔 La demande en mariage a été refusée.",
+    "divorce_success": "💔 Vous avez divorcé de **{user}**.",
+    "birthday_set": "🎂 Anniversaire défini au **{date}**.",
+    "birthday_today": "🎂 Joyeux anniversaire **{user}** !"
+  },
+  "verify": {
+    "verified": "✅ Vous avez été vérifié avec succès !",
+    "already_verified": "Vous êtes déjà vérifié.",
+    "captcha_wrong": "❌ Captcha incorrect.",
+    "question_wrong": "❌ Mauvaise réponse."
+  },
+  "utility": {
+    "ping": "🏓 Pong ! Latence : **{latency}ms** | API : **{api}ms**",
+    "reminder_set": "⏰ Rappel défini pour dans **{time}**.",
+    "reminder_fired": "⏰ Rappel : {message}",
+    "afk_set": "😴 Vous êtes maintenant AFK : {reason}",
+    "afk_removed": "👋 Bienvenue ! Vous n'êtes plus AFK. (Absent **{duration}**)",
+    "afk_mention": "💤 **{user}** est AFK : {reason} (depuis **{time}**)",
+    "poll_created": "📊 Sondage créé !",
+    "poll_ended": "📊 Sondage terminé !",
+    "suggest_created": "💡 Suggestion #{id} envoyée !",
+    "suggest_approved": "✅ Suggestion #{id} approuvée.",
+    "suggest_denied": "❌ Suggestion #{id} refusée."
+  },
+  "backup": {
+    "created": "💾 Backup **{id}** créée avec succès.",
+    "restored": "♻️ Backup **{id}** restaurée.",
+    "deleted": "🗑️ Backup supprimée.",
+    "not_found": "Backup introuvable."
+  },
+  "premium": {
+    "active": "⭐ Premium **{tier}** actif jusqu'au **{expires}**.",
+    "not_active": "Vous n'avez pas d'abonnement premium.",
+    "activated": "✅ Premium **{tier}** activé !",
+    "code_invalid": "❌ Code promotionnel invalide ou expiré."
+  },
+  "antinuke": {
+    "enabled": "🛡️ Anti-nuke activé.",
+    "disabled": "Anti-nuke désactivé.",
+    "alert": "🚨 **ALERTE ANTI-NUKE** — Action suspecte détectée : **{action}** par **{user}**",
+    "owner_only": "Seul le propriétaire du serveur peut utiliser cette commande."
+  },
+  "roles": {
+    "reaction_role_created": "Reaction role créé dans {channel}.",
+    "autorole_added": "Autorole **{role}** ajouté.",
+    "autorole_removed": "Autorole **{role}** retiré.",
+    "rolemenu_created": "Menu de rôles créé."
+  },
+  "events": {
+    "created": "📅 Événement **{name}** créé !",
+    "joined": "Vous participez à l'événement **{name}**.",
+    "left": "Vous ne participez plus à l'événement **{name}**.",
+    "started": "🎉 L'événement **{name}** commence !",
+    "ended": "L'événement **{name}** est terminé.",
+    "cancelled": "L'événement **{name}** a été annulé."
+  },
+  "integrations": {
+    "twitch_added": "📺 Notifications Twitch activées pour **{channel}**.",
+    "youtube_added": "📺 Notifications YouTube activées pour **{channel}**.",
+    "rss_added": "📰 Flux RSS ajouté : **{url}**."
+  },
+  "forums": {
+    "template_created": "📝 Template de forum créé.",
+    "auto_tag_set": "Tag automatique configuré."
   }
 }

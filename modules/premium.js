@@ -1,0 +1,63 @@
+module.exports = {
+  id: 'premium',
+  name: 'Premium',
+  emoji: '💎',
+  category: 'admin',
+  description: 'Système premium avec tiers, codes promo, limites augmentées et fonctionnalités exclusives.',
+  dependencies: [],
+  requiredPermissions: [],
+  configSchema: {
+    enabled: { type: 'boolean', default: true },
+    freeTier: {
+      type: 'object',
+      default: {
+        maxCustomCommands: 10,
+        maxAutoResponders: 5,
+        maxTicketCategories: 3,
+        maxGiveaways: 2,
+        maxBackups: 3,
+        maxRoleMenus: 5,
+        canUploadBackground: false,
+      },
+    },
+    bronzeTier: {
+      type: 'object',
+      default: {
+        maxCustomCommands: 50,
+        maxAutoResponders: 25,
+        maxTicketCategories: 10,
+        maxGiveaways: 10,
+        maxBackups: 10,
+        maxRoleMenus: 20,
+        canUploadBackground: true,
+      },
+    },
+    silverTier: {
+      type: 'object',
+      default: {
+        maxCustomCommands: 100,
+        maxAutoResponders: 50,
+        maxTicketCategories: 25,
+        maxGiveaways: 25,
+        maxBackups: 25,
+        maxRoleMenus: 50,
+        canUploadBackground: true,
+      },
+    },
+    goldTier: {
+      type: 'object',
+      default: {
+        maxCustomCommands: -1,
+        maxAutoResponders: -1,
+        maxTicketCategories: -1,
+        maxGiveaways: -1,
+        maxBackups: -1,
+        maxRoleMenus: -1,
+        canUploadBackground: true,
+      },
+    },
+  },
+  commands: ['premium'],
+  events: [],
+  jobs: ['premiumExpiryTask'],
+};

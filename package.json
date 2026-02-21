@@ -5,15 +5,30 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "dev": "node --watch index.js",
     "deploy": "node deploy-commands.js --global",
     "deploy:dev": "node deploy-commands.js --dev",
     "deploy:global": "node deploy-commands.js --global",
     "deploy:clean": "node deploy-commands.js --clean",
     "deploy:clean-global": "node deploy-commands.js --clean-global",
-    "test": "jest --passWithNoTests"
+    "test": "jest --passWithNoTests",
+    "test:watch": "jest --watch --passWithNoTests",
+    "test:coverage": "jest --coverage --passWithNoTests",
+    "lint": "eslint . --ext .js --max-warnings 0",
+    "lint:fix": "eslint . --ext .js --fix",
+    "migrate": "knex migrate:latest --knexfile database/knexfile.js",
+    "migrate:rollback": "knex migrate:rollback --knexfile database/knexfile.js",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:build": "docker-compose build",
+    "validate": "node -e \"const fs=require('fs');const p=require('path');let c=0;function s(d){for(const f of fs.readdirSync(d,{withFileTypes:true})){if(f.isDirectory())s(p.join(d,f.name));else if(f.name.endsWith('.js')){const m=require(p.join(d,f.name));if(m.data&&m.execute)c++;}}}s(p.resolve('commands'));console.log('✅',c,'commandes valides')\""
   },
   "dependencies": {
     "discord.js": "^14.16.3",
+    "@discordjs/voice": "^0.17.0",
+    "@discordjs/opus": "^0.9.0",
+    "play-dl": "^1.9.7",
+    "sodium-native": "^4.1.1",
     "mysql2": "^3.11.0",
     "dotenv": "^16.4.7",
     "knex": "^3.1.0",
@@ -21,10 +36,30 @@
     "node-cache": "^5.1.2",
     "winston": "^3.17.0",
     "express": "^4.21.1",
-    "uuid": "^11.0.0"
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "passport": "^0.7.0",
+    "passport-discord": "^0.1.4",
+    "express-session": "^1.18.0",
+    "canvas": "^2.11.2",
+    "uuid": "^11.0.0",
+    "mathjs": "^13.2.0",
+    "translate-google": "^1.5.0",
+    "qrcode": "^1.5.4",
+    "rss-parser": "^3.13.0",
+    "genius-lyrics": "^4.4.7",
+    "prom-client": "^15.1.0",
+    "@sentry/node": "^8.0.0",
+    "ioredis": "^5.4.1",
+    "html-pdf-node": "^1.0.8",
+    "cheerio": "^1.0.0",
+    "archiver": "^7.0.1",
+    "perspective-api-client": "^3.0.1"
   },
   "devDependencies": {
-    "jest": "^29.7.0"
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0",
+    "eslint": "^9.0.0"
   },
   "engines": {
     "node": ">=20.0.0"
