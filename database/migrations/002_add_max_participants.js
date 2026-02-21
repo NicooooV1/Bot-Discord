@@ -104,22 +104,23 @@ exports.up = async function (knex) {
   }
 
   // === Ajout colonnes manquantes à users ===
-  const userColsRaw = await knex.raw(`SHOW COLUMNS FROM users`);
-  const userColNames = (userColsRaw[0] || []).map((c) => c.Field);
+  const hasStreak = await knex.schema.hasColumn('users', 'daily_streak');
+  const hasLastDaily = await knex.schema.hasColumn('users', 'last_daily');
+  const hasLastWeekly = await knex.schema.hasColumn('users', 'last_weekly');
 
   await knex.schema.alterTable('users', (t) => {
-    if (!userColNames.includes('daily_streak')) t.integer('daily_streak').defaultTo(0);
-    if (!userColNames.includes('last_daily')) t.datetime('last_daily');
-    if (!userColNames.includes('last_weekly')) t.datetime('last_weekly');
+    if (!hasStreak) t.integer('daily_streak').defaultTo(0);
+    if (!hasLastDaily) t.datetime('last_daily');
+    if (!hasLastWeekly) t.datetime('last_weekly');
   });
 
   // === Ajout colonnes manquantes à sanctions ===
-  const sanctionColsRaw = await knex.raw(`SHOW COLUMNS FROM sanctions`);
-  const sanctionColNames = (sanctionColsRaw[0] || []).map((c) => c.Field);
+  const hasRevokedAt = await knex.schema.hasColumn('sanctions', 'revoked_at');
+  const hasRevokedBy = await knex.schema.hasColumn('sanctions', 'revoked_by');
 
   await knex.schema.alterTable('sanctions', (t) => {
-    if (!sanctionColNames.includes('revoked_at')) t.datetime('revoked_at');
-    if (!sanctionColNames.includes('revoked_by')) t.string('revoked_by', 20);
+    if (!hasRevokedAt) t.datetime('revoked_at');
+    if (!hasRevokedBy) t.string('revoked_by', 20);
   });
 };
 

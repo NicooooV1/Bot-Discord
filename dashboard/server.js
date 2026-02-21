@@ -1,7 +1,15 @@
+﻿// ===================================
+// Ultra Suite - Web Dashboard
+// Projet independant - Express + Passport OAuth2
+//
+// Se connecte directement a PostgreSQL et Redis.
+// Communique avec le bot via API REST interne.
+//
+// Deploiement : LXC 115 (192.168.1.219)
+// Reverse proxy Nginx + SSL (certbot)
 // ===================================
-// Ultra Suite — Web Dashboard
-// Express + Passport OAuth2 + Static SPA
-// ===================================
+
+require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
@@ -10,67 +18,163 @@ const { Strategy: DiscordStrategy } = require('passport-discord');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const path = require('path');
-const { createModuleLogger } = require('../core/logger');
-const configService = require('../core/configService');
-const { getDb } = require('../database');
+const Redis = require('ioredis');
+const knex = require('knex');
 
-const log = createModuleLogger('Dashboard');
-
-let app = null;
-let server = null;
-let botClient = null;
-
+// ===================================
+// Configuration
+// ===================================
+const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT, 10) || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || process.env.OAUTH2_CLIENT_SECRET || 'change-me';
 const SCOPES = ['identify', 'guilds'];
-const JWT_SECRET = process.env.API_SECRET || 'ultra-suite-secret';
-const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || process.env.API_PORT, 10) || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const BOT_API_URL = process.env.BOT_API_URL || 'http://192.168.1.235:3001';
 
-// ─── Passport Setup ─────────────────────────
+// ===================================
+// Database (PostgreSQL direct)
+// ===================================
+const db = knex({
+  client: 'pg',
+  connection: {
+    host: process.env.DB_HOST || '192.168.1.216',
+    port: parseInt(process.env.DB_PORT, 10) || 5432,
+    user: process.env.DB_USER || 'botuser',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'discordbot',
+  },
+  pool: { min: 1, max: 5 },
+});
+
+// ===================================
+// Redis (DB3 pour sessions)
+// ===================================
+const redis = new Redis({
+  host: process.env.REDIS_HOST || '192.168.1.217',
+  port: parseInt(process.env.REDIS_PORT, 10) || 6379,
+  password: process.env.REDIS_PASSWORD || '',
+  db: 3,
+  lazyConnect: true,
+});
+
+redis.on('connect', () => console.log('[Dashboard] Redis DB3 connecte'));
+redis.on('error', (err) => console.error('[Dashboard] Redis erreur:', err.message));
+
+// ===================================
+// Session store Redis
+// ===================================
+let RedisStore;
+try {
+  const connectRedis = require('connect-redis');
+  RedisStore = connectRedis.default || connectRedis;
+} catch {
+  RedisStore = null;
+}
+
+// ===================================
+// Passport Discord
+// ===================================
 passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((obj, done) => done(null, obj));
 
-/**
- * Start the dashboard server
- * @param {import('discord.js').Client} client
- */
-function startDashboard(client) {
-  if (!process.env.OAUTH2_CLIENT_SECRET || !process.env.CLIENT_ID) {
-    log.warn('OAUTH2_CLIENT_SECRET ou CLIENT_ID manquant — Dashboard désactivé');
-    return;
+// ===================================
+// Helper : appel API vers le bot
+// ===================================
+async function botApi(endpoint, options = {}) {
+  try {
+    const url = `${BOT_API_URL}${endpoint}`;
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.BOT_API_KEY || ''}`,
+        ...(options.headers || {}),
+      },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ===================================
+// Helper : parser la config guild
+// ===================================
+function safeJsonParse(str, fallback = {}) {
+  if (!str) return fallback;
+  if (typeof str === 'object') return str;
+  try { return JSON.parse(str); } catch { return fallback; }
+}
+
+// ===================================
+// Start
+// ===================================
+async function startDashboard() {
+  // Connexion Redis
+  try {
+    await redis.connect();
+  } catch (err) {
+    console.warn('[Dashboard] Redis non disponible:', err.message);
   }
 
-  botClient = client;
-  app = express();
+  // Tester la connexion DB
+  try {
+    await db.raw('SELECT 1');
+    console.log('[Dashboard] PostgreSQL connecte');
+  } catch (err) {
+    console.error('[Dashboard] PostgreSQL erreur:', err.message);
+  }
 
-  // ─── Middleware ──────────────────────────
+  const app = express();
+
+  // --- Middleware ---
   app.use(cors({
     origin: process.env.DASHBOARD_URL || `http://localhost:${DASHBOARD_PORT}`,
     credentials: true,
   }));
   app.use(express.json());
-  app.use(session({
+
+  // Session (Redis ou memoire)
+  const sessionConfig = {
     secret: JWT_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 },
-  }));
+    cookie: {
+      secure: NODE_ENV === 'production',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      sameSite: 'lax',
+    },
+  };
+
+  if (RedisStore && redis.status === 'ready') {
+    sessionConfig.store = new RedisStore({ client: redis, prefix: 'dash:sess:' });
+    console.log('[Dashboard] Sessions stockees dans Redis');
+  }
+
+  app.use(session(sessionConfig));
   app.use(passport.initialize());
   app.use(passport.session());
 
-  // Passport Discord strategy
-  passport.use(new DiscordStrategy({
-    clientID: process.env.CLIENT_ID,
-    clientSecret: process.env.OAUTH2_CLIENT_SECRET,
-    callbackURL: process.env.OAUTH2_REDIRECT_URI || `http://localhost:${DASHBOARD_PORT}/auth/callback`,
-    scope: SCOPES,
-  }, (accessToken, refreshToken, profile, done) => {
-    profile.accessToken = accessToken;
-    return done(null, profile);
-  }));
+  // Passport Discord strategy (seulement si configure)
+  if (process.env.CLIENT_ID && process.env.OAUTH2_CLIENT_SECRET) {
+    passport.use(new DiscordStrategy({
+      clientID: process.env.CLIENT_ID,
+      clientSecret: process.env.OAUTH2_CLIENT_SECRET,
+      callbackURL: process.env.OAUTH2_REDIRECT_URI || `http://localhost:${DASHBOARD_PORT}/auth/callback`,
+      scope: SCOPES,
+    }, (accessToken, refreshToken, profile, done) => {
+      profile.accessToken = accessToken;
+      return done(null, profile);
+    }));
+  } else {
+    console.warn('[Dashboard] CLIENT_ID ou OAUTH2_CLIENT_SECRET manquant - OAuth desactive');
+  }
 
-  // ─── Static files ──────────────────────
+  // --- Static files ---
   app.use(express.static(path.join(__dirname, 'public')));
 
-  // ─── Auth Routes ───────────────────────
+  // --- Auth Routes ---
   app.get('/auth/login', passport.authenticate('discord'));
 
   app.get('/auth/callback',
@@ -93,151 +197,170 @@ function startDashboard(client) {
     });
   });
 
-  // ─── API Routes ────────────────────────
+  // --- API Routes ---
   app.get('/api/health', async (req, res) => {
+    const dbOk = await db.raw('SELECT 1').then(() => true).catch(() => false);
+    const redisOk = redis.status === 'ready';
+    const botData = await botApi('/health');
+
     res.json({
-      status: 'healthy',
-      uptime: Math.floor(process.uptime()),
-      guilds: botClient?.guilds?.cache?.size || 0,
-      memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      status: dbOk && redisOk ? 'healthy' : 'degraded',
+      database: dbOk,
+      redis: redisOk,
+      bot: botData || { status: 'unreachable' },
     });
   });
 
   app.get('/api/stats', requireAuth, async (req, res) => {
+    // Recuperer les stats du bot via son API
+    const botStats = await botApi('/stats');
+
     res.json({
-      bot: {
-        username: botClient?.user?.tag || 'N/A',
-        avatar: botClient?.user?.displayAvatarURL({ size: 128 }),
-        guilds: botClient?.guilds?.cache?.size || 0,
-        users: botClient?.guilds?.cache?.reduce((s, g) => s + g.memberCount, 0) || 0,
-        channels: botClient?.channels?.cache?.size || 0,
-        commands: botClient?.commands?.size || 0,
+      bot: botStats || { guilds: 0, users: 0, commands: 0, uptime: 0 },
+      dashboard: {
         uptime: Math.floor(process.uptime()),
+        memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       },
-      memory: {
-        heap: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      },
-      cache: configService.getCacheStats?.() || {},
     });
   });
 
-  // Guild list (only guilds user can manage AND bot is in)
-  app.get('/api/guilds', requireAuth, (req, res) => {
+  // Guild list (from DB + bot API)
+  app.get('/api/guilds', requireAuth, async (req, res) => {
     const managed = filterManagedGuilds(req.user.guilds || []);
-    const botGuilds = botClient?.guilds?.cache;
 
-    const guilds = managed.map((g) => {
-      const inBot = botGuilds?.has(g.id);
-      const botGuild = inBot ? botGuilds.get(g.id) : null;
-      return {
-        id: g.id, name: g.name, icon: g.icon,
-        inBot,
-        members: botGuild?.memberCount || 0,
-      };
-    });
+    // Recuperer les guilds ou le bot est present via la DB
+    const botGuildIds = await db('guilds').select('id', 'name').then((rows) => {
+      const map = new Map();
+      rows.forEach((r) => map.set(r.id, r));
+      return map;
+    }).catch(() => new Map());
+
+    const guilds = managed.map((g) => ({
+      id: g.id,
+      name: g.name,
+      icon: g.icon,
+      inBot: botGuildIds.has(g.id),
+      botName: botGuildIds.get(g.id)?.name || null,
+    }));
 
     res.json({ guilds });
   });
 
-  // Guild config
+  // Guild config (from DB)
   app.get('/api/guilds/:id', requireAuth, requireGuildAccess, async (req, res) => {
     const guildId = req.params.id;
-    const guild = botClient?.guilds?.cache?.get(guildId);
+    const guild = await db('guilds').where('id', guildId).first();
 
-    const config = await configService.get(guildId);
-    const modules = await configService.getModules(guildId);
+    if (!guild) return res.status(404).json({ error: 'Guild not found in database' });
+
+    const config = safeJsonParse(guild.config, {});
+    const modules = safeJsonParse(guild.modules_enabled, {});
+
+    // Recuperer channels et roles via le bot API
+    const guildInfo = await botApi(`/guilds/${guildId}`);
 
     res.json({
       id: guildId,
-      name: guild?.name || 'N/A',
-      icon: guild?.iconURL({ size: 128 }),
-      members: guild?.memberCount || 0,
-      config, modules,
-      channels: guild?.channels?.cache?.filter((c) => c.type === 0).map((c) => ({ id: c.id, name: c.name })) || [],
-      roles: guild?.roles?.cache?.filter((r) => !r.managed && r.id !== guildId).map((r) => ({ id: r.id, name: r.name, color: r.hexColor })) || [],
+      name: guild.name,
+      config,
+      modules,
+      channels: guildInfo?.channels || [],
+      roles: guildInfo?.roles || [],
+      members: guildInfo?.memberCount || 0,
     });
   });
 
-  // Update guild config
+  // Update guild config (write to DB)
   app.post('/api/guilds/:id/config', requireAuth, requireGuildAccess, async (req, res) => {
     const guildId = req.params.id;
 
     if (req.body.config) {
-      await configService.set(guildId, req.body.config);
-    }
-    if (req.body.modules) {
-      for (const [name, enabled] of Object.entries(req.body.modules)) {
-        await configService.setModule(guildId, name, enabled);
-      }
+      const existing = await db('guilds').where('id', guildId).first();
+      const currentConfig = safeJsonParse(existing?.config, {});
+      const merged = { ...currentConfig, ...req.body.config };
+      await db('guilds').where('id', guildId).update({
+        config: JSON.stringify(merged),
+        updated_at: db.fn.now(),
+      });
     }
 
-    const config = await configService.get(guildId);
-    const modules = await configService.getModules(guildId);
-    res.json({ success: true, config, modules });
+    if (req.body.modules) {
+      const existing = await db('guilds').where('id', guildId).first();
+      const currentModules = safeJsonParse(existing?.modules_enabled, {});
+      const merged = { ...currentModules, ...req.body.modules };
+      await db('guilds').where('id', guildId).update({
+        modules_enabled: JSON.stringify(merged),
+        updated_at: db.fn.now(),
+      });
+    }
+
+    // Invalider le cache Redis
+    try {
+      await redis.del(`cfg:${guildId}`);
+      await redis.del(`mod:${guildId}`);
+    } catch { /* pas grave */ }
+
+    const updated = await db('guilds').where('id', guildId).first();
+    res.json({
+      success: true,
+      config: safeJsonParse(updated?.config, {}),
+      modules: safeJsonParse(updated?.modules_enabled, {}),
+    });
   });
 
   // Guild stats
   app.get('/api/guilds/:id/stats', requireAuth, requireGuildAccess, async (req, res) => {
     const guildId = req.params.id;
-    const db = getDb();
 
     const [tickets] = await db('tickets').where('guild_id', guildId).count('id as c').catch(() => [{ c: 0 }]);
-    const [warnings] = await db('warnings').where('guild_id', guildId).count('id as c').catch(() => [{ c: 0 }]);
-    const [xpUsers] = await db('user_xp').where('guild_id', guildId).count('id as c').catch(() => [{ c: 0 }]);
+    const [sanctions] = await db('sanctions').where('guild_id', guildId).count('id as c').catch(() => [{ c: 0 }]);
+    const [users] = await db('users').where('guild_id', guildId).count('id as c').catch(() => [{ c: 0 }]);
 
     res.json({
       tickets: tickets?.c || 0,
-      warnings: warnings?.c || 0,
-      xpUsers: xpUsers?.c || 0,
+      sanctions: sanctions?.c || 0,
+      users: users?.c || 0,
     });
   });
 
   // Leaderboard
   app.get('/api/guilds/:id/leaderboard', requireAuth, requireGuildAccess, async (req, res) => {
     const guildId = req.params.id;
-    const db = getDb();
     const type = req.query.type || 'xp';
 
     let data = [];
     if (type === 'xp') {
-      data = await db('user_xp').where('guild_id', guildId).orderBy('xp', 'desc').limit(50);
+      data = await db('users').where('guild_id', guildId).orderBy('xp', 'desc').limit(50).catch(() => []);
     } else if (type === 'economy') {
-      data = await db('economy').where('guild_id', guildId).orderBy('balance', 'desc').limit(50);
+      data = await db('users').where('guild_id', guildId).orderBy('balance', 'desc').limit(50).catch(() => []);
     }
 
     res.json({ leaderboard: data });
   });
 
-  // ─── SPA fallback ──────────────────────
+  // --- SPA fallback ---
   app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   });
 
-  // ─── Error handler ─────────────────────
+  // --- Error handler ---
   app.use((err, req, res, _next) => {
-    log.error(`Dashboard error: ${err.message}`);
+    console.error(`[Dashboard] Error: ${err.message}`);
     res.status(500).json({ error: 'Internal Server Error' });
   });
 
-  // ─── Start ─────────────────────────────
-  server = app.listen(DASHBOARD_PORT, () => {
-    log.info(`✔ Dashboard démarré sur le port ${DASHBOARD_PORT}`);
+  // --- Start ---
+  app.listen(DASHBOARD_PORT, () => {
+    console.log(`[Dashboard] Demarre sur le port ${DASHBOARD_PORT}`);
   });
 }
 
-function stopDashboard() {
-  if (server) {
-    server.close(() => log.info('Dashboard arrêté'));
-    server = null;
-  }
-}
-
-// ─── Middleware helpers ──────────────────────
+// ===================================
+// Middleware helpers
+// ===================================
 function requireAuth(req, res, next) {
   if (req.isAuthenticated()) return next();
 
-  // Also support Bearer token
   const auth = req.headers.authorization;
   if (auth?.startsWith('Bearer ')) {
     try {
@@ -256,13 +379,33 @@ function requireGuildAccess(req, res, next) {
   const hasAccess = userGuilds.some((g) => g.id === guildId && (parseInt(g.permissions) & 0x20) === 0x20);
 
   if (!hasAccess) return res.status(403).json({ error: 'No access to this guild' });
-  if (!botClient?.guilds?.cache?.has(guildId)) return res.status(404).json({ error: 'Bot not in this guild' });
-
   next();
 }
 
 function filterManagedGuilds(guilds) {
-  return guilds.filter((g) => (parseInt(g.permissions) & 0x20) === 0x20); // MANAGE_GUILD
+  return guilds.filter((g) => (parseInt(g.permissions) & 0x20) === 0x20);
 }
 
-module.exports = { startDashboard, stopDashboard };
+// ===================================
+// Export pour usage integre OU standalone
+// ===================================
+// Mode standalone : node dashboard/server.js
+if (require.main === module) {
+  startDashboard().catch((err) => {
+    console.error('[Dashboard] Erreur de demarrage:', err);
+    process.exit(1);
+  });
+}
+
+// Mode integre (optionnel, pour dev)
+module.exports = {
+  startDashboard: async function startIntegrated(client) {
+    // Si appele depuis le bot, on peut passer le client
+    // mais le dashboard standalone est la methode recommandee
+    console.warn('[Dashboard] Mode integre - utilisez le dashboard standalone en production');
+    await startDashboard();
+  },
+  stopDashboard: function () {
+    // Le dashboard standalone gere son propre lifecycle
+  },
+};

@@ -1,21 +1,79 @@
 // ===================================
 // Ultra Suite — Config Service
-// Cache mémoire + DB pour config guild
+// Redis (DB0) + fallback mémoire pour config guild
 // Données 100% séparées par serveur (guild_id)
 //
 // Chaque serveur a sa propre config indépendante.
-// Le cache TTL évite de requêter la DB à chaque commande.
+// Redis sert de cache distribué (TTL 5 min).
+// Fallback automatique sur NodeCache si Redis indisponible.
 // ===================================
 
 const NodeCache = require('node-cache');
+const redis = require('./redis');
 const guildQueries = require('../database/guildQueries');
 const { createModuleLogger } = require('./logger');
 
 const log = createModuleLogger('ConfigService');
 
-// TTL 5 minutes — refresh automatique
-// En multi-serveur, le cache est indexé par guild_id
-const cache = new NodeCache({ stdTTL: 300, checkperiod: 60, useClones: true });
+// TTL 5 minutes — Redis + fallback mémoire
+const CACHE_TTL = 300;
+const localCache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 60, useClones: true });
+
+// Indicateur de disponibilité Redis
+let redisAvailable = false;
+
+/**
+ * Initialise la connexion Redis du config service.
+ * Si Redis n'est pas dispo, le service utilise le cache mémoire.
+ */
+async function initRedis() {
+  try {
+    await redis.cache().ping();
+    redisAvailable = true;
+    log.info('ConfigService: Redis connecté (cache distribué)');
+  } catch {
+    redisAvailable = false;
+    log.warn('ConfigService: Redis indisponible — cache mémoire utilisé');
+  }
+}
+
+// Appeler l'init Redis de manière non-bloquante
+initRedis().catch(() => {});
+
+/**
+ * Helpers internes pour le cache hybride Redis + mémoire
+ */
+async function cacheGet(key) {
+  // Essayer Redis d'abord
+  if (redisAvailable) {
+    try {
+      const val = await redis.getJSON(key, 0);
+      if (val) return val;
+    } catch { /* fallback */ }
+  }
+  // Fallback mémoire
+  return localCache.get(key) || null;
+}
+
+async function cacheSet(key, value) {
+  // Toujours stocker en mémoire
+  localCache.set(key, value);
+  // Aussi en Redis si disponible
+  if (redisAvailable) {
+    try {
+      await redis.setJSON(key, value, CACHE_TTL, 0);
+    } catch { /* non-bloquant */ }
+  }
+}
+
+async function cacheDel(key) {
+  localCache.del(key);
+  if (redisAvailable) {
+    try {
+      await redis.del(key, 0);
+    } catch { /* non-bloquant */ }
+  }
+}
 
 // ===================================
 // Config par défaut pour un nouveau serveur
@@ -180,8 +238,8 @@ async function loadGuild(guildId) {
     const config = deepMergeConfig(deepClone(DEFAULT_CONFIG), rawConfig);
     const modules = { ...deepClone(DEFAULT_MODULES), ...rawModules };
 
-    cache.set(`cfg:${guildId}`, config);
-    cache.set(`mod:${guildId}`, modules);
+    await cacheSet(`cfg:${guildId}`, config);
+    await cacheSet(`mod:${guildId}`, modules);
 
     return { config, modules };
   } catch (err) {
@@ -234,7 +292,7 @@ const configService = {
       return deepClone(DEFAULT_CONFIG);
     }
 
-    const cached = cache.get(`cfg:${guildId}`);
+    const cached = await cacheGet(`cfg:${guildId}`);
     if (cached) return cached;
 
     const { config } = await loadGuild(guildId);
@@ -257,7 +315,7 @@ const configService = {
       if (!merged) return null;
 
       const full = deepMergeConfig(deepClone(DEFAULT_CONFIG), merged);
-      cache.set(`cfg:${guildId}`, full);
+      await cacheSet(`cfg:${guildId}`, full);
 
       log.info(`Config mise à jour pour guild ${guildId}`, {
         keys: Object.keys(patch),
@@ -294,7 +352,7 @@ const configService = {
   async getModules(guildId) {
     if (!guildId) return deepClone(DEFAULT_MODULES);
 
-    const cached = cache.get(`mod:${guildId}`);
+    const cached = await cacheGet(`mod:${guildId}`);
     if (cached) return cached;
 
     const { modules } = await loadGuild(guildId);
@@ -325,8 +383,8 @@ const configService = {
 
     try {
       const modules = await guildQueries.updateModules(guildId, { [moduleName]: enabled });
-      cache.set(`mod:${guildId}`, { ...deepClone(DEFAULT_MODULES), ...modules });
-      cache.del(`cfg:${guildId}`); // Invalider la config aussi
+      await cacheSet(`mod:${guildId}`, { ...deepClone(DEFAULT_MODULES), ...modules });
+      await cacheDel(`cfg:${guildId}`); // Invalider la config aussi
 
       log.info(`Module "${moduleName}" ${enabled ? 'activé' : 'désactivé'} pour guild ${guildId}`);
       return modules;
@@ -387,8 +445,8 @@ const configService = {
     try {
       const config = deepClone(DEFAULT_CONFIG);
       await guildQueries.updateConfig(guildId, config);
-      cache.del(`cfg:${guildId}`);
-      cache.del(`mod:${guildId}`);
+      await cacheDel(`cfg:${guildId}`);
+      await cacheDel(`mod:${guildId}`);
 
       log.info(`Config réinitialisée pour guild ${guildId}`);
       return config;
@@ -410,7 +468,7 @@ const configService = {
     try {
       const modules = deepClone(DEFAULT_MODULES);
       await guildQueries.updateModules(guildId, modules);
-      cache.set(`mod:${guildId}`, modules);
+      await cacheSet(`mod:${guildId}`, modules);
 
       log.info(`Modules réinitialisés pour guild ${guildId}`);
       return modules;
@@ -426,9 +484,9 @@ const configService = {
    *
    * @param {string} guildId
    */
-  invalidate(guildId) {
-    cache.del(`cfg:${guildId}`);
-    cache.del(`mod:${guildId}`);
+  async invalidate(guildId) {
+    await cacheDel(`cfg:${guildId}`);
+    await cacheDel(`mod:${guildId}`);
     log.debug(`Cache invalidé pour guild ${guildId}`);
   },
 
@@ -436,9 +494,13 @@ const configService = {
    * Vide tout le cache (toutes les guilds)
    * Utile en cas de migration ou modification massive
    */
-  flushAll() {
-    const stats = cache.getStats();
-    cache.flushAll();
+  async flushAll() {
+    const stats = localCache.getStats();
+    localCache.flushAll();
+    // Aussi vider Redis si disponible
+    if (redisAvailable) {
+      try { await redis.delPattern('cfg:*', 0); await redis.delPattern('mod:*', 0); } catch { /* non-bloquant */ }
+    }
     log.info(`Cache vidé (${stats.keys} clés supprimées)`);
   },
 
@@ -448,8 +510,9 @@ const configService = {
    */
   getCacheStats() {
     return {
-      ...cache.getStats(),
-      keys: cache.keys().length,
+      ...localCache.getStats(),
+      keys: localCache.keys().length,
+      redisAvailable,
     };
   },
 

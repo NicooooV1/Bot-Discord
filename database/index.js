@@ -1,6 +1,6 @@
 // ===================================
 // Ultra Suite — Database Manager
-// MySQL (mysql2) + Knex — Multi-serveur
+// PostgreSQL 16 + Knex — Multi-serveur
 //
 // Single pool de connexions partagé entre
 // tous les serveurs (guild_id sépare les données).
@@ -67,7 +67,7 @@ function getRetryDelay(attempt) {
 }
 
 /**
- * Teste la connexion à MySQL avec timeout
+ * Teste la connexion à PostgreSQL avec timeout
  * @param {import('knex').Knex} instance
  * @returns {Promise<boolean>}
  */
@@ -110,7 +110,7 @@ async function cleanMigrationLocks(instance) {
 // ===================================
 
 /**
- * Initialise la connexion MySQL avec retry exponentiel et lance les migrations.
+ * Initialise la connexion PostgreSQL avec retry exponentiel et lance les migrations.
  *
  * En multi-serveur, un seul pool de connexions est utilisé.
  * Les données sont séparées par guild_id dans chaque table.
@@ -125,9 +125,9 @@ async function init() {
 
   const host = process.env.DB_HOST || '127.0.0.1';
   const port = process.env.DB_PORT || 3306;
-  const dbName = process.env.DB_NAME || 'ultra_suite';
+  const dbName = process.env.DB_NAME || 'discordbot';
 
-  log.info('Connexion à MySQL...');
+  log.info('Connexion à PostgreSQL...');
   log.info(`  Host : ${host}:${port}`);
   log.info(`  DB   : ${dbName}`);
   log.info(`  User : ${process.env.DB_USER || 'root'}`);
@@ -141,7 +141,7 @@ async function init() {
     connected = await testConnection(db);
 
     if (connected) {
-      log.info(`Connexion MySQL établie (tentative ${attempt}/${CONFIG.maxRetries})`);
+      log.info(`Connexion PostgreSQL établie (tentative ${attempt}/${CONFIG.maxRetries})`);
       break;
     }
 
@@ -159,7 +159,7 @@ async function init() {
     // Détruire le pool inutilisable
     try { await db.destroy(); } catch { /* ignore */ }
     db = null;
-    log.error(`Impossible de se connecter à MySQL après ${CONFIG.maxRetries} tentatives.`);
+    log.error(`Impossible de se connecter à PostgreSQL après ${CONFIG.maxRetries} tentatives.`);
     log.error('Vérifiez les variables DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME dans .env');
     throw new Error('Database connection failed');
   }
@@ -201,10 +201,10 @@ async function init() {
   // === Afficher les infos de la DB ===
   try {
     const tables = await db.raw(
-      `SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = ?`,
+      `SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = 'public' AND table_catalog = ?`,
       [dbName]
     );
-    const tableCount = tables[0]?.[0]?.cnt || 0;
+    const tableCount = tables.rows?.[0]?.cnt || 0;
 
     // Compter les guilds existantes
     const hasGuilds = await db.schema.hasTable('guilds');
@@ -253,9 +253,9 @@ function startHealthMonitor() {
       const reconnected = await testConnection(db);
 
       if (reconnected) {
-        log.info('Reconnexion à MySQL réussie');
+        log.info('Reconnexion à PostgreSQL réussie');
       } else {
-        log.error('Échec de reconnexion à MySQL — le bot pourrait ne pas fonctionner correctement');
+        log.error('Échec de reconnexion à PostgreSQL — le bot pourrait ne pas fonctionner correctement');
         try { await db.destroy(); } catch { /* ignore */ }
         db = knex(knexConfig); // Prêt pour le prochain check
       }
@@ -376,7 +376,7 @@ async function paginatedQuery(table, guildId, options = {}) {
 
 /**
  * Opération bulk (insert/update) avec découpage en chunks.
- * Évite de dépasser les limites MySQL pour les gros inserts.
+ * Découpe les gros inserts en chunks pour éviter les dépassements.
  *
  * @param {string} table - Nom de la table
  * @param {Array<object>} rows - Données à insérer
@@ -560,9 +560,9 @@ async function close() {
       // Attendre un court instant pour les requêtes en cours
       await sleep(500);
       await db.destroy();
-      log.info('Pool de connexions MySQL fermé');
+      log.info('Pool de connexions PostgreSQL fermé');
     } catch (err) {
-      log.error('Erreur fermeture pool MySQL:', err.message);
+      log.error('Erreur fermeture pool PostgreSQL:', err.message);
     }
     db = null;
   }

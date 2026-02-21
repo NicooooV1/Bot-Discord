@@ -1,7 +1,7 @@
 // ===================================
 // Ultra Suite — Migration initiale
 // Toutes les tables du CDC v2.0
-// MySQL (mysql2) — utf8mb4
+// PostgreSQL 16 — utf8
 //
 // Architecture multi-serveur :
 // Chaque table utilise guild_id pour séparer
@@ -128,7 +128,7 @@ exports.up = async function (knex) {
       t.string('priority', 20).defaultTo('normal');
       t.string('assignee_id', 20);
       t.json('form_answers');
-      t.text('transcript', 'longtext');
+      t.text('transcript');
       t.integer('rating').unsigned();
       t.text('rating_comment');
       t.string('closed_by', 20);

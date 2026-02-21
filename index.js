@@ -1,6 +1,7 @@
 // ===================================
 // Ultra Suite — Point d'entrée principal
 // Node.js 20+ / discord.js v14
+// PostgreSQL + Redis + Lavalink
 // Multi-serveur — Single process
 // ===================================
 
@@ -9,13 +10,14 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const { logger, createModuleLogger } = require('./core/logger');
 const db = require('./database');
+const redis = require('./core/redis');
+const lavalinkManager = require('./core/lavalink');
 const { loadCommands } = require('./core/commandHandler');
 const { loadEvents } = require('./core/eventHandler');
 const { loadComponents } = require('./core/componentHandler');
 const { loadLocales } = require('./core/i18n');
 const { startScheduler, stopScheduler } = require('./core/scheduler');
 const { startApi, stopApi } = require('./core/api');
-const { startDashboard, stopDashboard } = require('./dashboard/server');
 const guildQueries = require('./database/guildQueries');
 const moduleRegistry = require('./core/moduleRegistry');
 
@@ -96,7 +98,7 @@ async function syncGuilds() {
 // ===================================
 async function start() {
   log.info('╔════════════════════════════════════╗');
-  log.info('║     Ultra Suite Bot v2.0           ║');
+  log.info('║     Ultra Suite Bot v2.1           ║');
   log.info('║     Multi-serveur · Modulaire      ║');
   log.info('╚════════════════════════════════════╝');
   log.info(`Environnement : ${process.env.NODE_ENV || 'development'}`);
@@ -111,9 +113,13 @@ async function start() {
 
   // 2. Initialiser la base de données (migrations auto)
   await db.init();
-  log.info('✔ Base de données initialisée (MySQL)');
+  log.info('✔ Base de données initialisée (PostgreSQL)');
 
-  // 2b. Charger les manifests de modules
+  // 2b. Initialiser Redis (cache distribué)
+  const redisOk = await redis.init();
+  log.info(redisOk ? '✔ Redis connecté (cache distribué)' : '⚠ Redis indisponible — cache mémoire utilisé');
+
+  // 2c. Charger les manifests de modules
   moduleRegistry.loadAll();
   log.info(`✔ Module Registry : ${moduleRegistry.getAll().length} module(s) enregistré(s)`);
 
@@ -145,8 +151,16 @@ async function start() {
     // 9. Démarrer l'API REST (si activée)
     startApi(client);
 
-    // 10. Démarrer le Dashboard web (si configuré)
-    startDashboard(client);
+    // 10. Initialiser Lavalink (musique)
+    const lavalink = lavalinkManager.init(client);
+    if (lavalink) {
+      log.info('✔ Lavalink initialisé');
+    } else {
+      log.warn('⚠ Lavalink non configuré — module musique désactivé');
+    }
+
+    // Note: Le Dashboard est un projet séparé (LXC 115)
+    // Il se connecte directement à PostgreSQL et Redis
 
     log.info('═══════════════════════════════════');
     log.info(`Bot opérationnel sur ${client.guilds.cache.size} serveur(s) !`);
@@ -174,10 +188,16 @@ async function shutdown(signal) {
 
   try {
     stopApi();
-    stopDashboard();
-    log.info('✔ API & Dashboard arrêtés');
+    log.info('✔ API arrêtée');
   } catch (err) {
     log.error('Erreur arrêt API:', err.message);
+  }
+
+  try {
+    await lavalinkManager.close();
+    log.info('✔ Lavalink fermé');
+  } catch (err) {
+    log.error('Erreur fermeture Lavalink:', err.message);
   }
 
   try {
@@ -185,6 +205,13 @@ async function shutdown(signal) {
     log.info('✔ Client Discord déconnecté');
   } catch (err) {
     log.error('Erreur déconnexion Discord:', err.message);
+  }
+
+  try {
+    await redis.close();
+    log.info('✔ Connexion Redis fermée');
+  } catch (err) {
+    log.error('Erreur fermeture Redis:', err.message);
   }
 
   try {

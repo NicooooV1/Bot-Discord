@@ -1,35 +1,25 @@
 {
-  "name": "ultra-bot",
+  "name": "ultra-suite-bot",
   "version": "2.1.0",
-  "description": "Bot Discord Ultra — 22 modules, modulaire, multi-serveur, configurable, Pterodactyl-ready",
+  "description": "Ultra Suite — Bot Discord modulaire multi-serveur (28 modules, 90+ commandes)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
     "deploy": "node deploy-commands.js --global",
     "deploy:dev": "node deploy-commands.js --dev",
-    "deploy:global": "node deploy-commands.js --global",
     "deploy:clean": "node deploy-commands.js --clean",
     "deploy:clean-global": "node deploy-commands.js --clean-global",
-    "test": "jest --passWithNoTests",
-    "test:watch": "jest --watch --passWithNoTests",
-    "test:coverage": "jest --coverage --passWithNoTests",
-    "lint": "eslint . --ext .js --max-warnings 0",
-    "lint:fix": "eslint . --ext .js --fix",
     "migrate": "knex migrate:latest --knexfile database/knexfile.js",
-    "migrate:rollback": "knex migrate:rollback --knexfile database/knexfile.js",
-    "docker:up": "docker-compose up -d",
-    "docker:down": "docker-compose down",
-    "docker:build": "docker-compose build",
-    "validate": "node -e \"const fs=require('fs');const p=require('path');let c=0;function s(d){for(const f of fs.readdirSync(d,{withFileTypes:true})){if(f.isDirectory())s(p.join(d,f.name));else if(f.name.endsWith('.js')){const m=require(p.join(d,f.name));if(m.data&&m.execute)c++;}}}s(p.resolve('commands'));console.log('✅',c,'commandes valides')\""
+    "migrate:rollback": "knex migrate:rollback --knexfile database/knexfile.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
     "@discordjs/voice": "^0.17.0",
     "@discordjs/opus": "^0.9.0",
     "play-dl": "^1.9.7",
+    "shoukaku": "^4.1.0",
     "sodium-native": "^4.1.1",
-    "mysql2": "^3.11.0",
+    "pg": "^8.13.0",
     "dotenv": "^16.4.7",
     "knex": "^3.1.0",
     "node-cron": "^3.0.3",
@@ -55,11 +45,6 @@
     "cheerio": "^1.0.0",
     "archiver": "^7.0.1",
     "perspective-api-client": "^3.0.1"
-  },
-  "devDependencies": {
-    "jest": "^29.7.0",
-    "supertest": "^7.0.0",
-    "eslint": "^9.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

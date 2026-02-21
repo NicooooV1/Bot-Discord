@@ -126,12 +126,12 @@ function stopApi() {
 // ===================================
 
 /**
- * Vérifie l'authentification par API_SECRET
+ * Vérifie l'authentification par API_SECRET ou OAUTH2_CLIENT_SECRET
  */
 function authenticate(req) {
-  const secret = process.env.API_SECRET;
+  const secret = process.env.API_SECRET || process.env.OAUTH2_CLIENT_SECRET;
   if (!secret) {
-    log.warn('API_SECRET non défini — toutes les requêtes sont refusées');
+    log.warn('API_SECRET / OAUTH2_CLIENT_SECRET non défini — toutes les requêtes sont refusées');
     return false;
   }
 

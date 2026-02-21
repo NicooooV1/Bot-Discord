@@ -20,13 +20,13 @@ module.exports = {
   data: new SlashCommandBuilder()
     .setName('premium')
     .setDescription('Système premium')
+    .setDMPermission(false)
     .addSubcommand((s) => s.setName('status').setDescription('Voir votre statut premium'))
     .addSubcommand((s) => s.setName('features').setDescription('Voir les fonctionnalités premium'))
     .addSubcommand((s) => s.setName('activate').setDescription('Activer un code premium')
       .addStringOption((o) => o.setName('code').setDescription('Code promo').setRequired(true)),
     )
     .addSubcommand((s) => s.setName('admin').setDescription('Gérer le premium (admin)')
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
       .addStringOption((o) => o.setName('action').setDescription('Action').setRequired(true).addChoices(
         { name: 'Définir le tier', value: 'set' },
         { name: 'Créer un code promo', value: 'promo' },
