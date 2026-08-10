@@ -1,0 +1,47 @@
+[Unit]
+Description=Discord gateway bot - Proxmox homelab monitoring + safe actions
+Documentation=file:/opt/discord-bot/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=discordbot
+Group=discordbot
+WorkingDirectory=/opt/discord-bot
+EnvironmentFile=/opt/discord-bot/config.env
+ExecStart=/opt/discord-bot/venv/bin/python -m bot
+Restart=always
+RestartSec=5
+
+# --- Hardening (fixed-user variant of the discord-syslog posture) ---
+NoNewPrivileges=yes
+# Live log stream binds UDP/514 (privileged port):
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=yes
+# venv cache + mplcache + config.env + audit.log live here; state in StateDirectory:
+ReadWritePaths=/opt/discord-bot
+StateDirectory=discord-bot
+StateDirectoryMode=0750
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# MemoryDenyWriteExecute is intentionally OMITTED: matplotlib/Pillow C-extensions trip W^X.
+
+[Install]
+WantedBy=multi-user.target

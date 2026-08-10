@@ -1,0 +1,20 @@
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+
+[RULES]
+# --- OUT: only what the bot needs ---
+OUT ACCEPT -dest 10.3.10.120 -p tcp -dport 8086 -log nolog   # InfluxDB (read)
+OUT ACCEPT -dest 10.3.10.200 -p tcp -dport 8006 -log nolog   # Proxmox API
+OUT ACCEPT -dest 10.3.10.123 -p tcp -dport 3100 -log nolog   # Loki (read)
+OUT ACCEPT -p tcp -dport 443 -log nolog                      # discord.com gateway+CDN (rotating IPs)
+OUT ACCEPT -p udp -dport 53 -log nolog                       # DNS
+OUT ACCEPT -p tcp -dport 53 -log nolog                       # DNS/TCP
+OUT ACCEPT -p udp -dport 123 -log nolog                      # NTP
+OUT ACCEPT -p icmp -log nolog
+
+# --- IN: live log stream UDP/514 from host, router and the LXC fleet (mgmt subnet) ---
+IN ACCEPT -source 10.3.0.0/16 -p udp -dport 514 -log nolog   # host + CTs + CRS305 forwarders
+IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 22 -log nolog    # admin SSH (mgmt LAN)
+IN ACCEPT -p icmp -log nolog

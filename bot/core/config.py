@@ -1,0 +1,342 @@
+"""Configuration loaded from the environment (systemd EnvironmentFile=config.env)."""
+import logging
+import os
+
+_log = logging.getLogger("discord-bot.config")
+
+
+def _csv_ints(v):
+    return [int(x) for x in (v or "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()]
+
+
+def _int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(v, default=0.0):
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool(v, default=False):
+    if v is None or v == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+class Config:
+    def __init__(self, env=None):
+        e = env if env is not None else os.environ
+        g = lambda k, d="": (e.get(k) if e.get(k) not in (None, "") else d)
+
+        # --- Discord ---
+        self.discord_token = g("DISCORD_TOKEN").strip()
+        self.guild_id = _int(g("GUILD_ID"))
+        self.admin_ids = _csv_ints(g("ADMIN_IDS"))
+        # role-based access: members holding one of these roles are admins / readers
+        self.admin_role_ids = _csv_ints(g("ADMIN_ROLE_IDS"))
+        self.read_role_ids = _csv_ints(g("READ_ROLE_IDS"))
+        # --- Groupes de gestion par SERVEUR (extensible : R820, puis d'autres) ---
+        # 3 TIERS par serveur : « clé:G:M:O[,clé2:...] »
+        #   G = gestion  -> VISUALISER les salons du serveur (pas de boutons)
+        #   M = modération -> tout faire sur ce serveur (boutons + catégorie Lock)
+        #   O = owner     -> aucune restriction (sauf 2FA) + délégation /gestion
+        # Voir cog gestion.py + core/permissions (is_admin/may_lock/can_delegate).
+        self.gestion_servers = self._parse_gestion_servers(g("GESTION_SERVERS"))
+        # --- Multi-serveurs (déploiement 1 bot/serveur physique, guild Discord partagé) ---
+        # SERVER_KEY = clé de CE serveur (R820, AVEYRON…) : les catégories du bot en dérivent
+        # (📊 Supervision <SRV> / Gestion <SRV> / 🔒 Lock <SRV>). IS_PRIMARY : le primaire gère
+        # les ressources PARTAGÉES (#logs-2fa, #général, /gestion, /2fa, rôle 2FA Complet) ;
+        # une instance secondaire (false) ne gère QUE son serveur.
+        self.server_key = g("SERVER_KEY", "R820").strip()
+        self.is_primary = _bool(g("IS_PRIMARY"), True)
+        # serveur dont dépend le salon du NŒUD (catégorie Lock) — 1er par défaut.
+        self.node_server_key = g("NODE_SERVER_KEY", next(iter(self.gestion_servers), ""))
+        _ns = self.gestion_servers.get(self.node_server_key, {})
+        self.node_view_role_id = _ns.get("view", 0)     # G — visualiser
+        self.node_mod_role_id = _ns.get("mod", 0)       # M — actions + Lock
+        self.node_owner_role_id = _ns.get("owner", 0)   # O — owner
+        # rétrocompat helpers (may_lock lit mod+owner ; l'ancien node_o_role_id = owner)
+        self.node_o_role_id = self.node_owner_role_id
+        # rôles « visionneurs » MANUELS (ex. « A ») : provision leur donne la VUE des salons
+        # de gestion (comme le tier G), MAIS le bot ne gère JAMAIS leur ATTRIBUTION (pas de
+        # reconcile, pas de retrait) — c'est le rôle de Nico, à la main.
+        self.viewer_role_ids = _csv_ints(g("VIEWER_ROLE_IDS"))
+        # rôle purement INDICATIF « 2FA Complet » : attribué à tout inscrit 2FA (réconcilié).
+        self.twofa_role_id = _int(g("TWOFA_ROLE_ID"))
+        # salon « général » : on y REMET le rôle A en vue+écriture SANS commandes slash
+        # (les commandes 2FA ont désormais leur salon dédié). 0 = pas de gestion.
+        self.general_channel_id = _int(g("GENERAL_CHANNEL_ID"))
+        # salon dédié aux commandes /2fa (inscription + statut). Le bot le crée/adopte par
+        # NOM et y autorise le rôle A à lancer les commandes ; /2fa n'est utilisable QUE là.
+        self.twofa_channel_name = g("TWOFA_CHANNEL_NAME", "logs-2fa").lstrip("#").strip()
+        self.admin_channel_id = _int(g("ADMIN_CHANNEL_ID"))
+        self.read_channel_ids = _csv_ints(g("READ_CHANNEL_IDS"))
+        self.alert_channel_id = _int(g("ALERT_CHANNEL_ID"))
+        self.report_channel_id = _int(g("REPORT_CHANNEL_ID"))
+        self.live_log_channel_id = _int(g("LIVE_LOG_CHANNEL_ID"))
+        # per-CT live channels: "ctname:channelid,ctname:channelid,..."
+        self.ct_channels = self._parse_ct_channels(g("CT_CHANNELS"))
+        # auto-provisioning des salons (catégories + supervision + 1 salon/guest)
+        self.auto_provision = _bool(g("AUTO_PROVISION"), True)
+        self.provision_reconcile_min = max(1, _int(g("PROVISION_RECONCILE_MIN", "5"), 5))
+
+        # --- InfluxDB v2 ---
+        self.influx_url = g("INFLUX_URL", "http://10.3.10.120:8086")
+        self.influx_org = g("INFLUX_ORG", "Home")
+        self.influx_bucket = g("INFLUX_BUCKET", "Proxmox")
+        self.influx_token = g("INFLUX_TOKEN").strip()
+        # bucket DÉDIÉ Aveyron (2026-07-18, même instance/org CT103, jeton SCOPÉ à ce
+        # seul bucket) : le cluster Aveyron n'a pas de telegraf (pas d'accès infra) —
+        # le bot collecte via l'API PVE déjà utilisée par avy.py et écrit lui-même les
+        # points, pour que Grafana affiche Aveyron comme le R820 sans rien installer
+        # là-bas. Vide/absent = collecteur désactivé (avy_metrics.py).
+        self.avy_influx_bucket = g("AVY_INFLUX_BUCKET", "Aveyron")
+        self.avy_influx_token = g("AVY_INFLUX_TOKEN").strip()
+        # Jellyfin API (pour le salon #jellyfin : titre en cours de lecture)
+        self.jellyfin_url = g("JELLYFIN_URL", "").rstrip("/")
+        self.jellyfin_api_key = g("JELLYFIN_API_KEY").strip()
+        # Journal d'activité Jellyfin (lecture démarrée, compte créé, connexion…) dans
+        # la catégorie 🔒 Lock — propriétaire uniquement (demande Nico 2026-07-18).
+        self.jellyfin_logs_enabled = _bool(g("JELLYFIN_LOGS_ENABLED"), True)
+        # Heartbeat externe (dead-man's-switch) : URL de ping healthchecks.io/ntfy
+        self.heartbeat_url = g("HEARTBEAT_URL", "").strip()
+
+        # --- Proxmox API ---
+        self.pve_host = g("PVE_HOST", "10.3.10.200")
+        self.pve_port = _int(g("PVE_PORT", "8006"), 8006)
+        self.pve_node = g("PVE_NODE", "pve")
+        self.pve_verify_ssl = _bool(g("PVE_VERIFY_SSL"), False)
+        self.pve_token_id = g("PVE_TOKEN_ID", "discordbot@pve!bot")
+        self.pve_token_secret = g("PVE_TOKEN_SECRET").strip()
+        self.pve_action_token_id = g("PVE_ACTION_TOKEN_ID", "discordbot@pve!actions")
+        self.pve_action_token_secret = g("PVE_ACTION_TOKEN_SECRET").strip()
+        self.pve_pbs_storage = g("PVE_PBS_STORAGE", "pbs")
+
+        # --- Cluster secondaire AVEYRON (2026-07-17, « tout sur le même bot ») ---
+        # Le même bot supervise le cluster 3 nœuds d'Aveyron : invités suffixés
+        # « -<AVY_SUFFIX> », salons dans « Gestion <AVY_SERVER_KEY> », boutons gardés par
+        # les rôles de cette clé dans GESTION_SERVERS. Vide (pas d'hôte/jeton) = inactif.
+        self.avy_key = g("AVY_SERVER_KEY", "AVEYRON").strip()
+        self.avy_suffix = g("AVY_SUFFIX", "avy").strip()
+        self.avy_host = g("AVY_PVE_HOST", "").strip()
+        self.avy_port = _int(g("AVY_PVE_PORT", "8006"), 8006)
+        self.avy_verify_ssl = _bool(g("AVY_PVE_VERIFY_SSL"), False)
+        self.avy_token_id = g("AVY_PVE_TOKEN_ID", "discordbot@pve!bot")
+        self.avy_token_secret = g("AVY_PVE_TOKEN_SECRET").strip()
+        self.avy_action_token_id = g("AVY_PVE_ACTION_TOKEN_ID", "discordbot@pve!actions")
+        self.avy_action_token_secret = g("AVY_PVE_ACTION_TOKEN_SECRET").strip()
+        self.avy_storage = g("AVY_PVE_STORAGE", "nas-backup")
+        # nœuds supervisés (STATIQUE : un nœud éteint garde ses salons/catégories) ;
+        # chaque nœud = un « serveur » à part entière (clé AVY-<NOM>, cf. pve.avy_server_key)
+        self.avy_nodes = [x.strip() for x in g("AVY_NODES", "").split(",") if x.strip()]
+        self.avy_enabled = bool(self.avy_host and self.avy_token_secret)
+
+        # --- NAS Synology = serveur à part entière (clé SYNO) 2026-08-07 ---
+        # Supervisé en SNMP par Telegraf (mesures synology* du bucket Proxmox) : le bot
+        # ne fait que LIRE Influx, il n'a aucun accès au NAS et ne peut rien y faire.
+        # Le bloc ne s'active que si la clé existe dans GESTION_SERVERS (cf.
+        # provision._syno_enabled) — l'hôte ci-dessous n'est qu'un affichage.
+        self.syno_key = g("SYNO_SERVER_KEY", "SYNO").strip()
+        self.syno_host = g("SYNO_HOST", "10.3.10.251").strip()
+
+        # --- Assistant IA local (Qwen sur RTX 3090, nœud llm d'Aveyron) 2026-07-18 ---
+        # Pas de route réseau directe vers la VM (VLAN non routé par le tunnel WG) : les
+        # requêtes passent par l'API PVE -> guest-agent -> exec curl localhost (jeton
+        # discordbot@pve!llm, scopé À CETTE SEULE VM via ACL /vms/<vmid>, jamais /vms).
+        self.avy_llm_node = g("AVY_LLM_NODE", "llm")
+        self.avy_llm_vmid = _int(g("AVY_LLM_VMID", "0"), 0)
+        self.avy_llm_token_id = g("AVY_LLM_TOKEN_ID", "discordbot@pve!llm")
+        self.avy_llm_token_secret = g("AVY_LLM_TOKEN_SECRET").strip()
+        self.avy_llm_model = g("AVY_LLM_MODEL", "qwen35-35b")
+        self.avy_llm_port = _int(g("AVY_LLM_PORT", "4000"), 4000)
+        self.avy_llm_enabled = bool(self.avy_llm_vmid and self.avy_llm_token_secret)
+        # clé serveur du nœud LLM (« AVY-LLM ») — même formule que Pve.avy_server_key,
+        # dupliquée ici pour que le cog assistant.py n'ait pas besoin de l'objet Pve
+        self.avy_llm_server_key = f"AVY-{self.avy_llm_node.upper()}"
+        # salon de chat direct avec l'assistant (câblé par provision._rewire, pas lu
+        # depuis l'environnement — 0 tant que le salon n'est pas encore créé)
+        self.assistant_chat_channel_id = 0
+
+        # --- Terminal Discord (console root sur guest LXC via termproxy) ---
+        self.terminal_enabled = _bool(g("TERMINAL_ENABLED"), False)
+        # ouverture réservée à ces user-ids Discord (défaut : le break-glass ADMIN_IDS)
+        self.terminal_owner_ids = _csv_ints(g("TERMINAL_OWNER_IDS")) or list(self.admin_ids)
+        # …ou à quiconque porte l'un de ces rôles (comme ADMIN_ROLE_IDS)
+        self.terminal_owner_role_ids = _csv_ints(g("TERMINAL_OWNER_ROLE_IDS"))
+        # guests sensibles ré-exclus côté bot (double barrière avec l'ACL PVE)
+        self.terminal_excluded_guests = {
+            x.strip().lower() for x in
+            g("TERMINAL_EXCLUDED_GUESTS", "vaultwarden,mailserver,bdd").split(",") if x.strip()}
+        self.terminal_idle_min = max(1, _int(g("TERMINAL_IDLE_MIN", "10"), 10))
+        self.pve_console_user = g("PVE_CONSOLE_USER", "botconsole@pve")
+        self.pve_console_password = g("PVE_CONSOLE_PASSWORD").strip()
+
+        # --- Terminal du NŒUD PVE (console root de l'hyperviseur, via SSH) ---
+        # Voir bot/core/nodeshell.py pour le « pourquoi SSH et pas termproxy ».
+        self.node_terminal_enabled = _bool(g("NODE_TERMINAL_ENABLED"), False)
+        # ⚠️ PROPRIÉTAIRE UNIQUEMENT, volontairement SANS repli sur les rôles :
+        # contrairement à TERMINAL_OWNER_ROLE_IDS (console LXC), aucun rôle Discord ne
+        # peut ouvrir un shell root sur l'hyperviseur. Défaut = break-glass ADMIN_IDS.
+        self.node_terminal_owner_ids = _csv_ints(g("NODE_TERMINAL_OWNER_IDS")) or list(self.admin_ids)
+        self.node_ssh_host = g("NODE_SSH_HOST", self.pve_host)
+        self.node_ssh_port = _int(g("NODE_SSH_PORT", "22"), 22)
+        self.node_ssh_user = g("NODE_SSH_USER", "root")
+        self.node_ssh_key = g("NODE_SSH_KEY", "/etc/discord-bot/node_ed25519")
+        self.node_ssh_known_hosts = g("NODE_SSH_KNOWN_HOSTS", "/etc/discord-bot/node_known_hosts")
+        self.node_terminal_idle_min = max(1, _int(g("NODE_TERMINAL_IDLE_MIN", "10"), 10))
+        # salon « 🔒 Lock » + dashboard live du nœud
+        self.node_channel_enabled = _bool(g("NODE_CHANNEL_ENABLED"), True)
+        # bouton 💾 Sauvegarder du salon nœud = vzdump de TOUS les invités
+        self.node_backup_enabled = _bool(g("NODE_BACKUP_ENABLED"), True)
+        # …sauf ceux-ci (défaut 200 = le PBS lui-même, comme le job pbs-daily-cts)
+        self.node_backup_exclude = g("NODE_BACKUP_EXCLUDE", "200").strip()
+        # durée de vie ABSOLUE d'une console du nœud, même active (0 = illimité)
+        self.node_terminal_max_min = max(0, _int(g("NODE_TERMINAL_MAX_MIN", "120"), 120))
+
+        # --- Live log stream ---
+        self.live_log_bind_addr = g("LIVE_LOG_BIND_ADDR", "0.0.0.0")
+        self.live_log_bind_port = _int(g("LIVE_LOG_BIND_PORT", "514"), 514)
+        self.live_log_min_severity = g("LIVE_LOG_MIN_SEVERITY", "warning").strip().lower()
+        self.live_log_flush_interval = _float(g("LIVE_LOG_FLUSH_INTERVAL", "10"), 10.0)
+        self.live_log_max_groups = _int(g("LIVE_LOG_MAX_GROUPS_PER_FLUSH", "8"), 8)
+        self.log_retry_queue_max = max(1, _int(g("LOG_RETRY_QUEUE_MAX", "20"), 20))
+        self.log_repeat_cooldown_seconds = max(
+            0, _int(g("LOG_REPEAT_COOLDOWN_SECONDS", "300"), 300))
+        self.log_startup_notice = _bool(g("LOG_STARTUP_NOTICE"), True)
+        # patterns separated by ';', re.search against "host app: text"
+        self.log_ignore_regex = g("LOG_IGNORE_REGEX").strip()
+        # per-host severity thresholds "host:sev,..." (sev names, resolved in logstream)
+        self.log_min_sev_overrides = self._parse_sev_overrides(g("LOG_MIN_SEV_OVERRIDES"))
+        # muted appnames (case-insensitive exact match)
+        self.log_mute_programs = {p.strip().lower() for p in
+                                  g("LOG_MUTE_PROGRAMS").split(",") if p.strip()}
+        self.log_route_per_ct = _bool(g("LOG_ROUTE_PER_CT"), False)
+        mode = g("LOG_ROUTE_MODE", "mirror").strip().lower()
+        self.log_route_mode = mode if mode in ("mirror", "move") else "mirror"
+
+        # --- Loki (centralized logs) ---
+        self.loki_url = g("LOKI_URL").strip()
+
+        # --- Behavior ---
+        self.dashboard_interval_min = max(1, _int(g("DASHBOARD_INTERVAL_MIN", "2"), 2))
+        self.report_hour = _int(g("REPORT_HOUR", "8"), 8)
+        self.report_minute = _int(g("REPORT_MINUTE", "0"), 0)
+        self.alert_poll_seconds = max(30, _int(g("ALERT_POLL_SECONDS", "60"), 60))
+        self.tz = g("TZ", "Europe/Paris")
+
+        state_dir = g("STATE_DIRECTORY", "/var/lib/discord-bot")
+        self.state_path = os.path.join(state_dir, "state.json")
+
+        # --- 2FA (TOTP) --------------------------------------------------------
+        # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les
+        # commandes sans laisser personne s'inscrire. On active APRÈS un /2fa setup.
+        # Break-glass : remettre TWOFA_ENABLED=false ici + redémarrer le bot.
+        # --- /docker (conteneurs CT120 via ytgrab) — kill-switch DOCKER_CTL_ENABLED=false
+        self.docker_ctl_enabled = _bool(g("DOCKER_CTL_ENABLED"), True)
+        self.twofa_enabled = g("TWOFA_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        self.twofa_session_min = int(g("TWOFA_SESSION_MIN", "15") or 15)
+        # Secrets à part de state.json : même dossier (écrit par le bot) mais fichier 0600.
+        self.twofa_path = g("TWOFA_PATH", os.path.join(state_dir, "2fa.json"))
+        self.audit_path = os.path.join(state_dir, "audit.log")
+
+    @staticmethod
+    def _parse_sev_overrides(v):
+        out = {}
+        for part in (v or "").split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            host, _, sev = part.rpartition(":")
+            host, sev = host.strip(), sev.strip().lower()
+            if host and sev:
+                out[host] = sev
+        return out
+
+    @staticmethod
+    def _parse_gestion_servers(v):
+        """« R820:G:M:O,AVEYRON:G:M:O » -> {R820:{view,mod,owner}, …}. Rétrocompat : une
+        entrée à 2 ids « clé:G:O » est lue comme {view:G, mod:G, owner:O} (ancien modèle)."""
+        out = {}
+        for part in (v or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            bits = [x.strip() for x in part.split(":")]
+            key = bits[0] if bits else ""
+            ids = bits[1:]
+            if not key or not ids or not all(x.isdigit() for x in ids):
+                _log.warning("GESTION_SERVERS: entrée ignorée (mal formée): %r", part)
+                continue
+            if len(ids) == 3:
+                out[key] = {"view": int(ids[0]), "mod": int(ids[1]), "owner": int(ids[2])}
+            elif len(ids) == 2:
+                # ancien format clé:gestion:o -> le rôle « gestion » = view SEUL ; le rôle O
+                # sert de mod ET owner (le rôle « vue » ne doit JAMAIS donner Lock/nœud).
+                out[key] = {"view": int(ids[0]), "mod": int(ids[1]), "owner": int(ids[1])}
+            else:
+                _log.warning("GESTION_SERVERS: %r attend 2 ou 3 ids (G:M:O), ignoré", part)
+        return out
+
+    @staticmethod
+    def _parse_ct_channels(v):
+        out = {}
+        for part in (v or "").split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            name, _, cid = part.rpartition(":")
+            name, cid = name.strip(), cid.strip()
+            if name and cid.isdigit():
+                out[name] = int(cid)
+        return out
+
+    # token id "user@realm!name" -> (user@realm, name)
+    @staticmethod
+    def split_token(token_id):
+        user, _, name = token_id.partition("!")
+        return user, name
+
+    def missing_required(self):
+        miss = []
+        if not self.discord_token:
+            miss.append("DISCORD_TOKEN")
+        if not self.guild_id:
+            miss.append("GUILD_ID")
+        return miss
+
+    @property
+    def influx_enabled(self):
+        return bool(self.influx_token)
+
+    @property
+    def loki_enabled(self):
+        return bool(self.loki_url)
+
+    @property
+    def pve_enabled(self):
+        return bool(self.pve_token_secret)
+
+    @property
+    def pve_actions_enabled(self):
+        return bool(self.pve_action_token_secret)
+
+    @property
+    def terminal_ready(self):
+        return bool(self.terminal_enabled and self.pve_console_password
+                    and (self.terminal_owner_ids or self.terminal_owner_role_ids))
+
+    @property
+    def node_terminal_ready(self):
+        """Prêt seulement si la clé existe VRAIMENT et qu'un propriétaire est défini.
+
+        Le test d'existence est délibéré : sans lui, une clé absente ne se manifesterait
+        qu'au clic, par une erreur opaque, alors qu'ici le bouton est simplement refusé
+        avec un message clair. Aucun repli sur les rôles (cf. node_terminal_owner_ids)."""
+        return bool(self.node_terminal_enabled and self.node_terminal_owner_ids
+                    and self.node_ssh_key and os.path.exists(self.node_ssh_key))

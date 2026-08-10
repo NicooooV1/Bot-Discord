@@ -1,0 +1,14 @@
+# Pinned deps for the Discord monitoring bot (installed into /opt/discord-bot/venv).
+# discord.py 2.5.x supports Python 3.13; audioop was removed from the 3.13 stdlib so
+# the audioop-lts backport is required for discord.py's (unused) voice import to load.
+discord.py==2.5.2
+audioop-lts; python_version >= "3.13"
+influxdb-client==1.45.0
+proxmoxer==2.2.0
+requests==2.32.3
+matplotlib==3.9.2
+Pillow==10.4.0
+pyte
+asyncssh==2.24.0
+pyotp
+qrcode

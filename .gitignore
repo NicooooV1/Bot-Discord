@@ -1,0 +1,17 @@
+# Secrets — ne JAMAIS versionner
+config.env
+config.env.bak*
+servarr-apis.json
+
+# Environnement Python
+venv/
+__pycache__/
+*.py[cod]
+.mplcache/
+
+# Sauvegardes manuelles (historique désormais tenu par git)
+*.bak*
+bot.bak-*
+
+# État runtime
+*.log
