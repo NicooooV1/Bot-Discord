@@ -1,3 +1,9 @@
+# ⚠️ SOURCE DE VERITE du pare-feu de CT106 : provision_ct106.sh copie CE fichier
+# vers /etc/pve/firewall/106.fw. Toute regle ajoutee a la main sur l hote DOIT
+# etre reportee ici, sinon le prochain provisioning la SUPPRIMERA.
+# Resynchronise le 2026-08-11 : la version versionnee datait du 2026-07-02 et
+# aurait fait perdre InfluxDB (mauvaise IP), Loki, l API Aveyron, la console SSH
+# du noeud et TOUTE la stack servarr/Jellyfin/ytgrab.
 [OPTIONS]
 enable: 1
 policy_in: DROP
@@ -5,16 +11,26 @@ policy_out: DROP
 
 [RULES]
 # --- OUT: only what the bot needs ---
-OUT ACCEPT -dest 10.3.10.120 -p tcp -dport 8086 -log nolog   # InfluxDB (read)
+OUT ACCEPT -dest 10.3.10.103 -p tcp -dport 8086 -log nolog   # InfluxDB (read)
 OUT ACCEPT -dest 10.3.10.200 -p tcp -dport 8006 -log nolog   # Proxmox API
-OUT ACCEPT -dest 10.3.10.123 -p tcp -dport 3100 -log nolog   # Loki (read)
+OUT ACCEPT -dest 10.0.10.10 -p tcp -dport 8006 -log nolog    # API cluster Aveyron (via WG, src-nat MikroTik)
+OUT ACCEPT -dest 10.3.10.200 -p tcp -dport 22 -log nolog     # console root du noeud (terminal Discord, cle dediee restreinte)
+OUT ACCEPT -dest 10.3.10.117 -p tcp -dport 3100 -log nolog   # Loki (read)
 OUT ACCEPT -p tcp -dport 443 -log nolog                      # discord.com gateway+CDN (rotating IPs)
 OUT ACCEPT -p udp -dport 53 -log nolog                       # DNS
 OUT ACCEPT -p tcp -dport 53 -log nolog                       # DNS/TCP
 OUT ACCEPT -p udp -dport 123 -log nolog                      # NTP
 OUT ACCEPT -p icmp -log nolog
+OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 5055 -log nolog   # Seerr (demandes /film /serie)
+OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8080 -log nolog   # qBittorrent (suivi telechargements)
+OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 7878 -log nolog   # Radarr
+OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8989 -log nolog   # Sonarr
+OUT ACCEPT -dest 10.3.20.105 -p tcp -dport 8096 -log nolog   # Jellyfin API (#jellyfin en lecture)
+OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8770 -log nolog   # ytgrab (YouTube /yt)
+OUT ACCEPT -dest 10.3.20.121 -p tcp -dport 8080 -log nolog   # web-e (site RDV : DM des reponses)
 
 # --- IN: live log stream UDP/514 from host, router and the LXC fleet (mgmt subnet) ---
 IN ACCEPT -source 10.3.0.0/16 -p udp -dport 514 -log nolog   # host + CTs + CRS305 forwarders
 IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 22 -log nolog    # admin SSH (mgmt LAN)
+IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 9100 -log nolog  # node_exporter (scrape telegraf hôte)
 IN ACCEPT -p icmp -log nolog
