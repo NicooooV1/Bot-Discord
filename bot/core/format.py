@@ -117,3 +117,22 @@ def slug(name):
     while "--" in s:
         s = s.replace("--", "-")
     return s.strip("-")[:90] or "guest"
+
+
+def outcome_text(outcome, done_label="terminé"):
+    """Rend le verdict d'un suivi de tâche PVE (`_poll`).
+
+    Partagé par cogs/actions.py et cogs/ct_channels.py (2026-08-11) : les deux avaient
+    leur propre rendu, et celui de ct_channels affichait « ⚠️ lost » — illisible.
+
+    « lost » n'est PAS un échec : c'est NOTRE suivi qui s'est interrompu, la tâche
+    continue côté PVE. L'annoncer comme un échec ferait croire à une sauvegarde ratée.
+    """
+    if outcome == "OK":
+        return f"✅ {done_label}"
+    if outcome == "running":
+        return "⏳ encore en cours"
+    if outcome == "lost":
+        return ("⚠️ suivi interrompu (API PVE injoignable) — **la tâche continue côté "
+                "Proxmox**, son sort réel est dans `/tasks`")
+    return f"⚠️ {outcome}"

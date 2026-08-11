@@ -651,11 +651,31 @@ class CtControlView(GatedView):
         return await super().interaction_check(interaction)
 
     async def _poll(self, upid, timeout=45):
-        for _ in range(max(1, timeout // 3)):
+        """Suit une tâche PVE jusqu'à `timeout` secondes de temps RÉEL.
+
+        Même correctif que `Actions._poll` (2026-08-11), qui avait le défaut ici encore :
+        - un SEUL hoquet (pveproxy rechargé, tunnel WG qui clignote sur un UPID « avy: »)
+          terminait le suivi sur « unknown » alors que la tâche continue côté PVE, ce qui
+          fait passer une sauvegarde RÉUSSIE pour un échec. On tolère 5 échecs consécutifs.
+        - la borne était un COMPTE d'itérations supposant 3 s par tour ; un échec réseau
+          coûte le timeout distant (jusqu'à 30 s), donc la durée réelle dérivait très
+          au-delà des 45 s annoncées. La borne est désormais l'horloge murale.
+        « lost » ≠ échec : c'est NOTRE suivi qui s'arrête, pas la tâche.
+        """
+        deadline = time.monotonic() + max(2, timeout)
+        fails = 0
+        while time.monotonic() < deadline:
             try:
                 st = await self.cog.bot.pve.atask_status(upid)
             except Exception:
-                return "unknown"
+                fails += 1
+                if fails >= 5:
+                    log.warning("suivi de la tâche %s abandonné (%d échecs consécutifs) "
+                                "— la tâche continue côté PVE", upid, fails, exc_info=True)
+                    return "lost"
+                await asyncio.sleep(2)
+                continue
+            fails = 0
             if st.get("status") == "stopped":
                 return st.get("exitstatus") or "OK"
             await asyncio.sleep(3)
@@ -740,9 +760,8 @@ class CtControlView(GatedView):
             return
         await itx.followup.send(f"⏳ **{verb}** lancé sur **{name}** — suivi…", ephemeral=True)
         outcome = await self._poll(str(upid))
-        res = ("✅ terminé" if outcome == "OK"
-               else "⏳ encore en cours" if outcome == "running" else f"⚠️ {outcome}")
-        await itx.followup.send(f"**{name}** — {verb.lower()} : {res}", ephemeral=True)
+        await itx.followup.send(
+            f"**{name}** — {verb.lower()} : {fmt.outcome_text(outcome)}", ephemeral=True)
 
     @discord.ui.button(label="Start", emoji="▶️",
                        style=discord.ButtonStyle.success, custom_id="ctchannels:start")

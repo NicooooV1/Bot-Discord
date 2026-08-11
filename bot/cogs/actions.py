@@ -23,19 +23,9 @@ ACTIONS = [app_commands.Choice(name="start", value="start"),
 
 
 def _outcome_text(outcome, done_label):
-    """Rend le verdict d'un `_poll`.
-
-    « lost » n'est PAS un échec : c'est NOTRE suivi qui s'est interrompu, la tâche
-    continue côté PVE. L'annoncer comme tel évite de faire croire à une sauvegarde ratée
-    (2026-08-11)."""
-    if outcome == "OK":
-        return f"✅ {done_label}"
-    if outcome == "running":
-        return "⏳ encore en cours"
-    if outcome == "lost":
-        return ("⚠️ suivi interrompu (API PVE injoignable) — **la tâche continue côté "
-                "Proxmox**, son sort réel est dans `/tasks`")
-    return f"⚠️ {outcome}"
+    """Conservé comme alias local : l'implémentation vit dans core/format (partagée
+    avec ct_channels, qui avait sa propre version divergente)."""
+    return fmt.outcome_text(outcome, done_label)
 
 
 class Actions(commands.Cog):
