@@ -13,40 +13,26 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from ..core import channels
 from ..core import format as fmt
 from ..core.gates import GatedView
+from ..core.http import client_for, load_service_apis
 from ..core.permissions import read_check, admin_check
+from ..core.ui import pin_edit
 from ..views.alertaction import AlertActionView, alert_snoozed
 
 log = logging.getLogger("discord-bot.servarr")
 
 RATIO_WARN = 1.0
-LOCK_CATEGORY = "Lock"      # repli historique : la vraie catégorie est « 🔒 Lock <clé> »
 RATIO_CHANNEL = "ratio"
-APIS_FILE = "/opt/discord-bot/servarr-apis.json"
 # Vraies stats C411 (le tracker, ≠ ratio local qBittorrent) — saisies via /setratio.
 DEFAULT_C411 = {"ratio": 2.96, "up_to": 2.592, "dl_go": 898.1, "bonus_go": 269.8}
-
-
-def _norm(s):
-    """Nom de catégorie normalisé (même règle que Provision._ensure_category) : « Lock »
-    et « 🔒 Lock R820 » ne se ressemblent que comparés en alphanumérique minuscule."""
-    return "".join(c for c in str(s).lower() if c.isalnum())
-
-
-def _load_apis():
-    try:
-        with open(APIS_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # informatif : sans ce fichier, /langues et le débit temps réel sont muets pour
-        # toujours — l'avaler en silence laissait croire à une seedbox à 0 o/s.
-        log.warning("%s absent : /langues et le débit qBittorrent seront indisponibles",
-                    APIS_FILE)
-        return {}
-    except Exception as e:  # noqa: BLE001 — JSON cassé : le bot doit démarrer quand même
-        log.warning("%s illisible: %s", APIS_FILE, e)
-        return {}
+#: Clés d'alerte émises par ce cog. Servent à REPRENDRE les clés nues écrites avant le
+#: cloisonnement de state["alerts"] (cf. core/state.AlertSpace) : sans cette reprise, les
+#: alertes en cours seraient toutes re-postées dans #alertes au premier démarrage.
+ALERT_KEYS = {"servarr_metrics", "servarr_vpn_down", "servarr_pf_down",
+              "servarr_qbit_down", "servarr_sync_down", "servarr_ratio_low",
+              "servarr_c411_stale"}
 
 
 def _c411d(cur, prev, unit, dec):
@@ -76,7 +62,12 @@ def _delta(cur, prev, kind="num"):
 class Servarr(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.apis = _load_apis()
+        self.apis = load_service_apis()
+        self.radarr = client_for(self.apis, "radarr")   # None si non configuré
+        # espace d'alertes PROPRE à ce cog (cf. core/state.AlertSpace) : le cog `alerts`
+        # ne peut plus effacer nos clés au démarrage. `adopt` reprend celles écrites
+        # avant le cloisonnement, sinon toutes les alertes en cours seraient re-postées.
+        self.alerts = bot.state.ns("servarr", adopt=ALERT_KEYS)
         self._ratio_cache = None    # dernières données Influx (qb/vpn/sync/fl) — pour le débit live
         self._ratio_gen = 0         # n° de génération du cache : dit à la boucle débit qu'il a bougé
         self._ratio_msg = None      # message #ratio gardé en cache (édité toutes les 10 s)
@@ -143,22 +134,14 @@ class Servarr(commands.Cog):
         except (KeyError, ValueError, TypeError):
             return None
 
-    async def _api_get(self, app, path):
-        def _sync():
-            a = self.apis[app]
-            req = urllib.request.Request(a["url"] + path, headers={"X-Api-Key": a["key"]})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read())
-        try:
-            return await asyncio.to_thread(_sync)
-        except Exception as e:  # noqa: BLE001 — panne réseau / 401 / timeout
-            # ⚠️ None ≠ [] : l'appelant DOIT distinguer « injoignable » de « rien à
-            # signaler ». Sans cette trace, une clé API révoquée passait totalement
-            # inaperçue (audit 2026-08-11).
-            log.warning("api %s %s: %s", app, path, e)
-            return None
-
     # --------------------------------------------- débit qBittorrent en direct
+    # ⚠️ Ce client reste en urllib LOCAL, sciemment : core.http.ApiClient porte des
+    # en-têtes FIXES et renvoie None pour toute erreur. Or qBittorrent impose une session
+    # à COOKIE (login POST urlencodé -> Set-Cookie SID réutilisé, en-tête qui change à
+    # chaque relogin) et le relogin automatique repose sur la DISTINCTION du code HTTP :
+    # 401/403 = session expirée (on retente une fois), le reste = panne. Passer par
+    # request_json aplatirait les deux cas en None et casserait le relogin, c'est-à-dire
+    # figerait le débit à « rien » dès la première expiration de session.
     def _qbit_warn(self, what, err):
         """Journalise une panne qBittorrent au plus une fois toutes les 5 min.
 
@@ -317,7 +300,7 @@ class Servarr(commands.Cog):
         return ch
 
     async def _fire(self, ch, key, level, title, desc):
-        prev = self.bot.state.alert_level(key)
+        prev = self.alerts.level(key)
         if level and level != prev:
             if alert_snoozed(self.bot.state, key):
                 return   # en sommeil (Snooze)
@@ -325,11 +308,11 @@ class Servarr(commands.Cog):
             emb = discord.Embed(title=title, description=desc, color=color)
             emb.set_footer(text=f"alerte: {key} [{level}]")
             await ch.send(embed=emb, view=AlertActionView())
-            self.bot.state.set_alert(key, level)
+            self.alerts.set_level(key, level)
         elif not level and prev:
             await ch.send(embed=discord.Embed(
                 title=f"✅ Résolu — {title}", description=desc, color=fmt.GREEN))
-            self.bot.state.clear_alert(key)
+            self.alerts.clear(key)
 
     async def _evaluate(self):
         qb, vpn, sync = await self._read()
@@ -406,165 +389,69 @@ class Servarr(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ------------------------------------------------- salon #ratio (Lock)
-    def _lock_category(self, guild):
-        """Catégorie verrouillée où ranger #ratio.
+    async def _seal_ratio_once(self, ch, cat):
+        """Range un #ratio lisible de @everyone dans la catégorie verrouillée.
 
-        ⚠️ PIÈGE (corrigé 2026-08-11) : la catégorie protégée est celle que provisionne le
-        cog Provision — « 🔒 Lock <SERVER_KEY> », avec ses overwrites (@everyone refusé,
-        M/O autorisés) et son _enforce_perms. Le nom « Lock » écrit en dur ici désignait
-        une catégorie DIFFÉRENTE (la normalisation alphanumérique donne « lock » ≠
-        « lockr820 ») : le bot en créait une seconde, sans le moindre overwrite, et #ratio
-        y naissait visible de @everyone. On adopte donc d'abord la catégorie provisionnée
-        (id persisté par Provision, puis nom normalisé) ; le repli « Lock » ne sert plus
-        qu'aux installations où l'auto-provisioning est désactivé.
-        ⚠️ On ne DÉPLACE aucun salon existant : un #ratio déjà en place reste où il est
-        (le déplacer le ferait disparaître d'un coup pour ceux qui le voient aujourd'hui).
+        ⚠️ Le salon affiche le ratio, l'upload et le download du compte d'un tracker
+        PRIVÉ : un #ratio né avant le 2026-08-11 hors de « 🔒 Lock <clé> » était lisible
+        de tout le serveur. `channels.seal_if_public` fait le déplacement avec
+        `sync_permissions=True` (jamais `edit(overwrites=…)`, qui REMPLACE les overwrites
+        et retirerait un accès légitime posé à la main) et se tait si la catégorie cible
+        est elle-même ouverte.
+
+        Une seule tentative par démarrage : la réponse est la même à chaque cycle, et
+        rejouer un déplacement refusé toutes les 10 min ne ferait que remplir les logs.
         """
-        cid = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("lock")
-        c = guild.get_channel(cid) if cid else None
-        if isinstance(c, discord.CategoryChannel):
-            return c
-        want = _norm(f"Lock {getattr(self.bot.cfg, 'server_key', 'R820')}")
-        c = next((x for x in guild.categories if _norm(x.name) == want), None)
-        if c is not None:
-            return c
-        cat_id = self.bot.state.get("lock_category_id")
-        c = guild.get_channel(cat_id) if cat_id else None
-        if isinstance(c, discord.CategoryChannel):
-            return c
-        return discord.utils.get(guild.categories, name=LOCK_CATEGORY)
-
-    async def _seal_if_public(self, ch):
-        """Range un #ratio DÉJÀ EXISTANT qui serait lisible par @everyone.
-
-        ⚠️ La correction de `_lock_category` ne servait qu'aux salons à CRÉER : sur une
-        installation en place, `_ensure_ratio_channel` rend le salon mémorisé sans jamais
-        regarder sa catégorie. Un #ratio né avant le 2026-08-11 dans la catégorie « Lock »
-        nue reste donc lisible de tout le serveur — or il affiche le ratio, l'upload et le
-        download du compte du tracker privé.
-
-        On répare en DÉPLAÇANT le salon dans la vraie catégorie verrouillée, avec
-        `sync_permissions=True` : le salon hérite alors des overwrites de la catégorie.
-        On n'appelle JAMAIS `edit(overwrites=…)`, qui REMPLACE l'ensemble des overwrites
-        et pourrait retirer un accès légitime posé à la main.
-
-        Une seule tentative par démarrage, et uniquement si la catégorie cible existe et
-        est elle-même fermée à @everyone — sinon on se contente de le crier dans les logs
-        (déplacer vers une catégorie ouverte ne réglerait rien)."""
         if self._ratio_public_warned:
             return
         self._ratio_public_warned = True
-        guild = getattr(ch, "guild", None)
-        if guild is None:
-            return
-        try:
-            if not ch.permissions_for(guild.default_role).view_channel:
-                return                       # déjà privé : rien à faire
-        except Exception:  # noqa: BLE001 — un diagnostic ne doit jamais casser le cycle
-            return
-        cat = self._lock_category(guild)
-        cat_ok = False
-        if isinstance(cat, discord.CategoryChannel):
-            try:
-                cat_ok = not cat.permissions_for(guild.default_role).view_channel
-            except Exception:  # noqa: BLE001
-                cat_ok = False
-        if not cat_ok:
-            log.warning("#%s est visible de @everyone (catégorie « %s ») et aucune "
-                        "catégorie verrouillée n'est disponible : à ranger à la main "
-                        "dans « 🔒 Lock %s »", getattr(ch, "name", "?"),
-                        getattr(getattr(ch, "category", None), "name", "aucune"),
-                        getattr(self.bot.cfg, "server_key", "R820"))
-            return
-        try:
-            await ch.edit(category=cat, sync_permissions=True,
-                          reason="ratio C411 lisible de @everyone — remise sous clé")
-            log.warning("#%s était visible de @everyone : déplacé dans « %s » et "
-                        "resynchronisé sur ses permissions (2026-08-11)",
-                        getattr(ch, "name", "?"), cat.name)
-        except discord.HTTPException as e:
-            log.error("#%s : remise sous clé impossible (%s) — le ratio du tracker reste "
-                      "lisible de tout le serveur, à ranger à la main",
-                      getattr(ch, "name", "?"), e)
+        await channels.seal_if_public(self.bot, ch, cat, why="ratio du tracker privé")
 
     async def _ensure_ratio_channel(self):
+        """Salon #ratio, créé au besoin DANS la catégorie verrouillée provisionnée.
+
+        ⚠️ Pas de catégorie -> pas de salon (règle de `channels.ensure_channel`) : un
+        `create_text_channel(category=None)` pose le salon à la racine, donc PUBLIC —
+        c'est exactement comme cela que #ratio s'est retrouvé lisible de tout le serveur.
+        Le salon manquant sera créé au prochain cycle, une fois provision passé.
+        ⚠️ On ne DÉPLACE pas un salon existant qui est déjà privé : il appartient à
+        l'utilisateur, qui a pu le ranger ailleurs volontairement.
+        """
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
             return None
+        cat = channels.lock_category(self.bot, guild)
         info = self.bot.state.get("servarr_ratio") or {}
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
-        if ch is not None:
-            await self._seal_if_public(ch)
-            return ch
-        cat = self._lock_category(guild)
-        if cat is None:
-            try:
-                # ⚠️ overwrites DÈS la création : une catégorie créée nue est visible de
-                # tout le serveur, et #ratio en hériterait (2026-08-11). Fenêtre publique
-                # nulle, au lieu de « créer puis sécuriser ».
-                cat = await guild.create_category(
-                    LOCK_CATEGORY,
-                    overwrites={guild.default_role:
-                                discord.PermissionOverwrite(view_channel=False),
-                                guild.me:
-                                discord.PermissionOverwrite(view_channel=True,
-                                                            send_messages=True)},
-                    reason="salon ratio distant (catégorie verrouillée)")
-            except discord.HTTPException as e:
-                log.warning("catégorie « %s » non créée: %s", LOCK_CATEGORY, e)
-                cat = None
-        if cat is not None:
-            self.bot.state.set("lock_category_id", cat.id)
-        ch = discord.utils.get(guild.text_channels, name=RATIO_CHANNEL)
         if ch is None:
-            try:
-                # pas d'overwrites explicites : le salon hérite (synchronise) ceux de la
-                # catégorie Lock, qui portent la confidentialité.
-                ch = await guild.create_text_channel(
-                    RATIO_CHANNEL, category=cat, topic="Ratio C411 en temps réel — auto + bouton Rafraîchir")
-                log.info("salon #ratio créé dans « %s »", getattr(cat, "name", "aucune catégorie"))
-            except discord.HTTPException as e:
-                log.warning("salon #%s non créé: %s", RATIO_CHANNEL, e)
+            ch = await channels.ensure_channel(
+                self.bot, guild, RATIO_CHANNEL, cat,
+                topic="Ratio C411 en temps réel — auto + bouton Rafraîchir")
+            if ch is None:
                 return None
-        cur = self.bot.state.get("servarr_ratio") or {}
-        cur["channel"] = ch.id
-        self.bot.state.set("servarr_ratio", cur)
-        await self._seal_if_public(ch)  # salon ADOPTÉ : il peut venir d'une catégorie ouverte
+            cur = self.bot.state.get("servarr_ratio") or {}
+            cur["channel"] = ch.id
+            self.bot.state.set("servarr_ratio", cur)
+        # salon ADOPTÉ (existant ou retrouvé par son nom) : il peut venir d'ailleurs
+        await self._seal_ratio_once(ch, cat)
         return ch
 
     async def _pin_edit(self, ch, embed):
+        """Publie (et épingle) ou réédite le message de #ratio via `ui.pin_edit`.
+
+        ⚠️ Le STOCKAGE de l'id reste ICI, dans `state["servarr_ratio"]["message"]` : le
+        déplacer orphelinerait le message déjà épinglé et en ferait poster un DOUBLON
+        (bug vécu le 2026-07-17 sur 12 salons -avy). Seule la danse Discord est partagée.
+        """
         info = self.bot.state.get("servarr_ratio") or {}
-        mid = info.get("message")
-        msg = None
-        if mid:
-            try:
-                msg = await ch.fetch_message(mid)
-            except discord.NotFound:
-                msg = None
-            except discord.HTTPException as e:
-                log.warning("#ratio : message épinglé illisible: %s", e)
-                return
-        view = self._view()
-        try:
-            if msg is None:
-                msg = await ch.send(embed=embed, view=view)
-                try:
-                    await msg.pin()
-                except discord.HTTPException as e:
-                    log.warning("#ratio : épinglage impossible: %s", e)
-                info["message"] = msg.id
-                self.bot.state.set("servarr_ratio", info)
-            else:
-                await msg.edit(embed=embed, view=view)
+        msg, mid = await pin_edit(ch, embed, message_id=info.get("message"),
+                                  view=self._view(), label="#ratio", log=log)
+        if mid and mid != info.get("message"):
+            info["message"] = mid
+            self.bot.state.set("servarr_ratio", info)
+        if msg is not None:
             self._ratio_msg = msg   # cache pour la boucle débit (10 s), évite un fetch
-        except discord.Forbidden:
-            # cas durable (permission retirée) : le signaler, sinon #ratio se fige sans
-            # une seule ligne de log (2026-08-11)
-            log.warning("#ratio : écriture refusée dans #%s (permissions)",
-                        getattr(ch, "name", "?"))
-        except discord.HTTPException as e:
-            log.warning("#ratio : publication impossible: %s", e)
 
     async def _qbit_24h(self):
         """Upload / download RÉELS sur 24 h = amplitude (spread) du compteur monotone
@@ -958,14 +845,18 @@ class Servarr(commands.Cog):
     @read_check()
     async def langues(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)
-        if "radarr" not in self.apis:
+        if self.radarr is None:
             await itx.followup.send("API Radarr non configurée.", ephemeral=True)
             return
-        mv = await self._api_get("radarr", "/api/v3/movie")
-        if mv is None:
+        mv = await self.radarr.aget("/api/v3/movie")
+        if not isinstance(mv, list):
             # ⚠️ `or []` transformait la panne (CT120 éteint, clé API révoquée, timeout)
             # en bibliothèque vide : l'audit s'affichait en VERT « 0 sans VF », strictement
             # indiscernable d'une bibliothèque parfaite (2026-08-11).
+            # On teste le TYPE et pas seulement `is None` : core.http.request_json rend
+            # `{}` pour un corps VIDE (204 d'un reverse-proxy, réponse tronquée), qui
+            # n'est pas davantage une bibliothèque — l'ancien json.loads(b"") levait et
+            # rendait None. Sans ce test, le même faux vert revenait par la fenêtre.
             await itx.followup.send(
                 "⚠️ Radarr injoignable (ou clé API refusée) — audit impossible, "
                 "aucune donnée n'a été lue.", ephemeral=True)

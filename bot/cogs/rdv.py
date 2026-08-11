@@ -10,19 +10,22 @@ n'est signalée qu'une fois par demi-heure). Curseurs persistés dans state.json
 premier passage des réponses, on saute celles déjà présentes (tests) pour ne notifier que
 les nouvelles.
 """
-import asyncio
-import json
 import logging
 import time
-import urllib.request
 
 import discord
 from discord.ext import commands, tasks
 
+from ..core.http import ApiClient
+
 log = logging.getLogger("discord-bot.rdv")
 
-ANSWERS_URL = "http://10.3.20.121:8080/api/answers"   # endpoints privés du site web-e (CT121)
-VISITS_URL = "http://10.3.20.121:8080/api/visits"
+SITE_URL = "http://10.3.20.121:8080"   # site web-e (CT121) : endpoints privés /api/*
+ANSWERS_PATH = "/api/answers"
+VISITS_PATH = "/api/visits"
+# 8 s (et non le défaut de core.http) : la boucle repasse toutes les 30 s et enchaîne DEUX
+# appels — un site injoignable ne doit pas manger la moitié de l'intervalle.
+HTTP_TIMEOUT = 8
 POLL_SECONDS = 30
 VISIT_COALESCE_S = 30 * 60    # une même IP -> au plus 1 notification de visite / 30 min
 FALLBACK_CHANNEL = "e-reponses"   # salon privé (propriétaire seul)
@@ -63,6 +66,7 @@ class Rdv(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._visit_seen = {}   # ip -> monotonic de la dernière notification (coalescence)
+        self._api = ApiClient(SITE_URL, timeout=HTTP_TIMEOUT, label="web-e")
 
     async def cog_load(self):
         self.poll.start()
@@ -70,10 +74,16 @@ class Rdv(commands.Cog):
     def cog_unload(self):
         self.poll.cancel()
 
-    def _get(self, url, after):
-        req = urllib.request.Request(f"{url}?after={int(after)}")
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read() or b"[]")
+    async def _fetch(self, path, after):
+        """Lot de lignes depuis `?after=<curseur>`, ou None si le site est injoignable.
+
+        ⚠️ None (échec) et [] (rien de neuf) ne se confondent PAS : sur un échec, les
+        curseurs ne doivent pas bouger, sinon une réponse d'Elisa serait sautée pour
+        toujours. `quiet=True` : CT121 peut être éteint, et un avertissement toutes les
+        30 s noierait le journal — l'échec reste visible en debug."""
+        data = await self._api.aget(path, {"after": _i(after)}, quiet=True)
+        if data is None:
+            return None
         return data if isinstance(data, list) else []
 
     @tasks.loop(seconds=POLL_SECONDS)
@@ -95,12 +105,8 @@ class Rdv(commands.Cog):
     async def _poll_answers(self):
         st = self.bot.state
         cursor = int(st.get("rdv_cursor", 0) or 0)
-        try:
-            data = await asyncio.to_thread(self._get, ANSWERS_URL, cursor)
-        except Exception as e:  # noqa: BLE001
-            log.debug("rdv poll answers: %s", e)
-            return
-        if not data:
+        data = await self._fetch(ANSWERS_PATH, cursor)
+        if not data:      # None (échec) comme [] (rien de neuf) : on ne touche à rien
             return
         # 1er passage : ne pas spammer avec les réponses déjà là (tests) — caler le curseur.
         if not st.get("rdv_init"):
@@ -136,12 +142,8 @@ class Rdv(commands.Cog):
         Pas de saut initial : visits.jsonl démarre vide, le curseur suffit."""
         st = self.bot.state
         cursor = int(st.get("rdv_visits_cursor", 0) or 0)
-        try:
-            data = await asyncio.to_thread(self._get, VISITS_URL, cursor)
-        except Exception as e:  # noqa: BLE001
-            log.debug("rdv poll visits: %s", e)
-            return
-        if not data:
+        data = await self._fetch(VISITS_PATH, cursor)
+        if not data:      # None (échec) comme [] (rien de neuf) : on ne touche à rien
             return
         # coalescence : au sein du lot ET dans le temps, 1 notif max par IP / 30 min
         now = time.monotonic()
@@ -310,7 +312,20 @@ class Rdv(commands.Cog):
         adopté tel quel — et le bot y publiait tout ça devant le serveur entier. On
         persiste donc son id et on revérifie la confidentialité à CHAQUE usage
         (2026-08-11) ; aucune catégorie provisionnée ne couvre ce salon, personne d'autre
-        ne repasse derrière."""
+        ne repasse derrière.
+
+        ⚠️ POURQUOI CE SALON N'EST PAS DANS « 🔒 Lock <SERVER_KEY> » (2026-08-11)
+        Le reste du bot ne crée plus rien hors d'une catégorie provisionnée
+        (`channels.ensure_channel`), parce qu'un salon né à la RACINE est public. Ici,
+        non : la création pose explicitement `_private_overwrites`, le salon ne peut donc
+        pas naître visible. Et le ranger dans Lock le rendrait au contraire MOINS privé —
+        `provision._enforce_perms` (boucle de 5 min) réapplique `_lock_overwrites` à
+        CHAQUE salon texte de la catégorie Lock : les porteurs des rôles M et O y
+        gagneraient la lecture des réponses d'Elisa et des IP des visiteurs, et notre
+        réimposition ci-dessous se battrait indéfiniment avec la sienne (deux `edit` par
+        cycle, pour toujours). La catégorie Lock est le territoire de provision ; ce
+        salon-ci est le seul du projet dont l'exigence est « propriétaire SEUL ».
+        """
         gid = getattr(self.bot.cfg, "guild_id", 0)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
@@ -322,24 +337,24 @@ class Rdv(commands.Cog):
         if not isinstance(ch, discord.TextChannel):
             # repli par NOM (première exécution, ou salon recréé à la main)
             ch = discord.utils.get(guild.text_channels, name=FALLBACK_CHANNEL)
-        if ch is not None:
-            if not await self._ensure_private(ch):
+        if ch is None:
+            try:
+                ch = await guild.create_text_channel(
+                    FALLBACK_CHANNEL, overwrites=self._private_overwrites(guild),
+                    topic="Réponses & visites du site e.nicov1.fr (privé). "
+                          "Active « Messages privés des membres du serveur » pour recevoir les réponses en vrai DM.",
+                    reason="rdv: salon privé réponses/visites")
+                log.info("rdv: salon #%s créé (privé)", FALLBACK_CHANNEL)
+            except discord.HTTPException as e:
+                log.warning("rdv: création #%s impossible: %s", FALLBACK_CHANNEL, e)
                 return None
-            if cid != ch.id:      # state.set écrit sur disque : seulement si ça change
-                st.set("rdv_channel_id", ch.id)
-            return ch
-        try:
-            ch = await guild.create_text_channel(
-                FALLBACK_CHANNEL, overwrites=self._private_overwrites(guild),
-                topic="Réponses & visites du site e.nicov1.fr (privé). "
-                      "Active « Messages privés des membres du serveur » pour recevoir les réponses en vrai DM.",
-                reason="rdv: salon privé réponses/visites")
-            st.set("rdv_channel_id", ch.id)
-            log.info("rdv: salon #%s créé", FALLBACK_CHANNEL)
-            return ch
-        except discord.HTTPException as e:
-            log.warning("rdv: création #%s impossible: %s", FALLBACK_CHANNEL, e)
+        # une seule porte de confidentialité, qu'on vienne de l'id, du nom ou de la
+        # création : FAIL-CLOSED, rien n'est publié dans un salon qu'on n'a pas pu fermer
+        if not await self._ensure_private(ch):
             return None
+        if cid != ch.id:      # state.set écrit sur disque : seulement si ça change
+            st.set("rdv_channel_id", ch.id)
+        return ch
 
 
 async def setup(bot):

@@ -8,7 +8,6 @@ import difflib
 import json
 import logging
 import unicodedata
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -16,41 +15,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from ..core import channels
 from ..core import format as fmt
 from ..core.gates import GatedView
+from ..core.http import client_for, load_service_apis
 from ..core.permissions import read_check
+from ..core.ui import pin_edit
 
 log = logging.getLogger("discord-bot.medias")
 
-APIS_FILE = "/opt/discord-bot/servarr-apis.json"
-# provision.py fabrique « 📊 Supervision <SERVER_KEY> » depuis le multi-serveurs : le nom
-# figé ci-dessous ne résolvait plus la catégorie, et #telechargements naissait alors à la
-# RACINE du serveur, sans overwrites (= noms des torrents visibles de @everyone).
-# On garde l'ancien nom en dernier recours : la catégorie historique, adoptée par ID par
-# provision, n'a jamais été renommée. 2026-08-11.
-SUPERVISION_CATEGORY_LEGACY = "📊 Supervision"
 DL_CHANNEL = "telechargements"
 DL_STATES = ("downloading", "stalledDL", "metaDL", "forcedDL",
              "checkingDL", "allocating", "queuedDL")
-
-
-def _load_apis():
-    """Charge servarr-apis.json.
-
-    Une lecture ratée désactive silencieusement TOUT le cog (dltracker n'est jamais
-    démarré, /film répond « Seerr non configuré ») et le fichier n'est relu nulle part :
-    sans ces logs, la panne est indiagnosticable. 2026-08-11.
-    """
-    try:
-        with open(APIS_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        log.warning("%s absent — cog medias inactif (pas de suivi ni de /film)", APIS_FILE)
-    except PermissionError:
-        log.error("%s illisible (droits du fichier) — cog medias inactif", APIS_FILE)
-    except Exception:
-        log.exception("%s illisible (JSON invalide ?) — cog medias inactif", APIS_FILE)
-    return {}
 
 
 def _bar(pct, width=12):
@@ -69,16 +45,22 @@ def _eta(s):
     return f"{s // 3600}h{(s % 3600) // 60:02d}"
 
 
-def _norm(s):
-    """minuscule, sans accents ni ponctuation, espaces compactés — pour comparer les titres."""
+def _norm_titre(s):
+    """minuscule, sans accents ni ponctuation, espaces compactés — pour comparer les titres.
+
+    ⚠️ RIEN À VOIR avec `core.channels.norm`, qui normalise des NOMS DE SALON en collant
+    tout l'alphanumérique (« 🔒 Lock R820 » -> « lockr820 »). Ici on retire les accents et
+    on GARDE les espaces : ce sont eux qui font le score de `difflib` sur un titre de film.
+    Les confondre casserait la recherche approximative. 2026-08-11.
+    """
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii").lower()
     return " ".join("".join(c if c.isalnum() else " " for c in s).split())
 
 
 def _match_score(query_norm, r):
     """Ressemblance [0..1] entre la recherche et un résultat (titre localisé OU original)."""
-    tn = _norm(r.get("title") or r.get("name") or "")
-    on = _norm(r.get("originalTitle") or r.get("originalName") or "")
+    tn = _norm_titre(r.get("title") or r.get("name") or "")
+    on = _norm_titre(r.get("originalTitle") or r.get("originalName") or "")
     sim = difflib.SequenceMatcher(None, query_norm, tn).ratio()
     if on:
         sim = max(sim, difflib.SequenceMatcher(None, query_norm, on).ratio())
@@ -137,7 +119,10 @@ def _relax_variants(query):
 class Medias(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.apis = _load_apis()
+        self.apis = load_service_apis()
+        # None = service non configuré (core.http.client_for). Les appels Seerr passent
+        # tous par ce client : url, clé et TIMEOUT posés en un seul endroit.
+        self.seerr = client_for(self.apis, "seerr")
         if self.apis:
             self.dltracker.start()
 
@@ -149,36 +134,9 @@ class Medias(commands.Cog):
             self.dltracker.cancel()
 
     # ------------------------------------------------------------- HTTP helpers
-    def _get_sync(self, app, path):
-        a = self.apis[app]
-        req = urllib.request.Request(a["url"] + path, headers={"X-Api-Key": a["key"]})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read())
-
-    async def _get(self, app, path):
-        try:
-            return await asyncio.to_thread(self._get_sync, app, path)
-        except Exception as e:
-            log.warning("GET %s%s: %s", app, path, e)
-            return None
-
-    def _post_sync(self, app, path, body):
-        a = self.apis[app]
-        req = urllib.request.Request(a["url"] + path, data=json.dumps(body).encode(),
-                                     headers={"X-Api-Key": a["key"], "Content-Type": "application/json"},
-                                     method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read()
-            return r.status, (json.loads(raw) if raw else {})
-
-    async def _post(self, app, path, body):
-        try:
-            return await asyncio.to_thread(self._post_sync, app, path, body)
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace")[:250]
-        except Exception as e:
-            return 0, str(e)
-
+    # Les lectures Seerr passent par `self.seerr` (core.http.ApiClient) : plus de bloc
+    # urllib recopié ici. Il ne reste que qBittorrent, dont l'authentification par COOKIE
+    # de session (login -> Set-Cookie -> rappel) n'est pas exprimable avec ApiClient.
     def _qbit_sync(self):
         # Sentinelle : None = injoignable/échec (distinct de [] = succès sans torrent actif).
         a = self.apis.get("qbit")
@@ -209,91 +167,54 @@ class Medias(commands.Cog):
             return None
 
     # -------------------------------------------------- salon #telechargements
-    def _supervision_name(self):
-        return f"📊 Supervision {getattr(self.bot.cfg, 'server_key', 'R820')}"
-
-    def _supervision_category(self, guild):
-        """Catégorie de supervision de PROVISION : id publié par le cog, puis nom réel,
-        puis nom historique. Jamais de création ici — une catégorie créée à la volée
-        naîtrait sans overwrites, donc publique."""
-        prov = self.bot.get_cog("Provision")
-        cid = ((getattr(prov, "prov", None) or {}).get("categories") or {}).get("supervision")
-        cat = guild.get_channel(cid) if cid else None
-        if isinstance(cat, discord.CategoryChannel):
-            return cat
-        return (discord.utils.get(guild.categories, name=self._supervision_name())
-                or discord.utils.get(guild.categories, name=SUPERVISION_CATEGORY_LEGACY))
-
     async def _ensure_dl_channel(self):
+        """Salon #telechargements, DANS la catégorie de supervision — jamais ailleurs.
+
+        La résolution de la catégorie appartient à `core.channels` (id publié par
+        provision, puis nom réel « 📊 Supervision <SERVER_KEY> »). Pas de catégorie
+        résolue -> AUCUNE création : `create_text_channel(category=None)` posait le salon
+        à la RACINE du serveur, sans overwrites, c'est-à-dire les noms des torrents
+        visibles de @everyone. Mieux vaut pas de salon du tout : provision recrée la
+        CATÉGORIE (il ne connaît pas #telechargements, qui n'appartient qu'à ce cog) et
+        le tour suivant de `dltracker` (600 s) repose le salon dedans. 2026-08-11.
+        """
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
             return None
         info = self.bot.state.get("media_dl") or {}
+        cat = channels.supervision_category(self.bot, guild)
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
-        if ch is not None:
-            return ch
-        cat = self._supervision_category(guild)
-        if cat is None:
-            # Pas de catégorie résolue -> create_text_channel(category=None) posait le
-            # salon À LA RACINE, sans overwrites. Mieux vaut pas de salon (provision le
-            # créera) qu'un salon public listant les torrents. 2026-08-11.
-            log.warning("catégorie « %s » introuvable — salon #%s NON créé",
-                        self._supervision_name(), DL_CHANNEL)
-            return None
-        ch = discord.utils.get(cat.text_channels, name=DL_CHANNEL)
         if ch is None:
-            # homonyme ailleurs dans le serveur : le rapatrier (il héritait sinon des
-            # permissions de là où il traînait, souvent aucune).
-            stray = discord.utils.get(guild.text_channels, name=DL_CHANNEL)
-            if stray is not None:
-                ch = stray
-                try:
-                    await stray.edit(category=cat, sync_permissions=True,
-                                     reason="#telechargements appartient à la supervision")
-                    log.warning("#%s trouvé hors de « %s » — rapatrié", DL_CHANNEL, cat.name)
-                except discord.HTTPException:
-                    log.warning("#%s hors de « %s » et non déplaçable — adopté tel quel",
-                                DL_CHANNEL, cat.name)
-        if ch is None:
-            try:
-                ch = await guild.create_text_channel(
-                    DL_CHANNEL, category=cat,
-                    topic="Téléchargements en cours (barre de progression, mise à jour ~30 s)")
-                log.info("salon #%s créé", DL_CHANNEL)
-            except discord.HTTPException:
-                log.exception("création du salon #%s", DL_CHANNEL)
+            ch = await channels.ensure_channel(
+                self.bot, guild, DL_CHANNEL, cat,
+                topic="Téléchargements en cours (barre de progression, mise à jour ~30 s)")
+            if ch is None:
                 return None
+        # Un homonyme resté hors catégorie hérite des permissions de là où il traîne,
+        # souvent aucune : on le remet sous clé s'il est lisible de @everyone. S'il ne
+        # l'est pas, on ne le déplace pas — l'utilisateur a pu le ranger exprès.
+        await channels.seal_if_public(self.bot, ch, cat, why="noms des torrents en cours")
+        # relire l'état : `_pin_edit` a pu y écrire « message » entre-temps
         cur = self.bot.state.get("media_dl") or {}
-        cur["channel"] = ch.id
-        self.bot.state.set("media_dl", cur)
+        if cur.get("channel") != ch.id:
+            cur["channel"] = ch.id
+            self.bot.state.set("media_dl", cur)
         return ch
 
     async def _pin_edit(self, ch, embed):
+        """Message épinglé de #telechargements — la danse Discord vit dans core.ui.
+
+        Le STOCKAGE de l'id reste ici (`state["media_dl"]["message"]`) : le migrer
+        orphelinerait le message déjà épinglé et en ferait poster un DOUBLON.
+        """
         info = self.bot.state.get("media_dl") or {}
-        mid = info.get("message")
-        msg = None
-        if mid:
-            try:
-                msg = await ch.fetch_message(mid)
-            except discord.NotFound:
-                msg = None
-            except discord.HTTPException:
-                return
-        view = DlRefreshView(self)
-        try:
-            if msg is None:
-                msg = await ch.send(embed=embed, view=view)
-                try:
-                    await msg.pin()
-                except discord.HTTPException:
-                    pass
-                info["message"] = msg.id
-                self.bot.state.set("media_dl", info)
-            else:
-                await msg.edit(embed=embed, view=view)
-        except discord.HTTPException:
-            pass
+        _msg, mid = await pin_edit(ch, embed, message_id=info.get("message"),
+                                   view=DlRefreshView(self), label=f"#{DL_CHANNEL}", log=log)
+        if mid and mid != info.get("message"):
+            cur = self.bot.state.get("media_dl") or {}
+            cur["message"] = mid
+            self.bot.state.set("media_dl", cur)
 
     async def _build_dl_embed(self):
         torrents = await self._qbit()
@@ -365,25 +286,41 @@ class Medias(commands.Cog):
 
     # ------------------------------------------------------- /film et /serie
     async def _search_raw(self, query):
-        d = await self._get("seerr", "/api/v1/search?query=" + urllib.parse.quote(query))
-        return (d.get("results", []) if d else []) or []
+        """Résultats bruts Seerr, ou None si l'APPEL A ÉCHOUÉ.
+
+        ⚠️ None ≠ [] (invariant de core.http) : [] = « Seerr a répondu, rien à ce nom »,
+        None = « Seerr injoignable ». Écraser l'un sur l'autre enchaînait les 12
+        recherches relâchées de `_relax_variants` alors qu'AUCUNE ne pouvait aboutir —
+        12 timeouts de 15 s de plus, ~3 min d'attente et un worker du pool partagé
+        immobilisé — pour finir sur « vérifie l'orthographe » quand le service était
+        simplement HS. C'est le défaut qui rendait `/langues` rassurant. 2026-08-11.
+        """
+        if self.seerr is None:
+            return None
+        d = await self.seerr.aget("/api/v1/search", {"query": query})
+        if d is None:
+            return None
+        return (d.get("results") or []) if isinstance(d, dict) else []
 
     async def _search(self, query, kind):
         """Retourne (résultats classés par probabilité, exact?) — propose les plus
         probables même sans correspondance exacte (fautes de frappe / mots en trop tolérés)."""
         want = "movie" if kind == "film" else "tv"
-        qn = _norm(query)
+        qn = _norm_titre(query)
         seen = {}
 
         def keep(results):
-            for r in results:
+            for r in results or []:          # None = appel en échec, pas « rien trouvé »
                 if r.get("mediaType") == want and r.get("id"):
                     seen.setdefault(r["id"], r)
 
-        keep(await self._search_raw(query))
-        # aucune correspondance directe -> on relâche la requête (fautes / à-peu-près)
+        direct = await self._search_raw(query)
+        keep(direct)
+        # aucune correspondance directe -> on relâche la requête (fautes / à-peu-près),
+        # mais SEULEMENT si Seerr a répondu (`direct` vaut [] et non None) : injoignable,
+        # les 12 variantes échoueraient toutes de la même façon (cf. _search_raw).
         fuzzy = False
-        if not seen:
+        if not seen and direct is not None:
             fuzzy = True
             for variant in _relax_variants(query):
                 keep(await self._search_raw(variant))
@@ -403,32 +340,17 @@ class Medias(commands.Cog):
             ranked = [r for r in ranked if _match_score(qn, r) >= _PROBABLE_FLOOR] or ranked[:5]
         return ranked[:15], best >= _EXACT_FLOOR
 
-    async def _request(self, kind, tmdb):
-        """Crée la demande DIRECTEMENT dans Seerr avec la clé API admin — donc
-        auto-approuvée et téléchargée dans la foulée.
-
-        ⚠️ NE PAS rebrancher ceci sur /film ou /serie : c'est exactement le repli qui
-        contournait le portail de validation #demandes (supprimé le 2026-08-11). Le seul
-        chemin légitime pour créer une demande est le bouton « Approuver » du portail
-        (bot/cogs/requests.py), gardé par le tier M/O + 2FA.
-        """
-        if kind == "film":
-            body = {"mediaType": "movie", "mediaId": int(tmdb)}
-        else:
-            det = await self._get("seerr", f"/api/v1/tv/{tmdb}")
-            if det is None:
-                # échec du fetch détail : on demande TOUTE la série ("all" accepté par
-                # Overseerr/Jellyseerr) plutôt que de retomber par erreur sur la saison 1.
-                seasons = "all"
-            else:
-                seasons = [s["seasonNumber"] for s in det.get("seasons", [])
-                           if s.get("seasonNumber", 0) > 0] or [1]
-            body = {"mediaType": "tv", "mediaId": int(tmdb), "seasons": seasons}
-        return await self._post("seerr", "/api/v1/request", body)
+    # ⚠️ Ce cog N'A PLUS AUCUN chemin de création de demande dans Seerr : la méthode
+    # `_request()` qui postait sur /api/v1/request avec la clé API admin — donc
+    # auto-approuvée et téléchargée dans la foulée — a été SUPPRIMÉE (elle n'était plus
+    # appelée depuis le 2026-08-11, où elle servait de repli quand le portail était
+    # indisponible). Ne pas la réintroduire : le seul chemin légitime est le bouton
+    # « Approuver » du portail #demandes (bot/cogs/requests.py), gardé par le tier M/O
+    # + 2FA. Ici, on ne fait que PROPOSER (cf. RequestView._on_select).
 
     async def _flow(self, itx, kind, titre):
         await itx.response.defer(ephemeral=True)
-        if "seerr" not in self.apis:
+        if self.seerr is None:
             await itx.followup.send("Seerr non configuré.", ephemeral=True)
             return
         res, exact = await self._search(titre, kind)

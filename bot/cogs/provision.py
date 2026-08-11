@@ -23,6 +23,15 @@ Après réconciliation, le routage temps réel est recâblé vers les salons ré
   - cfg.alert_channel_id / report_channel_id  (lus en direct par Alerts/Reports),
   - cfg.ct_channels                           (lu en direct par le routeur de logs),
   - CtChannels.map + Logs.stream.channel_id   (capturés à l'init -> mis à jour ici).
+
+DÉCOUPAGE (2026-08-11) — ce fichier ne garde que l'ORCHESTRATION (réconciliation,
+étapes 1..4b, _rewire, _save, les boucles). Deux modules frères, qui ne sont PAS des
+cogs (rien à ajouter à COGS dans `__main__.py`), portent les parties quasi pures :
+  - provision_perms.py  : guild + cfg -> dict d'overwrites (schéma des permissions) ;
+  - provision_embeds.py : données InfluxDB -> discord.Embed (rendus épinglés).
+provision reste le PROPRIÉTAIRE des catégories : il les crée avec leurs overwrites et
+publie leurs ids dans state["prov"]["categories"] — c'est `core/channels.py` qui les
+relit pour les autres cogs, jamais l'inverse.
 """
 import asyncio
 import logging
@@ -30,8 +39,11 @@ import logging
 import discord
 from discord.ext import commands, tasks
 
-from ..core import format as fmt
+from ..core import channels, format as fmt
 from ..core.gates import GatedView
+from ..core.ui import pin_edit
+from . import provision_embeds as embeds
+from . import provision_perms as perms
 
 log = logging.getLogger("discord-bot.provision")
 
@@ -63,24 +75,6 @@ SYNO_SUP_CHANNELS = [
     ("disques",  "disques",  "NAS : disques physiques — modèle, température, santé, secteurs défectueux."),
     ("volumes",  "volumes",  "NAS : volumes et groupes de stockage — capacité, remplissage, état."),
 ]
-
-
-def _slug(name: str) -> str:
-    """Nom de guest -> nom de salon Discord valide (minuscules, sans espace)."""
-    s = "".join(c if (c.isalnum() or c in "-_") else "-" for c in name.strip().lower())
-    while "--" in s:
-        s = s.replace("--", "-")
-    return s.strip("-")[:90] or "guest"
-
-
-def _pdelta(cur, prev, unit="", dec=0):
-    """Delta d'évolution depuis le dernier refresh (flèche + valeur)."""
-    if prev is None:
-        return ""
-    d = cur - prev
-    if round(d, dec) == 0:
-        return " (=)"
-    return f" (▲ +{d:.{dec}f}{unit})" if d > 0 else f" (▼ {d:.{dec}f}{unit})"
 
 
 class Provision(commands.Cog):
@@ -117,6 +111,13 @@ class Provision(commands.Cog):
         self.CAT_SYNO_SUP = f"📊 Supervision {self.syno_key}"
         self.CAT_SYNO_LOCK = f"🔒 Lock {self.syno_key}"
         self.is_primary = getattr(bot.cfg, "is_primary", True)
+        # Schémas d'overwrites du serveur principal, sous la forme `want_fn(guild)`
+        # attendue par `_enforce_perms` (les constructeurs vivent dans provision_perms
+        # et prennent `cfg` en argument explicite — ils ne dépendent plus du cog).
+        # ⚠️ Ils renvoient None quand un rôle M/O manque : « ne touche à rien », JAMAIS
+        # « aucun overwrite » (cf. l'en-tête de provision_perms).
+        self._managed_fn = perms.managed_overwrites_fn(self.cfg)
+        self._lock_fn = perms.node_lock_overwrites_fn(self.cfg)
         self._done_once = False
         # #chat-ia n'est publié à Assistant.on_message que si ses overwrites « O AVY-LLM »
         # ont bien pu être posés (2026-08-11) : sans ça un salon resté PUBLIC faute de
@@ -164,10 +165,12 @@ class Provision(commands.Cog):
         cat = discord.utils.get(guild.categories, name=name)
         if cat is None:
             # fallback tolérant aux emojis/espaces : « Archive » adopte « 🗄️ Archive »
-            # (et inversement) au lieu de créer un DOUBLON. Comparaison alphanumérique.
-            norm = lambda s: "".join(c for c in s.lower() if c.isalnum())
-            target = norm(name)
-            cat = next((c for c in guild.categories if norm(c.name) == target), None)
+            # (et inversement) au lieu de créer un DOUBLON. Comparaison alphanumérique —
+            # `channels.norm`, la MÊME que celle dont se servent les cogs satellites pour
+            # retrouver ces catégories (quatre copies locales avant le 2026-08-11).
+            target = channels.norm(name)
+            cat = next((c for c in guild.categories
+                        if channels.norm(c.name) == target), None)
         if cat is None:
             kw = {}
             if overwrites is not None:
@@ -176,151 +179,6 @@ class Provision(commands.Cog):
             log.info("catégorie créée: %s", name)
         self.prov["categories"][key] = cat.id
         return cat
-
-    def _private_seed_overwrites(self, guild):
-        """Overwrites minimaux FAIL-CLOSED pour une catégorie/un salon que le bot CRÉE
-        alors que les rôles voulus ne se résolvent pas encore : @everyone ne voit rien,
-        seul le bot écrit (le propriétaire du guild voit tout de toute façon, Discord ne
-        permet pas de le lui cacher — donc aucun risque de lockout).
-
-        Poser ça vaut mieux que de créer public « en attendant » : `_enforce_perms`
-        posera le vrai schéma dès que les rôles M/O existeront (2026-08-11)."""
-        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                manage_messages=True, manage_channels=True, read_message_history=True,
-                send_messages_in_threads=True)
-        return ow
-
-    # ------------------------------------------------- catégorie « 🔒 Lock » (nœud)
-
-    def _lock_overwrites(self, guild):
-        """Catégorie Lock : @everyone ne voit RIEN ; voient le propriétaire, le bot, et les
-        porteurs du rôle « O <srv> » (qui, par construction de /gestion, portent AUSSI
-        « Gestion <srv> » et ont le 2FA — cahier des charges 2026-07-16).
-
-        ⚠️ Un membre portant la permission Discord « Administrateur » (et le propriétaire
-        du serveur) IGNORE ces overwrites — Discord ne permet pas de les lui cacher. La
-        vraie frontière des BOUTONS est donc runtime (permissions.lock_button_ok +
-        terminal._may_open_node), pas cette permission de salon, qui reste le filtre de
-        visibilité."""
-        ow = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        }
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                manage_messages=True, manage_channels=True, read_message_history=True,
-                create_private_threads=True, send_messages_in_threads=True,
-                manage_threads=True)
-        # Catégorie Lock = tiers M (modération) ET O (owner) — pas G (visualiser).
-        lock_ids = [rid for rid in (self.cfg.node_mod_role_id, self.cfg.node_owner_role_id) if rid]
-        if not lock_ids:
-            return None
-        seen = False
-        for rid in lock_ids:
-            r = guild.get_role(rid)
-            if r is not None:
-                ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    send_messages_in_threads=True, use_application_commands=True)
-                seen = True
-        if not seen:
-            # aucun des rôles M/O n'est résolu : ne PAS poser un Lock @everyone-deny SANS
-            # personne (perte d'accès + combat de la boucle 5 min).
-            log.warning("rôles M/O introuvables — overwrites Lock NON modifiés")
-            return None
-        for oid in self.cfg.node_terminal_owner_ids:
-            # get_member est vide sans l'intent GUILD_MEMBERS -> Object(id) suffit :
-            # discord.py ne se sert que de .id et type l'overwrite en MEMBER.
-            target = guild.get_member(oid) or discord.Object(id=oid)
-            ow[target] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True,
-                create_private_threads=True, send_messages_in_threads=True)
-        return ow
-
-    def _lock_overwrites_fn(self, key):
-        """Comme _lock_overwrites, mais pour la catégorie Lock d'UN serveur Aveyron
-        précis (clé GESTION_SERVERS) : seuls M/O de CETTE clé voient la catégorie —
-        pas le O du R820, pas le rôle G (visualiser seul) de qui que ce soit."""
-        def want_fn(guild):
-            srv = (getattr(self.cfg, "gestion_servers", {}) or {}).get(key, {})
-            lock_ids = [rid for rid in (srv.get("mod"), srv.get("owner")) if rid]
-            ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-            me = guild.me
-            if me is not None:
-                ow[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, embed_links=True,
-                    manage_messages=True, manage_channels=True, read_message_history=True,
-                    create_private_threads=True, send_messages_in_threads=True,
-                    manage_threads=True)
-            if not lock_ids:
-                return None
-            seen = False
-            for rid in lock_ids:
-                r = guild.get_role(rid)
-                if r is not None:
-                    ow[r] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, read_message_history=True,
-                        send_messages_in_threads=True, use_application_commands=True)
-                    seen = True
-            if not seen:
-                log.warning("rôles M/O %s introuvables — overwrites Lock NON modifiés", key)
-                return None
-            for oid in self.cfg.node_terminal_owner_ids:
-                target = guild.get_member(oid) or discord.Object(id=oid)
-                ow[target] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    create_private_threads=True, send_messages_in_threads=True)
-            return ow
-        return want_fn
-
-    def _managed_overwrites(self, guild):
-        """Salons de Supervision + Gestion <srv>, 3 tiers :
-          - G (view, READ_ROLE_IDS)  : VOIT, mais n'écrit pas et ne lance pas de commandes ;
-          - M + O (ADMIN_ROLE_IDS)   : voient + écrivent + boutons (+ commandes) ;
-          - @everyone                : rien.
-        Les boutons restent visibles de G mais inertes (garde runtime is_admin)."""
-        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                manage_messages=True, manage_channels=True, read_message_history=True,
-                send_messages_in_threads=True)
-        # garde anti-lockout : le rôle M/O (admin) DOIT être résolu, sinon on ne touche rien
-        if not self.cfg.admin_role_ids:
-            return None
-        for rid in self.cfg.admin_role_ids:
-            if guild.get_role(rid) is None:
-                log.warning("rôle M/O %s introuvable — overwrites de gestion NON modifiés", rid)
-                return None
-        # VUE seule (tier G + éventuels rôles visionneurs manuels dans VIEWER_ROLE_IDS,
-        # VIDE depuis le 2026-07-17 sur demande de Nico : le rôle « A » ne doit voir QUE
-        # #général, plus aucun salon de gestion — seuls G/M/O par serveur donnent accès) :
-        # voir, mais pas d'écriture, pas de commandes, pas de fils (sinon contournement
-        # du « lecture seule »).
-        view_only = discord.PermissionOverwrite(
-            view_channel=True, read_message_history=True, send_messages=False,
-            add_reactions=False, use_application_commands=False,
-            create_public_threads=False, create_private_threads=False,
-            send_messages_in_threads=False)
-        view_ids = [getattr(self.cfg, "node_view_role_id", 0)] + list(self.cfg.viewer_role_ids)
-        for rid in view_ids:
-            r = guild.get_role(rid) if rid else None
-            if r is not None:
-                ow[r] = view_only
-        for rid in self.cfg.admin_role_ids:           # tiers M + O : voir + interagir
-            r = guild.get_role(rid)
-            if r is not None:
-                ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    use_application_commands=True, add_reactions=True, embed_links=True,
-                    send_messages_in_threads=True)
-        return ow
 
     async def _ensure_general_perms(self, guild):
         """#général : ENTRÉE ouverte à TOUS les membres (il n'y a plus de rôle d'entrée
@@ -345,18 +203,6 @@ class Provision(commands.Cog):
             except discord.HTTPException:
                 log.warning("#général : overwrite @everyone non appliqué")
 
-    def _twofa_overwrites(self, guild):
-        """#logs-2fa = JOURNAL d'audit 2FA : VISIBLE PAR PERSONNE (choix Nico). @everyone
-        deny view, aucun rôle ; seul le bot y écrit (et le propriétaire le voit par bypass
-        owner). Les commandes /2fa, elles, se lancent dans #général."""
-        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                read_message_history=True, manage_channels=True)
-        return ow
-
     async def _ensure_twofa_channel(self, guild):
         """Crée/adopte le JOURNAL d'audit 2FA (#logs-2fa) : rangé dans « 🗄️ Archive »,
         VISIBLE PAR PERSONNE (@everyone deny, seul le bot écrit + owner par bypass), et
@@ -364,7 +210,7 @@ class Provision(commands.Cog):
         name = getattr(self.cfg, "twofa_channel_name", "") or ""
         if not name:
             return
-        want = self._twofa_overwrites(guild)
+        want = perms.twofa_overwrites(guild)
         arch = await self._ensure_category(guild, CAT_ARCHIVE, "archive")
         cid = self.prov.get("twofa_channel")
         ch = guild.get_channel(cid) if cid else None
@@ -389,7 +235,7 @@ class Provision(commands.Cog):
                     log.info("journal 2FA rangé dans Archive + permissions réimposées")
                 except discord.HTTPException:
                     log.warning("journal 2FA : rangement dans Archive impossible")
-            elif self._ovw_drifted(ch, want):
+            elif perms.ovw_drifted(ch, want):
                 try:
                     await ch.edit(overwrites=want, reason="journal 2FA : permissions")
                     log.info("journal 2FA : permissions (ré)appliquées")
@@ -400,17 +246,6 @@ class Provision(commands.Cog):
         # publié pour le cog 2fa : c'est le salon où JOURNALISER (pas où confiner /2fa)
         if self.bot.state.get("twofa_log_channel_id") != ch.id:
             self.bot.state.set("twofa_log_channel_id", ch.id)
-
-    @staticmethod
-    def _ovw_drifted(ch, want):
-        """True si les overwrites du salon diffèrent de l'ensemble voulu (comparaison par
-        id : sans l'intent GUILD_MEMBERS les cibles sont des Object à l'identité instable)."""
-        try:
-            w = {t.id: p for t, p in want.items()}
-            h = {t.id: p for t, p in ch.overwrites.items()}
-        except Exception:  # noqa: BLE001
-            return True
-        return w != h
 
     async def _enforce_perms(self, guild, cat, want_fn):
         """Applique want_fn(guild) à la catégorie ET à chacun de ses salons texte, mais
@@ -423,34 +258,15 @@ class Provision(commands.Cog):
             return
         for ch in [cat] + list(cat.text_channels):
             try:
-                if self._ovw_drifted(ch, want):
+                if perms.ovw_drifted(ch, want):
                     await ch.edit(overwrites=want, reason="permissions R820 (cahier des charges)")
                     log.info("permissions (ré)appliquées: %s", getattr(ch, "name", "?"))
             except discord.HTTPException:
                 log.warning("permissions non appliquées: %s", getattr(ch, "name", "?"))
 
-    def _lock_perms_drifted(self, ch, guild):
-        """True si les overwrites du salon ne sont pas EXACTEMENT ceux attendus.
-
-        Comparaison de l'ensemble COMPLET, et pas de deux bits : un contrôle qui se
-        contentait de vérifier « @everyone est refusé » et « le propriétaire est autorisé »
-        était aveugle à un overwrite AJOUTÉ (quelqu'un s'ouvre l'accès à la main → jamais
-        corrigé) et à un propriétaire RETIRÉ de la config (son overwrite survivait → accès
-        jamais révoqué). Comparaison par id : sans l'intent GUILD_MEMBERS les cibles sont
-        des `discord.Object`, dont l'identité d'objet n'est pas stable."""
-        want_ow = self._lock_overwrites(guild)
-        if want_ow is None:
-            # garde anti-lockout : aucun rôle M/O résolu -> il n'y a RIEN à comparer.
-            # Avant (2026-08-11), le None.items() levait, l'except renvoyait True, et un
-            # `edit(overwrites=None)` — PATCH vide côté Discord — partait toutes les
-            # 5 min sur chaque salon Lock sans jamais rien corriger.
-            return False
-        try:
-            want = {t.id: p for t, p in want_ow.items()}
-            have = {t.id: p for t, p in ch.overwrites.items()}
-        except Exception:  # noqa: BLE001 — comparaison impossible -> on réapplique
-            return True
-        return want != have
+    # ------------------------------------------------- catégorie « 🔒 Lock » (nœud)
+    # Le SCHÉMA d'overwrites vit dans provision_perms (`lock_overwrites`) ; ici, seule
+    # l'orchestration : adopter/créer la catégorie et y ranger les salons sensibles.
 
     async def _ensure_lock_category(self, guild):
         """Adopte la catégorie « Lock » si elle existe, sinon la crée.
@@ -464,15 +280,15 @@ class Provision(commands.Cog):
 
         ⚠️ Les overwrites sont posés DÈS `create_category` (2026-08-11) : avant, la
         catégorie naissait publique puis était refermée par un `edit()` — fenêtre
-        d'exposition, et exposition DÉFINITIVE quand `_lock_overwrites` renvoyait None
+        d'exposition, et exposition DÉFINITIVE quand `perms.lock_overwrites` renvoyait None
         (rôles M/O non résolus) puisque `edit(overwrites=None)` est un PATCH vide."""
         key_before = self.prov["categories"].get("lock")
         existed = key_before is not None or discord.utils.get(
             guild.categories, name=self.CAT_LOCK) is not None
-        want = self._lock_overwrites(guild)
+        want = self._lock_fn(guild)
         cat = await self._ensure_category(
             guild, self.CAT_LOCK, "lock",
-            overwrites=want if want is not None else self._private_seed_overwrites(guild))
+            overwrites=want if want is not None else perms.private_seed_overwrites(guild))
         if not existed and want is not None:
             try:
                 await cat.edit(overwrites=want,
@@ -486,11 +302,11 @@ class Provision(commands.Cog):
         """Salon du nœud PVE dans « 🔒 Lock » (dashboard live + console root)."""
         if not getattr(self.cfg, "node_channel_enabled", True):
             return
-        # `_lock_overwrites` renvoie None par conception (garde anti-lockout). Le passer
+        # `perms.lock_overwrites` renvoie None par conception (garde anti-lockout). Le passer
         # tel quel à create_text_channel lève un TypeError — PAS une HTTPException — qui
         # remontait jusqu'au try de l'étape 4 et emportait AUSSI #jellyfin-logs et
         # `_enforce_perms` de toute la catégorie Lock (corrigé 2026-08-11).
-        ow = self._lock_overwrites(guild)
+        ow = self._lock_fn(guild)
         if ow is None:
             log.warning("rôles M/O non résolus — salon du nœud NON provisionné ce cycle")
             return
@@ -516,7 +332,7 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("salon du nœud : rangement dans Lock impossible")
-            if self._lock_perms_drifted(ch, guild):
+            if perms.lock_perms_drifted(ch, guild, self.cfg):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon du nœud : propriétaire uniquement")
@@ -534,7 +350,7 @@ class Provision(commands.Cog):
                 and self.cfg.jellyfin_api_key):
             return
         # même piège que _provision_node_channel : overwrites=None => TypeError (2026-08-11)
-        ow = self._lock_overwrites(guild)
+        ow = self._lock_fn(guild)
         if ow is None:
             log.warning("rôles M/O non résolus — #jellyfin-logs NON provisionné ce cycle")
             return
@@ -558,7 +374,7 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("#jellyfin-logs : rangement dans Lock impossible")
-            if self._lock_perms_drifted(ch, guild):
+            if perms.lock_perms_drifted(ch, guild, self.cfg):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon jellyfin-logs : propriétaire uniquement")
@@ -648,15 +464,15 @@ class Provision(commands.Cog):
                 #    publique, et ses salons héritent de cette visibilité jusqu'au
                 #    passage de _enforce_perms — voire pour toujours si les rôles ne se
                 #    résolvent pas (2026-08-11).
-                sup_want = self._managed_overwrites(guild)
+                sup_want = self._managed_fn(guild)
                 sup_cat = await self._ensure_category(
                     guild, self.CAT_SUPERVISION, "supervision",
-                    overwrites=sup_want or self._private_seed_overwrites(guild))
+                    overwrites=sup_want or perms.private_seed_overwrites(guild))
                 for key, cname, topic in SUPER_CHANNELS:
                     await self._ensure_text(guild, cname, sup_cat, self.prov["super"],
                                             key, topic)
                 # accès : @everyone rien, rôle A vision, rôle Gestion boutons (tous les salons)
-                await self._enforce_perms(guild, sup_cat, self._managed_overwrites)
+                await self._enforce_perms(guild, sup_cat, self._managed_fn)
 
                 # 1b) ressources PARTAGÉES (#général, #logs-2fa) : primaire uniquement — une
                 #     instance secondaire n'y touche pas (elles sont communes à tout le guild).
@@ -686,7 +502,7 @@ class Provision(commands.Cog):
                 for node in avy_nodes:
                     key = self.bot.pve.avy_server_key(node)
                     # Même garde que _syno_enabled : sans les rôles G/M/O de la clé dans
-                    # GESTION_SERVERS, _srv_overwrites_fn refuse de poser les overwrites
+                    # GESTION_SERVERS, perms.srv_overwrites_fn refuse de poser les overwrites
                     # et on créerait « 📊 Supervision / Gestion / 🔒 Lock AVY-X » +
                     # #hyperviseur-x PUBLICS, à vie (2026-08-11). Ne rien créer du tout
                     # est le seul comportement fail-closed. Déclencheur non théorique :
@@ -697,9 +513,9 @@ class Provision(commands.Cog):
                                     key, key)
                         continue
                     try:
-                        ow_fn = self._srv_overwrites_fn(key)
-                        lock_fn = self._lock_overwrites_fn(key)
-                        seed = self._private_seed_overwrites(guild)
+                        ow_fn = perms.srv_overwrites_fn(self.cfg, key)
+                        lock_fn = perms.lock_overwrites_fn(self.cfg, key)
+                        seed = perms.private_seed_overwrites(guild)
                         sup = await self._ensure_category(
                             guild, f"📊 Supervision {key}", f"avy_sup_{node}",
                             overwrites=ow_fn(guild) or seed)
@@ -740,7 +556,7 @@ class Provision(commands.Cog):
             #    que peut lever la limite Discord des 50 salons par catégorie.
             try:
                 await self._reconcile_containers(guild, cont_cat, avy_cats)
-                await self._enforce_perms(guild, cont_cat, self._managed_overwrites)
+                await self._enforce_perms(guild, cont_cat, self._managed_fn)
             except Exception:
                 log.exception("réconciliation des salons d'invités")
 
@@ -752,7 +568,7 @@ class Provision(commands.Cog):
                 await self._provision_node_channel(guild)
                 await self._provision_jellyfin_log_channel(guild)
                 # toute la catégorie Lock (salon nœud + salons persos) = Gestion+O R820
-                await self._enforce_perms(guild, lock_cat, self._lock_overwrites)
+                await self._enforce_perms(guild, lock_cat, self._lock_fn)
             except Exception:
                 log.exception("provisioning du salon du nœud")
 
@@ -781,33 +597,13 @@ class Provision(commands.Cog):
             except Exception:
                 log.exception("persistance de l'état de provisioning")
 
-    def _assistant_chat_overwrites(self, guild):
-        """@everyone deny ; SEUL le rôle O AVY-LLM (+ le bot) voit/écrit ce salon —
-        littéralement, pas M/G AVY-LLM ni aucun rôle R820 (demande explicite de Nico,
-        plus restrictif que /assistant qui reste ouvert à tout M/O de tout serveur)."""
-        srv = (getattr(self.cfg, "gestion_servers", {}) or {}).get("AVY-LLM", {})
-        owner_id = srv.get("owner", 0)
-        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                read_message_history=True, manage_messages=True)
-        if not owner_id or guild.get_role(owner_id) is None:
-            log.warning("rôle O AVY-LLM introuvable — overwrites #chat-ia NON modifiés")
-            return None
-        ow[guild.get_role(owner_id)] = discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True,
-            embed_links=True, add_reactions=True)
-        return ow
-
     async def _ensure_assistant_chat(self, guild):
         """⚠️ FAIL-CLOSED (2026-08-11) : rien n'est créé tant que le rôle O AVY-LLM ne
         se résout pas. Avant, la catégorie et #chat-ia naissaient PUBLICS (créés sans
         overwrites) et n'étaient JAMAIS refermés dans ce cas — aucun `_enforce_perms` ne
         balaie ce salon — pendant que `_rewire` publiait quand même son id, rendant
         `Assistant.on_message` actif dans un salon ouvert à tout le guild."""
-        want = self._assistant_chat_overwrites(guild)
+        want = perms.assistant_chat_overwrites(guild, self.cfg)
         if want is None:
             self._assistant_chat_ok = False
             log.error("rôle O AVY-LLM non résolu — #chat-ia NON provisionné "
@@ -825,7 +621,7 @@ class Provision(commands.Cog):
             return
         ok = True
         for target in (cat, ch):
-            if self._ovw_drifted(target, want):
+            if perms.ovw_drifted(target, want):
                 try:
                     await target.edit(overwrites=want, reason="salon assistant IA : O AVY-LLM uniquement")
                 except discord.HTTPException:
@@ -855,8 +651,8 @@ class Provision(commands.Cog):
         #    M/O ne se résolvent pas).
         return await self._ensure_category(
             guild, self.CAT_CONTAINERS, "containers",
-            overwrites=(self._managed_overwrites(guild)
-                        or self._private_seed_overwrites(guild)))
+            overwrites=(self._managed_fn(guild)
+                        or perms.private_seed_overwrites(guild)))
 
     async def _ensure_avy_sup_channels(self, guild, node, sup_cat):
         """Salons de supervision d'un nœud Aveyron (alertes/hyperviseur/stockage/
@@ -900,7 +696,7 @@ class Provision(commands.Cog):
 
     def _syno_enabled(self):
         """Le NAS n'est un « serveur » que si ses rôles G/M/O existent dans
-        GESTION_SERVERS. Sans eux, _srv_overwrites_fn refuserait de poser les
+        GESTION_SERVERS. Sans eux, perms.srv_overwrites_fn refuserait de poser les
         overwrites (garde anti-lockout) et on créerait des salons que personne ne
         verrait — mieux vaut ne rien créer du tout."""
         return bool((getattr(self.cfg, "gestion_servers", {}) or {}).get(self.syno_key))
@@ -917,9 +713,9 @@ class Provision(commands.Cog):
         store = self.prov.setdefault("syno", {})
         # overwrites dès la création (2026-08-11) : une catégorie créée nue est publique
         # et ses salons héritent de cette visibilité (fiche NAS = n° de série, SMART).
-        srv_fn = self._srv_overwrites_fn(self.syno_key)
-        lock_fn = self._lock_overwrites_fn(self.syno_key)
-        seed = self._private_seed_overwrites(guild)
+        srv_fn = perms.srv_overwrites_fn(self.cfg, self.syno_key)
+        lock_fn = perms.lock_overwrites_fn(self.cfg, self.syno_key)
+        seed = perms.private_seed_overwrites(guild)
         sup = await self._ensure_category(guild, self.CAT_SYNO_SUP, "syno_sup",
                                           overwrites=srv_fn(guild) or seed)
         lock = await self._ensure_category(guild, self.CAT_SYNO_LOCK, "syno_lock",
@@ -939,44 +735,6 @@ class Provision(commands.Cog):
             global_fallback=False)
         await self._enforce_perms(guild, sup, srv_fn)
         await self._enforce_perms(guild, lock, lock_fn)
-
-    def _srv_overwrites_fn(self, key):
-        """want_fn des catégories d'un serveur Aveyron : même schéma 3 tiers que
-        _managed_overwrites mais avec les rôles G/M/O de la clé `key` dans
-        GESTION_SERVERS (+ rôles visionneurs manuels). Garde anti-lockout : si les
-        rôles M/O de la clé ne se résolvent pas, on ne touche RIEN."""
-        def want_fn(guild):
-            srv = (getattr(self.cfg, "gestion_servers", {}) or {}).get(key, {})
-            mo_ids = [rid for rid in (srv.get("mod"), srv.get("owner")) if rid]
-            ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-            me = guild.me
-            if me is not None:
-                ow[me] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, embed_links=True,
-                    manage_messages=True, manage_channels=True,
-                    read_message_history=True, send_messages_in_threads=True)
-            if not mo_ids or any(guild.get_role(rid) is None for rid in mo_ids):
-                log.warning("rôles M/O %s introuvables — overwrites NON modifiés", key)
-                return None
-            view_only = discord.PermissionOverwrite(
-                view_channel=True, read_message_history=True, send_messages=False,
-                add_reactions=False, use_application_commands=False,
-                create_public_threads=False, create_private_threads=False,
-                send_messages_in_threads=False)
-            for rid in [srv.get("view", 0)] + list(self.cfg.viewer_role_ids):
-                r = guild.get_role(rid) if rid else None
-                if r is not None:
-                    ow[r] = view_only
-            for rid in mo_ids:
-                r = guild.get_role(rid)
-                if r is not None:
-                    ow[r] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True,
-                        read_message_history=True, use_application_commands=True,
-                        add_reactions=True, embed_links=True,
-                        send_messages_in_threads=True)
-            return ow
-        return want_fn
 
     async def _reconcile_containers(self, guild, cont_cat, avy_cats=None):
         """Crée les salons des VM/conteneurs présents, ordonne par VMID — chacun dans
@@ -1024,7 +782,7 @@ class Provision(commands.Cog):
                           "salon inchangé ce cycle", name)
                 continue
             if name in self.prov["ct"]:
-                await self._ensure_text(guild, _slug(name), cat,
+                await self._ensure_text(guild, fmt.slug(name), cat,
                                         self.prov["ct"], name,
                                         topic=f"VM/conteneur Proxmox « {name} ».",
                                         global_fallback=False)
@@ -1040,7 +798,7 @@ class Provision(commands.Cog):
                         log.warning("salon #%s : sortie d'Archive impossible", ch.name)
                     self.prov["ct"][name] = cid
                     continue
-            await self._ensure_text(guild, _slug(name), cat,
+            await self._ensure_text(guild, fmt.slug(name), cat,
                                     self.prov["ct"], name,
                                     topic=f"VM/conteneur Proxmox « {name} ».",
                                     global_fallback=False)
@@ -1117,7 +875,7 @@ class Provision(commands.Cog):
                     # nouvelle (sinon fuite de visibilité jusqu'au prochain
                     # _enforce_perms). Le poser sur TOUS les salons du tri écraserait à
                     # chaque réordonnancement leurs overwrites par ceux — potentiellement
-                    # vides — du CACHE de la catégorie ; quand _managed_overwrites renvoie
+                    # vides — du CACHE de la catégorie ; quand perms.managed_overwrites renvoie
                     # None (rôles M/O non résolus), _enforce_perms ne repasse pas derrière
                     # et le salon resterait ouvert. (2026-08-11)
                     moving = ch.category_id != getattr(cont_cat, "id", None)
@@ -1206,7 +964,8 @@ class Provision(commands.Cog):
             if not jfcog.poll.is_running():
                 jfcog.poll.start()
 
-    # ----------------------------------------------------- rendus thématiques
+    # ------------------------------------ rendus thématiques (message épinglé)
+    # Les embeds eux-mêmes sont dans provision_embeds ; ici, seule la publication.
 
     async def _pinned_edit(self, channel_id, embed, pending=None):
         """Édite le message épinglé du salon (créé+épinglé au 1er passage).
@@ -1228,675 +987,22 @@ class Provision(commands.Cog):
                 log.warning("salon %s injoignable ce cycle — embed non rafraîchi",
                             channel_id)
                 return
+        # ⚠️ Le STOCKAGE de l'id reste ICI (prov["pins"][str(salon)]) : seule la danse
+        # Discord (fetch / NotFound / send / pin / edit) est déléguée à ui.pin_edit.
+        # Migrer le stockage orphelinerait les messages déjà épinglés et en ferait
+        # poster des DOUBLONS (bug vécu le 2026-07-17 sur 12 salons -avy).
         pins = self.prov.setdefault("pins", {})
-        mid = pins.get(str(channel_id))
-        msg = None
-        if mid:
-            try:
-                msg = await ch.fetch_message(mid)
-            except discord.NotFound:
-                msg = None
-            except discord.HTTPException:
-                log.warning("message épinglé %s de #%s illisible ce cycle",
-                            mid, getattr(ch, "name", "?"))
-                return
-        view = TopicalRefreshView(self)
-        ok = False
-        try:
-            if msg is None:
-                msg = await ch.send(embed=embed, view=view)
-                try:
-                    await msg.pin()
-                except discord.HTTPException:
-                    log.warning("#%s : épinglage impossible (50 messages épinglés ?)",
-                                getattr(ch, "name", "?"))
-                pins[str(channel_id)] = msg.id
-                self._save()
-                ok = True
-            else:
-                await msg.edit(embed=embed, view=view)
-                ok = True
-        except discord.HTTPException:
-            log.warning("#%s : embed épinglé non écrit (permissions ? embed trop long ?)",
-                        getattr(ch, "name", "?"))
+        _, mid = await pin_edit(ch, embed, message_id=pins.get(str(channel_id)),
+                                view=TopicalRefreshView(self),
+                                label=f"#{getattr(ch, 'name', '?')}", log=log)
+        if mid is None:
+            return
+        if pins.get(str(channel_id)) != mid:
+            pins[str(channel_id)] = mid
+            self._save()
         # baselines de delta avancées seulement après une écriture confirmée (#21)
-        if ok and pending:
-            for k, v in pending.items():
-                self.bot.state.set(k, v)
-
-    async def _emb_materiel(self):
-        inf = self.bot.influx
-        pending = {}          # baselines de delta à persister APRÈS écriture réussie (#21)
-        emb = discord.Embed(title="🔧 Matériel", color=fmt.BLURPLE)
-        emb.timestamp = discord.utils.utcnow()
-        power = await inf.ipmi_power()
-        if power:
-            emb.add_field(name="Alimentation (W)",
-                          value="\n".join(f"{n}: {(v or 0):.0f}" for n, v in power)[:1024] or "—")
-        pc = await inf.power_cost()
-        if pc:
-            try:
-                emb.add_field(
-                    name="💶 Coût électrique",
-                    value=(f"{float(pc.get('watts', 0)):.0f} W · "
-                           f"**{float(pc.get('eur_day', 0)):.2f} €/jour** · "
-                           f"~{float(pc.get('eur_month', 0)):.0f} €/mois "
-                           f"({float(pc.get('kwh_day', 0)):.1f} kWh/j @ "
-                           f"{float(pc.get('tariff_eur_kwh', 0)):.3f} €/kWh)"),
-                    inline=False)
-            except (TypeError, ValueError):
-                pass
-        fans = await inf.ipmi_fans()
-        if fans:
-            emb.add_field(name="Ventilateurs (RPM)",
-                          value="\n".join(f"{n}: {int(v or 0)}" for n, v in fans[:12])[:1024] or "—")
-        temps = [(n, v) for n, v in (await inf.ipmi_temps() or []) if v is not None]
-        if temps:
-            mx = max(v for _, v in temps)
-            emb.add_field(name="Températures (°C)",
-                          value="\n".join(f"{n}: {v:.0f}" for n, v in temps[:12])[:1024])
-            if mx >= 40:
-                emb.color = fmt.RED if mx >= 60 else fmt.YELLOW
-            _p = self.bot.state.get("prov_prev_mat_temp")
-            emb.add_field(name="Δ temp max (depuis refresh)",
-                          value=f"{mx:.0f}°C{_pdelta(mx, _p, '°C')} · seuils ⚠️≥40 / 🔥≥60",
-                          inline=False)
-            pending["prov_prev_mat_temp"] = mx
-        ctrl, summ = await inf.raid()
-        if summ:
-            disks = await inf.raid_disks()
-            gd = max((int(d.get("grown_defects", 0) or 0) for d in disks), default=0)
-            emb.add_field(
-                name="RAID",
-                value=(f"{int(summ.get('disks_online', 0))}/{int(summ.get('disks_total', 0))} online"
-                       + (" · optimal ✅" if (ctrl or {}).get("vd_optimal") else " · ⚠️ dégradé")
-                       + f" · grown max {gd}"))
-            if ctrl and not ctrl.get("vd_optimal"):
-                emb.color = fmt.RED
-        health = await inf.smart_health()
-        if health:
-            bad = [d for d, h in health if not bool(h)]
-            emb.add_field(name="SMART",
-                          value=(f"{len(health) - len(bad)}/{len(health)} sains"
-                                 + (f" · ❌ {bad}" if bad else " ✅"))[:1024])
-            if bad:
-                emb.color = fmt.RED
-        emb.set_footer(text="rafraîchi")
-        return emb, pending
-
-    async def _emb_sauvegardes(self):
-        inf = self.bot.influx
-        pending = {}          # baselines de delta à persister APRÈS écriture réussie (#21)
-        emb = discord.Embed(title="🛟 Sauvegardes (PBS)", color=fmt.GREEN)
-        emb.timestamp = discord.utils.utcnow()
-        summ = await inf.backup_summary()
-        ages = await inf.backup_ages() or []
-        if summ:
-            nob = int(summ.get("guests_without_backup", 0))
-            emb.add_field(name="Plus ancienne",
-                          value=fmt.humanize_duration(summ.get("oldest_age_seconds")))
-            emb.add_field(name="Sans sauvegarde",
-                          value=(f"{nob} / {len(ages)} guests" if ages else str(nob)))
-            if nob:
-                emb.color = fmt.YELLOW
-            _p = self.bot.state.get("prov_prev_nob")
-            emb.add_field(name="Δ sans-backup (depuis refresh)",
-                          value=f"{nob}{_pdelta(nob, _p)}", inline=False)
-            pending["prov_prev_nob"] = nob
-            # volume réel des sauvegardes sur le NAS (logique vs dédupliqué)
-            logical = float(summ.get("total_logical_bytes", 0) or 0)
-            real = float(summ.get("real_used_bytes", 0) or 0)
-            dedup = float(summ.get("dedup_factor", 0) or 0)
-            snaps = int(summ.get("snapshots_total", 0) or 0)
-            if logical:
-                emb.add_field(
-                    name="📦 Volume sauvegardé (sur le NAS)",
-                    value=(f"{fmt.humanize_bytes(logical)} logique → **{fmt.humanize_bytes(real)}** "
-                           f"réel sur disque · dédup **×{dedup:.1f}** · {snaps} snapshots"),
-                    inline=False)
-        lines = []
-        for r in ages:
-            age = r.get("age_seconds")
-            name = r.get("name") or r.get("vmid")
-            sz = r.get("size_bytes")
-            szs = f" · {fmt.humanize_bytes(sz)}" if sz else ""
-            if age is None or age < 0 or not r.get("has_backup"):
-                lines.append(f"❌ **{name}** — aucune")
-                emb.color = fmt.RED
-            else:
-                flag = "⚠️" if age > 108000 else "✅"
-                lines.append(f"{flag} **{name}** — {fmt.humanize_duration(age)}{szs}")
-        if lines:
-            emb.add_field(name="Par guest", value="\n".join(lines)[:1024], inline=False)
-        emb.set_footer(text="rafraîchi")
-        return emb, pending
-
-    async def _emb_stockage(self):
-        inf = self.bot.influx
-        pending = {}          # baselines de delta à persister APRÈS écriture réussie (#21)
-        emb = discord.Embed(title="🗄️ Stockage", color=fmt.BLURPLE)
-        emb.timestamp = discord.utils.utcnow()
-        tp = await inf.thinpool()
-        if tp and tp.get("pool_bytes"):
-            poolb = tp.get("pool_bytes")
-            du = tp.get("data_used_bytes")
-            oc = tp.get("overcommit_percent")
-            # USAGE RÉEL (données écrites / pool) = le VRAI risque : un thinpool plein
-            # corrompt les volumes. C'est LUI qui doit rester < 100 % et pilote la couleur.
-            dp = tp.get("data_percent")
-            if dp is None:
-                dp = (du / poolb * 100) if (du and poolb) else 0.0
-            dp = float(dp)
-            emb.add_field(name=f"Thinpool local-lvm — {dp:.0f}% utilisé",
-                          value=fmt.pct_of(du, poolb, decimals=1))
-            if dp >= 90:
-                emb.color = fmt.RED
-            elif dp >= 85:
-                emb.color = fmt.YELLOW
-            # surallocation = INFO (dépasse 100 % en thin provisioning, c'est normal)
-            if oc is not None:
-                alloc = tp.get("allocated_bytes")
-                oc_ctx = (f" ({fmt.humanize_bytes(alloc)} alloués / {fmt.humanize_bytes(poolb)} pool)"
-                          if alloc is not None else "")
-                emb.add_field(name="Surprovisionnement (info)", value=f"{oc:.0f} %{oc_ctx}")
-        st = await inf.storages()
-        if st:
-            lines = [f"{'⚠️' if s.get('pct', 0) >= 85 else '•'} {s['name']} — "
-                     f"{fmt.pct_of(s.get('used', 0), s.get('total', 0))}"
-                     for s in st[:12]]
-            emb.add_field(name="Storages Proxmox", value="\n".join(lines)[:1024], inline=False)
-            if any(s.get("pct", 0) >= 90 for s in st):
-                emb.color = fmt.RED
-            mxp = max((s.get("pct", 0) for s in st), default=0)
-            _p = self.bot.state.get("prov_prev_sto_pct")
-            emb.add_field(name="Δ remplissage max (depuis refresh)",
-                          value=f"{mxp:.0f}%{_pdelta(mxp, _p, '%')}", inline=False)
-            pending["prov_prev_sto_pct"] = mxp
-        # prévision de saturation (projection linéaire ~7 j) pour les disques qui grossissent
-        fc_lines = []
-        for path in ("/mnt/media", "/"):
-            try:
-                fc = await inf.disk_forecast(path)
-            except Exception:
-                fc = None
-            if fc and fc.get("days") is not None:
-                d = fc["days"]
-                icon = "🔴" if d < 30 else ("🟠" if d < 90 else "🟢")
-                when = "moins d'1 jour" if d < 1 else f"~{d:.0f} jours"
-                # tailles réelles en plus du % (demande Nico 2026-07-20), ex. « 3,3 To / 3,8 To »
-                ub, tb = fc.get("used_bytes"), fc.get("total_bytes")
-                sizes = f" ({fmt.humanize_bytes(ub)} / {fmt.humanize_bytes(tb)})" if (ub and tb) else ""
-                fc_lines.append(f"{icon} `{path}` {fc['current']:.0f}%{sizes} → plein dans **{when}**")
-                if d < 30:
-                    emb.color = fmt.RED
-        if fc_lines:
-            emb.add_field(name="📈 Prévision de saturation",
-                          value="\n".join(fc_lines), inline=False)
-        emb.set_footer(text="rafraîchi")
-        return emb, pending
-
-    async def _emb_seedbox(self):
-        """Seedbox : ratio, upload, VPN/PF, sync, et top torrents uploaders."""
-        inf = self.bot.influx
-        b = self.cfg.influx_bucket
-        pending = {}          # baselines de delta à persister APRÈS écriture réussie (#21)
-
-        def piv(meas, keys):
-            rk = ", ".join(f'"{k}"' for k in keys)
-            return (f'from(bucket:"{b}") |> range(start:-6m) '
-                    f'|> filter(fn:(r)=> r._measurement=="{meas}") |> last() '
-                    f'|> pivot(rowKey:[{rk}], columnKey:["_field"], valueColumn:"_value")')
-
-        qbr = await inf.aq(piv("qbittorrent", ["host"]))
-        vpnr = await inf.aq(piv("servarr_vpn", ["host", "country"]))
-        syncr = await inf.aq(piv("servarr_sync", ["host"]))
-        qb = qbr[0] if qbr else {}
-        vpn = vpnr[0] if vpnr else {}
-        sync = syncr[0] if syncr else {}
-
-        # Stats C411 = EXACTEMENT celles de #ratio : même source de vérité, partagée via
-        # Servarr.c411_snapshot() (relève officielle tracker > estimation /setratio+qBit >
-        # saisie manuelle) — jamais les chiffres locaux qBittorrent (ratio de session,
-        # upload/download cumulés du client) qui en divergent.
-        srv = self.bot.get_cog("Servarr")
-        snap = await srv.c411_snapshot() if srv else None
-        if snap:
-            ratio, up_to, dl_go = snap["ratio"], snap["up_to"], snap["dl_go"]
-            bonus, src = snap["bonus_go"], snap["source"]
-        else:   # repli si le cog Servarr n'est pas chargé
-            c411 = self.bot.state.get("c411") or {}
-            ratio = float(c411.get("ratio", 0) or 0) or float(qb.get("ratio", 0) or 0)
-            up_to = float(c411.get("up_to", 0) or 0)
-            dl_go = float(c411.get("dl_go", 0) or 0)
-            bonus = float(c411.get("bonus_go", 0) or 0)
-            src = "manuel"
-        color = fmt.GREEN if ratio >= 1 else (fmt.YELLOW if ratio >= 0.8 else fmt.RED)
-        emb = discord.Embed(title="🧲 Seedbox — ratio & torrents", color=color)
-        emb.timestamp = discord.utils.utcnow()
-        if not qb:
-            emb.description = "Aucune donnée (collecteur `servarr-metrics` muet ?)."
-            emb.color = fmt.RED
-            emb.set_footer(text="rafraîchi")
-            return emb, pending
-
-        emb.add_field(name=f"Ratio C411 ({src})", value=f"**{ratio:.2f}**")
-        b_label = "crédit" if src == "officiel" else "bonus"
-        up_bonus = f"\n(dont {bonus:.1f} Go {b_label})" if bonus >= 0.1 else ""
-        emb.add_field(name="⬆️ Upload C411", value=f"{up_to:.3f} To{up_bonus}")
-        emb.add_field(name="⬇️ Download C411", value=f"{dl_go:.1f} Go")
-        emb.add_field(name="Débit ↑ / ↓",
-                      value=f"{fmt.humanize_rate(qb.get('up_speed',0) or 0)} / "
-                            f"{fmt.humanize_rate(qb.get('dl_speed',0) or 0)}")
-        emb.add_field(name="Torrents",
-                      value=f"{int(qb.get('seeding',0) or 0)} seed / {int(qb.get('torrents_total',0) or 0)}")
-        emb.add_field(name="Pairs", value=str(int(qb.get("peers", 0) or 0)))
-        ul = int(qb.get("alltime_ul", 0) or 0)
-        _p = self.bot.state.get("prov_prev_seed_ul")
-        d = ul - int(_p) if _p is not None else 0
-        emb.add_field(name="📈 Uploadé depuis le refresh",
-                      value=(f"▲ {fmt.humanize_bytes(d)}" if d > 0 else "—"), inline=False)
-        pending["prov_prev_seed_ul"] = ul
-
-        if vpn:
-            up = int(vpn.get("up", 0) or 0)
-            pf = int(vpn.get("pf_ok", 0) or 0)
-            extra = (f" · 🔁 sync {fmt.status_emoji(int(sync.get('usersync_up',0) or 0))}"
-                     if sync else "")
-            emb.add_field(
-                name="VPN & sync", inline=False,
-                value=f"{fmt.status_emoji(up)} {vpn.get('country','?')} "
-                      f"(`{vpn.get('egress','?')}`) · Port-forward "
-                      f"{'✅' if pf else '❌'} :{int(vpn.get('listen_port',0) or 0)}{extra}")
-
-        top_flux = (
-            f'from(bucket:"{b}") |> range(start:-8m) '
-            f'|> filter(fn:(r)=> r._measurement=="qbit_torrent" '
-            f'and (r._field=="uploaded" or r._field=="upspeed")) |> last() '
-            f'|> pivot(rowKey:["name"], columnKey:["_field"], valueColumn:"_value") '
-            f'|> group() |> sort(columns:["uploaded"], desc:true) |> limit(n:10)')
-        tops = await inf.aq(top_flux)
-        if tops:
-            lines = []
-            for i, t in enumerate(tops, 1):
-                up = t.get("uploaded", 0) or 0
-                sp = t.get("upspeed", 0) or 0
-                nm = str(t.get("name", "?"))[:46]
-                arrow = f" ↑{fmt.humanize_rate(sp)}" if sp > 0 else ""
-                lines.append(f"`{i:>2}.` **{fmt.humanize_bytes(up)}**{arrow} · {nm}")
-            emb.add_field(name="🏆 Top uploaders", value="\n".join(lines)[:1024], inline=False)
-        emb.set_footer(text="rafraîchi")
-        return emb, pending
-
-    async def _emb_nas(self, h=None):
-        """NAS Synology DS216se : capacité (via l'API PVE) + santé SNMP (si activé).
-
-        `h` = relevé nas_health() déjà en main (refresh_topical le partage entre les
-        5 embeds du cycle) ; None = on le récupère nous-mêmes (bouton Rafraîchir)."""
-        pending = {}
-        inf = self.bot.influx
-        cap = await inf.nas_capacity()
-        h = await self._nas_health(h)
-        sysd = (h or {}).get("system") or {}
-        color = fmt.GREEN
-        emb = discord.Embed(title="🗄️ NAS Synology — DS216se", color=color)
-        emb.timestamp = discord.utils.utcnow()
-        # --- capacité (toujours dispo, lue côté hyperviseur) ---
-        if cap:
-            total = float(cap.get("total", 0) or 0)
-            used = float(cap.get("used", 0) or 0)
-            pct = (used / total * 100) if total else 0
-            emb.add_field(
-                name="Capacité (volume de sauvegarde)",
-                value=f"{fmt.pct_bar(pct)}\n{fmt.pct_of(used, total, decimals=1)}",
-                inline=False)
-            if pct >= 90:
-                color = fmt.RED
-            elif pct >= 75:
-                color = fmt.YELLOW
-        else:
-            emb.add_field(name="Capacité", value="— (collecteur muet ?)", inline=False)
-        # --- santé (SNMP) ---
-        if sysd:
-            # _syno_i partout (2026-08-11) : ces conversions étaient les SEULES du cog à
-            # ne pas passer par le helper — un champ SNMP textuel levait un ValueError
-            # qui, avant l'isolation par salon de refresh_topical, emportait aussi
-            # #reseau et #services.
-            t = self._syno_i(sysd, "system_temp_c")
-            st = self._syno_i(sysd, "system_status")
-            fan = self._syno_i(sysd, "system_fan_status")
-            emb.add_field(name="Système",
-                          value=f"{'🟢' if st == 1 else '🔴'} état · {t}°C · "
-                                f"ventilo {'🟢' if fan == 1 else '🔴'}")
-            dlines = []
-            for d in ((h or {}).get("disks") or []):
-                ds = self._syno_i(d, "status")
-                dlines.append(f"{'🟢' if ds == 1 else '🔴'} {d.get('disk_id', '?')} — {d.get('temp_c', '?')}°C")
-                if ds != 1:
-                    color = fmt.RED
-            if dlines:
-                emb.add_field(name="Disques", value="\n".join(dlines)[:1024], inline=False)
-            bad = 0
-            for r in ((h or {}).get("smart") or []):
-                bad += self._syno_i(r, "raw")
-            if bad:
-                emb.add_field(name="⚠️ Secteurs défectueux (SMART)",
-                              value=f"**{bad}** — `sda` à surveiller / remplacer", inline=False)
-                color = fmt.RED
-            for rd in ((h or {}).get("raid") or []):
-                rs = self._syno_i(rd, "status")
-                emb.add_field(name="RAID",
-                              value=f"{'🟢 Normal' if rs == 1 else ('🟠 Dégradé' if rs == 11 else '🔴 Critique')}"
-                                    f" ({rd.get('raid_name', '?')})")
-                if rs != 1:
-                    color = fmt.RED
-        else:
-            emb.add_field(
-                name="Santé disques / SMART / RAID / température",
-                value="⚠️ Indisponible — **active SNMP** sur le NAS (DSM → Panneau de config → "
-                      "Terminal & SNMP → cocher SNMP, communauté `homelab`). Ça se remplira tout seul.",
-                inline=False)
-        emb.color = color
-        emb.set_footer(text="capacité via PVE · santé via SNMP · rafraîchi")
-        return emb, pending
-
-    # ------------------------------------------------ NAS Synology (serveur SYNO)
-    # Toutes les valeurs viennent des mesures synology* d'InfluxDB, alimentées par
-    # l'input SNMP de Telegraf sur l'hyperviseur. Le bot ne parle jamais au NAS
-    # directement, et n'a aucun moyen d'agir dessus : supervision en lecture seule.
-    async def _nas_health(self, h=None):
-        """Relevé SNMP du NAS, mutualisé sur un cycle (2026-08-11).
-
-        `influx.nas_health()` enchaîne 4 requêtes Flux et n'a AUCUN cache ; les
-        5 embeds du NAS (#nas + les 4 salons SYNO) l'appelaient chacun le leur, soit
-        20 requêtes identiques par cycle de 2 min. `refresh_topical` en fait UN et le
-        passe aux builders — ça borne aussi la cohérence : les 5 embeds d'un même cycle
-        décrivent le même instantané."""
-        return h if h is not None else await self.bot.influx.nas_health()
-
-    @staticmethod
-    def _syno_i(d, key, default=0):
-        """Champ SNMP -> entier (Influx renvoie des flottants, parfois des chaînes)."""
-        try:
-            return int(float((d or {}).get(key, default) or default))
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _syno_muet():
-        """Message unique quand SNMP ne répond plus, pour ne pas laisser un salon vide
-        sans explication (cause la plus fréquente : SNMP décoché dans DSM)."""
-        emb = discord.Embed(
-            title="🗄️ NAS Synology — pas de données",
-            description="Aucune métrique SNMP depuis plus de 15 minutes.\n"
-                        "À vérifier : DSM → Panneau de configuration → **Terminal & SNMP** "
-                        "(SNMP v2c coché, communauté `homelab`), et que le NAS est allumé.",
-            color=fmt.GREY)
-        emb.timestamp = discord.utils.utcnow()
-        return emb, {}
-
-    async def _emb_syno_sante(self, h=None):
-        h = await self._nas_health(h)
-        sysd = (h or {}).get("system") or {}
-        if not sysd:
-            return self._syno_muet()
-        st = self._syno_i(sysd, "system_status")
-        power = self._syno_i(sysd, "power_status")
-        sfan = self._syno_i(sysd, "system_fan_status")
-        cfan = self._syno_i(sysd, "cpu_fan_status")
-        temp = self._syno_i(sysd, "system_temp_c")
-        ok = lambda v: "🟢" if v == 1 else "🔴"
-        color = fmt.GREEN if all(v == 1 for v in (st, power, sfan, cfan)) else fmt.RED
-        if color == fmt.GREEN and temp >= 50:
-            color = fmt.YELLOW
-
-        emb = discord.Embed(
-            title=f"🗄️ {sysd.get('model') or 'Synology'} — santé",
-            color=color)
-        emb.timestamp = discord.utils.utcnow()
-        emb.add_field(name="État", value=f"{ok(st)} système\n{ok(power)} alimentation")
-        emb.add_field(name="Refroidissement",
-                      value=f"{ok(sfan)} ventilateur\n{ok(cfan)} ventilateur CPU")
-        emb.add_field(name="Température", value=f"**{temp} °C**")
-
-        up = self._syno_i(sysd, "uptime")          # Timeticks = centièmes de seconde
-        load = self._syno_i(sysd, "load1_x100") / 100.0
-        idle = self._syno_i(sysd, "cpu_idle_pct", 100)
-        emb.add_field(name="Charge",
-                      value=f"CPU {max(0, 100 - idle)} % · charge {load:.2f}")
-        total_kb = self._syno_i(sysd, "mem_total_kb")
-        if total_kb:
-            libre_kb = (self._syno_i(sysd, "mem_avail_kb")
-                        + self._syno_i(sysd, "mem_buffer_kb")
-                        + self._syno_i(sysd, "mem_cached_kb"))
-            used = max(0, total_kb - libre_kb) * 1024
-            emb.add_field(name="Mémoire",
-                          value=fmt.pct_of(used, total_kb * 1024, decimals=1))
-        if up:
-            emb.add_field(name="Allumé depuis", value=fmt.humanize_duration(up / 100))
-
-        maj = self._syno_i(sysd, "upgrade_available")
-        if maj == 1:
-            emb.add_field(name="Mise à jour DSM",
-                          value="🟠 Une mise à jour est disponible", inline=False)
-        # dsm_version contient déjà « DSM 7.1-… » : ne pas préfixer une seconde fois.
-        emb.set_footer(text=f"{sysd.get('dsm_version') or 'DSM ?'} · SNMP · lecture seule")
-        return emb, {}
-
-    async def _emb_syno_disques(self, h=None):
-        h = await self._nas_health(h)
-        disks = (h or {}).get("disks") or []
-        if not disks:
-            return self._syno_muet()
-        # SMART brut par disque : c'est LA valeur qui dit si un disque se dégrade.
-        smart = {}
-        for r in (h.get("smart") or []):
-            dev = (r.get("dev") or "").rsplit("/", 1)[-1]
-            smart.setdefault(dev, {})[r.get("attr_name")] = self._syno_i(r, "raw")
-
-        emb = discord.Embed(title="🗄️ NAS Synology — disques", color=fmt.GREEN)
-        emb.timestamp = discord.utils.utcnow()
-        pire = 0                                   # 0 = sain, 1 = à surveiller, 2 = grave
-        for d in sorted(disks, key=lambda x: str(x.get("disk_id"))):
-            status = self._syno_i(d, "status")
-            health = self._syno_i(d, "health_status")
-            bad = self._syno_i(d, "bad_sector")
-            temp = self._syno_i(d, "temp_c")
-            # status 1 = Normal (2+ = souci) ; health 1 = Normal, 2 = Warning, 3+ = Critical.
-            niveau = 2 if (status != 1 or health >= 3) else (1 if (health == 2 or bad) else 0)
-            pire = max(pire, niveau)
-            mark = ("🟢", "🟠", "🔴")[niveau]
-            lignes = [f"{d.get('disk_model') or '?'} · **{temp} °C**",
-                      f"⚠️ **{bad}** secteur(s) défectueux" if bad
-                      else "aucun secteur défectueux"]
-            # « Disk 1 » -> sda, « Disk 2 » -> sdb : DSM numérote les baies à partir de 1
-            # et nomme les périphériques dans le même ordre.
-            num = "".join(c for c in str(d.get("disk_id") or "") if c.isdigit())
-            devsm = smart.get(f"sd{chr(ord('a') + int(num) - 1)}", {}) if num else {}
-            if devsm:
-                lignes.append(f"SMART : {devsm.get('Reallocated_Sector_Ct', 0)} réalloué(s), "
-                              f"{devsm.get('Current_Pending_Sector', 0)} en attente")
-            emb.add_field(name=f"{mark} {d.get('disk_id') or '?'}",
-                          value="\n".join(lignes), inline=False)
-        emb.color = (fmt.GREEN, fmt.YELLOW, fmt.RED)[pire]
-        emb.set_footer(text="SNMP · un secteur réalloué isolé et stable n'est pas alarmant ; "
-                            "c'est sa progression qui compte")
-        return emb, {}
-
-    async def _emb_syno_volumes(self, h=None):
-        h = await self._nas_health(h)
-        raids = (h or {}).get("raid") or []
-        if not raids:
-            return self._syno_muet()
-        emb = discord.Embed(title="🗄️ NAS Synology — volumes", color=fmt.GREEN)
-        emb.timestamp = discord.utils.utcnow()
-        pire = 0                                   # 0 = sain, 1 = à surveiller, 2 = grave
-        for rd in sorted(raids, key=lambda x: str(x.get("raid_name"))):
-            nom = str(rd.get("raid_name") or "?")
-            status = self._syno_i(rd, "status")
-            total = self._syno_i(rd, "total_bytes")
-            free = self._syno_i(rd, "free_bytes")
-            # status : 1 = Normal, 11 = Dégradé, 12 = Crashé (2-10 = états transitoires).
-            etat = ("🟢 Normal" if status == 1
-                    else ("🟠 Dégradé" if status == 11 else "🔴 Critique"))
-            if status != 1:
-                pire = 2
-            # Un « Storage Pool » affiche comme espace libre ce qui n'est pas encore
-            # ALLOUÉ à un volume : une fois le volume créé il tombe à zéro, ce qui est
-            # normal. En faire une barre de remplissage afficherait 100 % en permanence
-            # et rendrait le salon rouge à tort — seuls les volumes sont mesurés.
-            if "pool" in nom.lower():
-                emb.add_field(name=f"{nom} — {etat}",
-                              value=f"{fmt.humanize_bytes(total)} de disques\n"
-                                    f"{fmt.humanize_bytes(free)} non alloués",
-                              inline=False)
-                continue
-            used = max(0, total - free)
-            pct = (used / total * 100) if total else 0
-            pire = max(pire, 2 if pct >= 90 else (1 if pct >= 75 else 0))
-            emb.add_field(
-                name=f"{nom} — {etat}",
-                value=f"{fmt.pct_bar(pct)}\n{fmt.pct_of(used, total, decimals=1)}",
-                inline=False)
-        emb.color = (fmt.GREEN, fmt.YELLOW, fmt.RED)[pire]
-        emb.set_footer(text="SNMP · « Storage Pool » = le groupe de disques, "
-                            "« Volume » = l'espace utilisable dessus")
-        return emb, {}
-
-    async def _emb_syno_fiche(self, h=None):
-        """Fiche détaillée, catégorie Lock : identité de la machine + SMART complet."""
-        h = await self._nas_health(h)
-        sysd = (h or {}).get("system") or {}
-        if not sysd:
-            return self._syno_muet()
-        emb = discord.Embed(title="🗄️ NAS Synology — fiche détaillée", color=fmt.BLURPLE)
-        emb.timestamp = discord.utils.utcnow()
-        emb.add_field(name="Modèle", value=str(sysd.get("model") or "?"))
-        emb.add_field(name="DSM", value=str(sysd.get("dsm_version") or "?"))
-        serial = sysd.get("serial")
-        if serial:
-            emb.add_field(name="N° de série", value=f"`{serial}`")
-        emb.add_field(name="Adresse", value=f"`{getattr(self.cfg, 'syno_host', '?')}`")
-
-        for d in sorted((h.get("disks") or []), key=lambda x: str(x.get("disk_id"))):
-            emb.add_field(
-                name=str(d.get("disk_id") or "?"),
-                value=f"{d.get('disk_model') or '?'}\n"
-                      f"{self._syno_i(d, 'temp_c')} °C · "
-                      f"{self._syno_i(d, 'bad_sector')} secteur(s) défectueux",
-                inline=False)
-        lignes = []
-        for r in sorted((h.get("smart") or []),
-                        key=lambda x: (str(x.get("dev")), str(x.get("attr_name")))):
-            lignes.append(f"`{(r.get('dev') or '?').rsplit('/', 1)[-1]}` "
-                          f"{r.get('attr_name')} = **{self._syno_i(r, 'raw')}**")
-        if lignes:
-            emb.add_field(name="SMART (valeurs brutes)",
-                          value="\n".join(lignes[:12]), inline=False)
-        emb.set_footer(text="SNMP · lecture seule · M/O SYNO uniquement")
-        return emb, {}
-
-    async def _emb_reseau(self):
-        """Réseau : routeur CRS305 (SNMP), WAN (ping/speedtest), services publics (uptime)."""
-        pending = {}
-        inf = self.bot.influx
-        rt = await inf.router_status()
-        wan = await inf.wan_status()
-        vh = await inf.vhost_uptime()
-        color = fmt.GREEN
-        emb = discord.Embed(title="🌐 Réseau — routeur · WAN · services publics", color=color)
-        emb.timestamp = discord.utils.utcnow()
-
-        def f(d, k):
-            try:
-                return float(d.get(k, 0) or 0)
-            except (TypeError, ValueError):
-                return 0.0
-
-        h = rt.get("host") or {}
-        if h:
-            mt, mu = f(h, "mem_total_blocks"), f(h, "mem_used_blocks")
-            mempct = (mu / mt * 100) if mt else 0
-            temp = f(h, "cpu_temp")
-            emb.add_field(
-                name="🧭 Routeur CRS305",
-                value=(f"🟢 en ligne · CPU {f(h, 'cpu_load'):.0f}% · {temp:.0f}°C · "
-                       f"RAM {mempct:.0f}% · uptime {fmt.humanize_duration(int(f(h, 'uptime') / 100))}"),
-                inline=False)
-            if temp >= 65:
-                color = fmt.RED
-        else:
-            emb.add_field(name="🧭 Routeur CRS305", value="⚠️ pas de données SNMP", inline=False)
-        # WAN latence + débit
-        inet = [r for r in (wan.get("ping") or []) if r.get("url") in ("1.1.1.1", "8.8.8.8")]
-        if inet:
-            avg = sum(f(r, "average_response_ms") for r in inet) / len(inet)
-            loss = max(f(r, "percent_packet_loss") for r in inet)
-            we = "🟢" if loss == 0 else ("🟠" if loss < 20 else "🔴")
-            emb.add_field(name="🌍 Internet (WAN)",
-                          value=f"{we} latence {avg:.0f} ms · perte {loss:.0f}%")
-            if loss >= 20:
-                color = fmt.RED
-        sp = wan.get("speedtest") or {}
-        if sp:
-            emb.add_field(name="⚡ Débit fibre",
-                          value=f"↓ {f(sp, 'down_mbps'):.0f} / ↑ {f(sp, 'up_mbps'):.0f} Mbit/s")
-        # services publics (uptime synthétique)
-        if vh:
-            up, downs = 0, []
-            for r in vh:
-                code = int(f(r, "http_response_code"))
-                (downs.append(r.get("site")) if not (0 < code < 500) else None)
-                up += 1 if 0 < code < 500 else 0
-            val = f"**{up}/{len(vh)}** en ligne"
-            if downs:
-                val += "\n🔴 DOWN : " + ", ".join(d for d in downs if d)
-                color = fmt.RED
-            # 1024 = limite Discord d'un champ d'embed : sans la coupe, une panne
-            # généralisée (tous les vhosts DOWN) faisait rejeter l'embed entier.
-            emb.add_field(name="🔗 Services publics (HTTPS)", value=val[:1024], inline=False)
-        emb.color = color
-        emb.set_footer(text="routeur SNMP · WAN ping/speedtest · uptime synthétique · rafraîchi")
-        return emb, pending
-
-    async def _emb_services(self):
-        """Santé niveau service (sondes TCP/HTTP) : Postgres/Vaultwarden/mail/*arr…"""
-        pending = {}
-        sh = await self.bot.influx.service_health()
-        color = fmt.GREEN
-        emb = discord.Embed(title="🩺 Santé des services", color=color)
-        emb.timestamp = discord.utils.utcnow()
-
-        def ms(d):
-            try:
-                return float(d.get("response_time", 0) or 0) * 1000
-            except (TypeError, ValueError):
-                return 0.0
-        rows = []
-        for r in (sh.get("net") or []):
-            rows.append((r.get("service"), str(r.get("result_code")) in ("0", "0.0"), ms(r)))
-        for r in (sh.get("http") or []):
-            try:
-                code = int(float(r.get("http_response_code", 0) or 0))
-            except (TypeError, ValueError):
-                code = 0
-            ok = str(r.get("result_code")) in ("0", "0.0") and 0 < code < 500
-            rows.append((r.get("service"), ok, ms(r)))
-        rows.sort(key=lambda x: (x[1], x[0] or ""))
-        body, down = [], 0
-        for name, ok, m in rows:
-            if not name:
-                continue
-            body.append(f"{'🟢' if ok else '🔴'} **{name}** · {m:.0f} ms")
-            down += 0 if ok else 1
-        if down:
-            color = fmt.RED
-        emb.description = (f"⚠️ **{down} service(s) KO**" if down
-                           else "✅ Tous les services répondent")
-        if body:
-            emb.add_field(name="Services", value="\n".join(body)[:1024], inline=False)
-        emb.color = color
-        emb.set_footer(text="sondes TCP/HTTP toutes les 30 s · rafraîchi")
-        return emb, pending
+        for k, v in (pending or {}).items():
+            self.bot.state.set(k, v)
 
     # ------------------------------------------------------------------ loops
 
@@ -1939,7 +1045,7 @@ class Provision(commands.Cog):
         if not cid:
             return
         try:
-            emb, pending = await self._emb_seedbox()
+            emb, pending = await embeds.emb_seedbox(self.bot)
         except Exception:
             # appelé depuis /setratio (cog Servarr) : une erreur d'embed ne doit pas
             # faire échouer la commande de l'utilisateur (2026-08-11).
@@ -1953,37 +1059,27 @@ class Provision(commands.Cog):
             return
         s = self.prov.get("super", {})
         sy = self.prov.get("syno", {}) if self._syno_enabled() else {}
-        syno_todo = [(k, b) for k, b in (("sante", self._emb_syno_sante),
-                                         ("disques", self._emb_syno_disques),
-                                         ("volumes", self._emb_syno_volumes),
-                                         ("fiche", self._emb_syno_fiche))
-                     if sy.get(k)]
+        syno_todo = [(k, b) for k, b in embeds.SYNO_BUILDERS.items() if sy.get(k)]
         # UN SEUL relevé SNMP par cycle (2026-08-11) : nas_health() enchaîne 4 requêtes
         # Flux sans aucun cache et il était appelé par les 5 embeds du NAS — 20 requêtes
         # identiques toutes les 2 min. Bonus : les 5 embeds décrivent le même instantané.
         nas_h = None
         if s.get("nas") or syno_todo:
             try:
-                nas_h = await self._nas_health()
+                nas_h = await embeds.nas_health(self.bot)
             except Exception:
                 log.exception("relevé SNMP du NAS illisible ce cycle")
 
         # un try PAR salon (2026-08-11) : les 7 salons partageaient un seul try, donc la
         # première exception sautait tous les suivants — #reseau et #services muets à
         # cause d'une donnée SNMP du NAS. Le bloc SYNO ci-dessous faisait déjà l'inverse.
-        # Table construite ici (et pas au niveau classe) : ce sont des méthodes LIÉES.
-        for key, builder in (("materiel", self._emb_materiel),
-                             ("sauvegardes", self._emb_sauvegardes),
-                             ("stockage", self._emb_stockage),
-                             ("seedbox", self._emb_seedbox),
-                             ("nas", self._emb_nas),
-                             ("reseau", self._emb_reseau),
-                             ("services", self._emb_services)):
+        for key, builder in embeds.BUILDERS.items():
             if not s.get(key):
                 continue
             try:
-                emb, pending = (await builder(nas_h) if key == "nas"
-                                else await builder())
+                # tous les constructeurs ont la même signature (bot, h) : ceux qui
+                # n'ont pas besoin du relevé SNMP l'ignorent.
+                emb, pending = await builder(self.bot, nas_h)
                 await self._pinned_edit(s[key], emb, pending)
             except Exception:
                 log.exception("rafraîchissement du salon « %s » échoué", key)
@@ -1992,7 +1088,7 @@ class Provision(commands.Cog):
         # empêcher le rafraîchissement des salons R820 ci-dessus (ni l'inverse).
         for key, builder in syno_todo:
             try:
-                emb, pending = await builder(nas_h)
+                emb, pending = await builder(self.bot, nas_h)
                 await self._pinned_edit(sy[key], emb, pending)
             except Exception:
                 log.exception("rafraîchissement du salon NAS « %s » échoué", key)
@@ -2023,28 +1119,19 @@ class TopicalRefreshView(GatedView):
     def _builders(self):
         """{id de salon: constructeur d'embed}. Les 4 salons du NAS y étaient ABSENTS
         (2026-08-11) alors que `_pinned_edit` attache cette vue à TOUS les embeds
-        épinglés : le bouton y acquittait sans rien faire ni rien dire."""
+        épinglés : le bouton y acquittait sans rien faire ni rien dire. Les deux tables
+        de provision_embeds ferment la classe : un salon ajouté là-bas est rafraîchi
+        par la boucle ET par le bouton, sans liste à tenir à jour ici."""
         s = self.cog.prov.get("super", {}) or {}
         sy = self.cog.prov.get("syno", {}) or {}
-        out = {
-            s.get("materiel"): self.cog._emb_materiel,
-            s.get("sauvegardes"): self.cog._emb_sauvegardes,
-            s.get("stockage"): self.cog._emb_stockage,
-            s.get("seedbox"): self.cog._emb_seedbox,
-            s.get("nas"): self.cog._emb_nas,
-            s.get("reseau"): self.cog._emb_reseau,
-            s.get("services"): self.cog._emb_services,
-            sy.get("sante"): self.cog._emb_syno_sante,
-            sy.get("disques"): self.cog._emb_syno_disques,
-            sy.get("volumes"): self.cog._emb_syno_volumes,
-            sy.get("fiche"): self.cog._emb_syno_fiche,
-        }
+        out = {s.get(k): fn for k, fn in embeds.BUILDERS.items()}
+        out.update({sy.get(k): fn for k, fn in embeds.SYNO_BUILDERS.items()})
         out.pop(None, None)          # salon non provisionné -> clé None parasite
         return out
 
     async def resolve_server(self, interaction):
         """Les salons du NAS sont gardés par les rôles M/O SYNO (ils sont provisionnés
-        avec _srv_overwrites_fn(syno_key)) ; ailleurs, tier R820 comme avant."""
+        avec perms.srv_overwrites_fn(cfg, syno_key)) ; ailleurs, tier R820 comme avant."""
         if interaction.channel_id in self._syno_ids():
             return self.cog.syno_key
         return None
@@ -2060,7 +1147,8 @@ class TopicalRefreshView(GatedView):
             return
         await itx.response.defer()
         try:
-            emb, pending = await fn()
+            # h=None : le bouton relève lui-même le NAS (pas de cycle à partager)
+            emb, pending = await fn(self.cog.bot)
         except Exception:
             log.exception("bouton Rafraîchir : construction de l'embed échouée (salon %s)",
                           itx.channel_id)

@@ -8,16 +8,15 @@ restarts instead of spamming.
 limite de débit Discord (le graphe est resté sur le bouton 📈, à la demande). Le
 docstring annonçait encore « + CPU/RAM graph » (corrigé 2026-08-11)."""
 import asyncio
-import json
 import logging
 import time
-import urllib.request
 
 import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
 from ..core.gates import GatedView
+from ..core.http import ApiClient
 from ..core.permissions import is_guild_owner
 from ..views.confirm import ConfirmView
 from .docker import _emoji as _docker_emoji
@@ -153,7 +152,7 @@ class CtChannels(commands.Cog):
         if not running:
             return
         try:
-            rows = await asyncio.to_thread(self.bot.pve.guest_rrd, vmid, gtype, "hour")
+            rows = await self.bot.pve.acall(self.bot.pve.guest_rrd, vmid, gtype, "hour")
             last = rows[-1] if rows else {}
         except Exception:
             last = {}
@@ -164,7 +163,7 @@ class CtChannels(commands.Cog):
 
         if gtype == "qemu":
             try:
-                ag = await asyncio.to_thread(self.bot.pve.agent_info, vmid)
+                ag = await self.bot.pve.acall(self.bot.pve.agent_info, vmid)
             except Exception:
                 ag = None
             if ag:
@@ -353,25 +352,25 @@ class CtChannels(commands.Cog):
         key = getattr(cfg, "jellyfin_api_key", "") or ""
         if not (url and key):
             return None
-
-        def _sync():
-            # Jellyfin 10.11 : header MediaBrowser Token (ignore X-Emby-Token / api_key=).
-            req = urllib.request.Request(
-                url + "/Sessions?ActiveWithinSeconds=600",
-                headers={"Authorization": f'MediaBrowser Token="{key}"'})
-            with urllib.request.urlopen(req, timeout=6) as r:
-                return json.loads(r.read())
-
-        try:
-            data = await asyncio.to_thread(_sync)
-        except Exception as e:
-            # debug : Jellyfin muet = cas nominal quand CT120 est arrêté, et on retombe
-            # proprement sur InfluxDB — mais l'erreur exacte (401 = clé périmée) doit
-            # rester trouvable au lieu d'être avalée en silence (2026-08-11).
-            log.debug("jellyfin /Sessions indisponible: %s", e)
+        # Jellyfin 10.11 : header MediaBrowser Token (ignore X-Emby-Token / api_key=).
+        jf = ApiClient(url, {"Authorization": f'MediaBrowser Token="{key}"'},
+                       timeout=6, label="jellyfin")
+        # quiet=True : Jellyfin muet = cas nominal quand CT120 est arrêté, et on retombe
+        # proprement sur InfluxDB — mais l'erreur exacte (401 = clé périmée) doit rester
+        # trouvable dans le journal de debug au lieu d'être avalée en silence (2026-08-11).
+        data = await jf.aget("/Sessions", {"ActiveWithinSeconds": 600}, quiet=True)
+        # None = appel EN ÉCHEC, et rien d'autre : c'est ce qui déclenche le repli sur
+        # InfluxDB chez l'appelant. Une liste VIDE, elle, veut dire « personne ne
+        # regarde » et doit être affichée comme telle.
+        # /Sessions renvoie un TABLEAU : tout le reste est une réponse anormale (corps
+        # vide rendu en {} par request_json, page d'erreur JSON d'un reverse-proxy…) et
+        # doit valoir « API indispo » -> repli, comme avant l'adoption de core.http.
+        # Sans ce test, itérer un dict donnerait ses CLÉS (str) et `s.get` lèverait,
+        # faisant échouer tout l'embed du salon (relecture 2026-08-11).
+        if not isinstance(data, list):
             return None
         out = []
-        for s in data or []:
+        for s in data:
             it = s.get("NowPlayingItem")
             if not it:
                 continue
@@ -416,7 +415,7 @@ class CtChannels(commands.Cog):
         if not self.bot.pve.enabled:
             return set()
         try:
-            return await asyncio.to_thread(self.bot.pve.running_vzdump_vmids)
+            return await self.bot.pve.acall(self.bot.pve.running_vzdump_vmids)
         except Exception:
             # lecture réseau faillible : une liste de tâches illisible ne doit pas
             # avorter TOUT le cycle (embeds non rafraîchis) — au pire l'emoji 🟠
@@ -650,37 +649,6 @@ class CtControlView(GatedView):
             return False
         return await super().interaction_check(interaction)
 
-    async def _poll(self, upid, timeout=45):
-        """Suit une tâche PVE jusqu'à `timeout` secondes de temps RÉEL.
-
-        Même correctif que `Actions._poll` (2026-08-11), qui avait le défaut ici encore :
-        - un SEUL hoquet (pveproxy rechargé, tunnel WG qui clignote sur un UPID « avy: »)
-          terminait le suivi sur « unknown » alors que la tâche continue côté PVE, ce qui
-          fait passer une sauvegarde RÉUSSIE pour un échec. On tolère 5 échecs consécutifs.
-        - la borne était un COMPTE d'itérations supposant 3 s par tour ; un échec réseau
-          coûte le timeout distant (jusqu'à 30 s), donc la durée réelle dérivait très
-          au-delà des 45 s annoncées. La borne est désormais l'horloge murale.
-        « lost » ≠ échec : c'est NOTRE suivi qui s'arrête, pas la tâche.
-        """
-        deadline = time.monotonic() + max(2, timeout)
-        fails = 0
-        while time.monotonic() < deadline:
-            try:
-                st = await self.cog.bot.pve.atask_status(upid)
-            except Exception:
-                fails += 1
-                if fails >= 5:
-                    log.warning("suivi de la tâche %s abandonné (%d échecs consécutifs) "
-                                "— la tâche continue côté PVE", upid, fails, exc_info=True)
-                    return "lost"
-                await asyncio.sleep(2)
-                continue
-            fails = 0
-            if st.get("status") == "stopped":
-                return st.get("exitstatus") or "OK"
-            await asyncio.sleep(3)
-        return "running"
-
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="ctchannels:refresh")
     async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
@@ -744,9 +712,9 @@ class CtControlView(GatedView):
         vm = {"start": bot.pve.start_vm, "stop": bot.pve.shutdown_vm, "restart": bot.pve.reboot_vm}
         try:
             if act == "backup":
-                upid = await asyncio.to_thread(bot.pve.backup, vmid)
+                upid = await bot.pve.acall(bot.pve.backup, vmid)
             else:
-                upid = await asyncio.to_thread((vm if gtype == "qemu" else lxc)[act], vmid)
+                upid = await bot.pve.acall((vm if gtype == "qemu" else lxc)[act], vmid)
         except Exception as e:
             bot.audit.record(user=who, action=act, target=f"{name}/{vmid}", result=f"error:{e}")
             await itx.followup.send(f"❌ Échec : `{e}`", ephemeral=True)
@@ -759,7 +727,9 @@ class CtControlView(GatedView):
                 ephemeral=True)
             return
         await itx.followup.send(f"⏳ **{verb}** lancé sur **{name}** — suivi…", ephemeral=True)
-        outcome = await self._poll(str(upid))
+        # suivi partagé (Pve.apoll_task) : cadence de 3 s conservée, et « lost » ≠ échec —
+        # c'est NOTRE suivi qui s'arrête, pas la tâche (rendu par fmt.outcome_text).
+        outcome = await bot.pve.apoll_task(str(upid), timeout=45, poll_every=3)
         await itx.followup.send(
             f"**{name}** — {verb.lower()} : {fmt.outcome_text(outcome)}", ephemeral=True)
 

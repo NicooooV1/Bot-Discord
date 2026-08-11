@@ -287,6 +287,13 @@ class Docker(commands.Cog):
         self._glue_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ HTTP
+    # Client local, et PAS core.http (relecture 2026-08-11) : ytgrab répond aux refus par
+    # un code d'erreur HTTP dont le CORPS porte le diagnostic ({"error": "..."}), et c'est
+    # ce texte qui est montré à l'utilisateur (« Liste impossible : … », le détail après
+    # un `docker stop` refusé, « Logs indisponibles : … »). `request_json` réduit toute
+    # réponse d'erreur à None — le corps ne part que dans les logs : on afficherait
+    # « injoignable » à la place de la vraie raison. Contrat volontairement différent,
+    # donc duplication ASSUMÉE (même helper que youtube._yt, qui parle au même service).
     def _dk_sync(self, method, path, body=None, timeout=200):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(YTGRAB + path, data=data, method=method,

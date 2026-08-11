@@ -2,9 +2,9 @@
 
 - /help : index des commandes (éphémère, même contenu que le salon).
 - /whoami : tes rôles & permissions.
-- Salon #help (catégorie « Lock ») : message épinglé listant TOUTES les commandes,
-  leur usage (signature des arguments) et à quoi elles servent — auto-généré depuis
-  l'arbre de commandes du bot, rafraîchi par une boucle + un bouton « Rafraîchir ».
+- Salon #help (catégorie « 🔒 Lock <SERVER_KEY> ») : message épinglé listant TOUTES les
+  commandes, leur usage (signature des arguments) et à quoi elles servent — auto-généré
+  depuis l'arbre de commandes du bot, rafraîchi par une boucle + un bouton « Rafraîchir ».
 """
 import logging
 
@@ -12,25 +12,22 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from ..core import channels
 from ..core import format as fmt
 from ..core.gates import GatedView
 from ..core.permissions import read_check, is_admin, can_read
+from ..core.ui import pin_edit
 
 log = logging.getLogger("discord-bot.meta")
 
-LOCK_CATEGORY = "Lock"      # repli historique : la vraie est « 🔒 Lock <SERVER_KEY> »
-
-
-def _norm(s):
-    """Nom de catégorie normalisé — « Lock » et « 🔒 Lock R820 » ne se ressemblent que
-    comparés en alphanumérique minuscule (même règle que Provision._ensure_category)."""
-    return "".join(c for c in str(s).lower() if c.isalnum())
 HELP_CHANNEL = "help"
 
 # command name -> category; anything unlisted lands in "Autres"
 # ⚠️ Table à tenir à jour quand une commande est ajoutée : une commande absente n'est pas
 # perdue (elle tombe dans « 🧩 Autres »), mais le classement perd son sens. Le cadenas 🔒,
 # lui, n'est PLUS déduit d'une liste (cf. _is_admin_cmd) — il ne peut donc pas périmer.
+# Recollationnée sur l'arbre RÉEL le 2026-08-11 : 46 racines listées, 46 commandes
+# déclarées, aucune ne tombe dans « 🧩 Autres » et aucune entrée ne désigne le vide.
 CATEGORIES = [
     ("📊 État & métriques", ["status", "health", "ping", "node", "ct", "cts", "graph"]),
     ("💽 Stockage & matériel", ["storage", "thinpool", "raid", "smart", "temps", "ipmi"]),
@@ -155,127 +152,55 @@ class Meta(commands.Cog):
         return emb
 
     # ------------------------------------------------------------------ salon
-    @staticmethod
-    def _satellite_overwrites(guild, parent=None):
-        """Permissions posées À LA CRÉATION des salons satellites de « Lock ».
-
-        Sans `overwrites=`, Discord fait hériter les permissions du serveur : au tout
-        premier démarrage sur un guild vierge, la catégorie « Lock » et #help naissaient
-        donc INSCRIPTIBLES par @everyone (2026-08-11). Personne d'autre que le bot n'y
-        écrit désormais.
-
-        ⚠️ `parent` (la catégorie d'accueil) n'est pas décoratif : dès qu'on passe
-        `overwrites=` à `create_text_channel`, Discord CESSE de recopier les permissions
-        de la catégorie. Or `lock_category_id` peut très bien désigner la vraie « 🔒 Lock
-        <clé> » de provision (requests._lock_category l'y écrit), qui masque @everyone :
-        un #help créé là avec nos seuls overwrites en ressortirait VISIBLE DE TOUS. On
-        repart donc des overwrites de la catégorie et on n'ajoute que le refus d'écriture
-        (relecture 2026-08-11). La visibilité de #help reste ainsi exactement celle de sa
-        catégorie, comme avant la correction.
-
-        ⚠️ À passer uniquement à `create_*`, JAMAIS à `edit(overwrites=)` : sur une
-        catégorie pré-existante, qui appartient à l'utilisateur et peut contenir ses
-        propres salons, `edit` REMPLACE l'ensemble des overwrites (cf.
-        provision._ensure_lock_category)."""
-        # `.overwrites` reconstruit des PermissionOverwrite neufs à chaque appel : les
-        # modifier ne touche pas le cache de la catégorie.
-        ow = dict(parent.overwrites) if parent is not None else {}
-        everyone = ow.get(guild.default_role) or discord.PermissionOverwrite()
-        everyone.update(send_messages=False, add_reactions=False)
-        ow[guild.default_role] = everyone
-        if guild.me is not None:      # sans le membre bot en cache, on ne s'auto-exclut pas
-            me = ow.get(guild.me) or discord.PermissionOverwrite()
-            me.update(view_channel=True, send_messages=True, embed_links=True,
-                      manage_messages=True)
-            ow[guild.me] = me
-        return ow
-
     async def _ensure_help_channel(self):
+        """Salon #help, dans la catégorie « 🔒 Lock <SERVER_KEY> » de provision.
+
+        La résolution de la catégorie (id publié par provision, puis nom comparé en
+        alphanumérique) vit dans `core.channels` — chercher « Lock » tout court désignait
+        une catégorie DIFFÉRENTE, que le bot créait alors sans overwrites : #help y
+        naissait visible de tout le serveur (2026-08-11).
+
+        ⚠️ On ne crée plus de catégorie de repli, et on ne passe PAS d'`overwrites=` à la
+        création du salon. Deux raisons, toutes deux vécues :
+          - `create_text_channel(category=None)` pose le salon à la RACINE, donc public ;
+            pas de catégorie verrouillée => pas de salon ce cycle, on retentera (c'est la
+            règle de `channels.ensure_channel`) ;
+          - dès qu'on passe `overwrites=`, Discord CESSE de recopier ceux de la catégorie.
+            Un #help créé dans la vraie « 🔒 Lock <clé> » avec nos seuls overwrites en
+            ressortait VISIBLE DE TOUS. L'héritage est aussi ce que provision réimpose de
+            toute façon à chaque cycle sur TOUS les salons de Lock (`_enforce_perms`) :
+            tout overwrite posé ici ne survivrait pas 5 minutes.
+        """
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
             return None
         info = self.bot.state.get("help_msg") or {}
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
-        if ch is not None:
-            return ch
-        cat = None
-        # 1) l'id publié par Provision : c'est LA catégorie verrouillée qui fait autorité
-        prov = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("lock")
-        if prov:
-            c = guild.get_channel(prov)
-            if isinstance(c, discord.CategoryChannel):
-                cat = c
-        # 2) l'id mémorisé par un cog satellite
-        if cat is None:
-            cat_id = self.bot.state.get("lock_category_id")
-            if cat_id:
-                c = guild.get_channel(cat_id)
-                if isinstance(c, discord.CategoryChannel):
-                    cat = c
-        # 3) le NOM provisionné « 🔒 Lock <SERVER_KEY> », comparé en alphanumérique
-        #    (2026-08-11) : chercher « Lock » tout court désignait une catégorie
-        #    DIFFÉRENTE, que le bot créait alors sans overwrites — #help y naissait
-        #    visible de tout le serveur. Même correctif que servarr._lock_category.
-        if cat is None:
-            want = _norm(f"Lock {getattr(self.bot.cfg, 'server_key', 'R820')}")
-            cat = next((x for x in guild.categories if _norm(x.name) == want), None)
-        # 4) dernier repli historique
-        if cat is None:
-            cat = discord.utils.get(guild.categories, name=LOCK_CATEGORY)
-        if cat is None:
-            try:
-                cat = await guild.create_category(
-                    LOCK_CATEGORY, overwrites=self._satellite_overwrites(guild),
-                    reason="salon d'aide")
-            except discord.HTTPException:
-                log.warning("catégorie « %s » non créée", LOCK_CATEGORY, exc_info=True)
-                cat = None
-        if cat is not None:
-            self.bot.state.set("lock_category_id", cat.id)
-        ch = discord.utils.get(guild.text_channels, name=HELP_CHANNEL)
         if ch is None:
-            try:
-                ch = await guild.create_text_channel(
-                    HELP_CHANNEL, category=cat,
-                    overwrites=self._satellite_overwrites(guild, cat),
-                    topic="Aide : toutes les commandes du bot — auto + bouton Rafraîchir")
-                log.info("salon #help créé")
-            except discord.HTTPException:
-                log.warning("salon #%s non créé", HELP_CHANNEL, exc_info=True)
+            ch = await channels.ensure_channel(
+                self.bot, guild, HELP_CHANNEL,
+                channels.lock_category(self.bot, guild),
+                topic="Aide : toutes les commandes du bot — auto + bouton Rafraîchir",
+                reason="salon d'aide")
+            if ch is None:
                 return None
-        cur = self.bot.state.get("help_msg") or {}
-        cur["channel"] = ch.id
-        self.bot.state.set("help_msg", cur)
+        if info.get("channel") != ch.id:   # state.set écrit sur disque : seulement si ça change
+            info["channel"] = ch.id
+            self.bot.state.set("help_msg", info)
         return ch
 
     async def _pin_edit(self, ch, embed):
+        # La danse Discord (fetch / NotFound / send / pin / edit) est dans core.ui ; le
+        # STOCKAGE de l'id reste ici, dans state["help_msg"]["message"] — le migrer
+        # orphelinerait le message déjà épinglé et en ferait poster un DOUBLON.
         info = self.bot.state.get("help_msg") or {}
-        mid = info.get("message")
-        msg = None
-        if mid:
-            try:
-                msg = await ch.fetch_message(mid)
-            except discord.NotFound:
-                msg = None
-            except discord.HTTPException:
-                return
-        view = HelpRefreshView(self)
-        try:
-            if msg is None:
-                msg = await ch.send(embed=embed, view=view)
-                try:
-                    await msg.pin()
-                except discord.HTTPException:
-                    log.warning("message d'aide non épinglé", exc_info=True)
-                info["message"] = msg.id
-                self.bot.state.set("help_msg", info)
-            else:
-                await msg.edit(embed=embed, view=view)
-        except discord.HTTPException:
-            # avalé jusqu'ici : un embed rejeté (>6000 car.) ou un salon devenu
-            # inaccessible laissait #help figé sans une ligne de log (2026-08-11).
-            log.warning("publication du message d'aide impossible", exc_info=True)
+        _msg, mid = await pin_edit(ch, embed, message_id=info.get("message"),
+                                   view=HelpRefreshView(self),
+                                   label=f"#{HELP_CHANNEL}", log=log)
+        if mid and mid != info.get("message"):
+            info["message"] = mid
+            self.bot.state.set("help_msg", info)
 
     @tasks.loop(minutes=30)
     async def helpchan(self):

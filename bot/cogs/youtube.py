@@ -53,8 +53,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from ..core import bg
+from . import youtube_render as render
+from ..core import bg, channels
 from ..core.gates import GatedView
+from ..core.http import ApiClient
 from ..core.permissions import admin_check, is_admin, read_check
 
 log = logging.getLogger("discord-bot.youtube")
@@ -66,12 +68,6 @@ YT_MEDIA_PREFIX = "/mnt/media/YouTube"
 AUTO_DELETE_HOURS = 96        # défaut = 4 jours ; surchargé par /yt-config (state.json)
 POLL_SECONDS = 8
 NOTICE_CHANNEL = "youtube"
-SUPERVISION_CAT = "📊 Supervision"   # provision crée « 📊 Supervision <SERVER_KEY> »
-
-
-def _norm(s):
-    """Nom de catégorie normalisé (même règle que Provision._ensure_category)."""
-    return "".join(c for c in str(s).lower() if c.isalnum())
 
 ACTIVE = ("queued", "running", "paused")
 
@@ -89,50 +85,6 @@ DELAY_CHOICES = [
     app_commands.Choice(name="30 jours", value=720),
     app_commands.Choice(name="jamais (garder)", value=-1),
 ]
-
-
-def _fmt_delay(hours):
-    """Formatte un délai en heures -> « 1 heure » / « 6 heures » / « 2 jours » / « jamais »."""
-    if hours is None:
-        return "réglage global"
-    if hours < 0:
-        return "jamais (garder)"
-    if hours < 24:
-        return f"{hours} heure" + ("s" if hours > 1 else "")
-    d = hours / 24
-    return f"{int(d)} jour" + ("s" if d > 1 else "") if hours % 24 == 0 else f"{hours} h"
-
-
-def _bar(pct_str):
-    try:
-        p = float((pct_str or "0").replace("%", "").strip())
-    except ValueError:
-        p = 0.0
-    n = max(0, min(20, round(p / 5)))
-    return "█" * n + "░" * (20 - n) + f" {p:.0f}%"
-
-
-def _fmt_bytes(n):
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    if n >= 1024 ** 3:
-        return f"{n / 1024 ** 3:.1f} Gio"
-    if n >= 1024 ** 2:
-        return f"{n / 1024 ** 2:.0f} Mio"
-    return f"{n / 1024:.0f} Kio"
-
-
-def _fmt_dur(s):
-    try:
-        s = int(s)
-    except (TypeError, ValueError):
-        return "?"
-    h, m = s // 3600, (s % 3600) // 60
-    if h:
-        return f"{h} h {m:02d}"
-    return f"{m} min" if m else f"{s} s"
 
 
 # URLs MULTI-vidéos qui ne sont pas des playlists explicites : chaîne/onglet/
@@ -226,10 +178,6 @@ def _strip_playlist(url):
     except ValueError:
         pass
     return None
-
-
-def _delay_label(hours):
-    return _fmt_delay(hours)
 
 
 class DownloadView(GatedView):
@@ -365,10 +313,49 @@ class PlaylistConfirmView(GatedView):
                 pass
 
 
+class _JellyfinClient(ApiClient):
+    """ApiClient Jellyfin qui rend None sur TOUTE erreur — il ne lève jamais.
+
+    ⚠️ `core.http.request_json` construit son `urllib.request.Request` AVANT son `try` :
+    une base SANS SCHÉMA remonte alors « ValueError: unknown url type » jusqu'à
+    l'appelant. Or JELLYFIN_URL vaut "" par défaut (core/config.py) : sur une instance où
+    Jellyfin n'est pas configuré, `autodelete` mourrait à CHAQUE cycle (relancée en
+    boucle par bg.guard_cog_loops, une trace d'erreur toutes les ~5 min) et `_scan_library`
+    ferait finir en erreur la tâche de suivi d'un téléchargement pourtant réussi.
+    L'ancien `_jf` local attrapait tout et rendait None : ce filet rétablit exactement ce
+    contrat. À SUPPRIMER si core.http finit par construire sa requête dans le `try`.
+    """
+
+    def _safe(self, call, *args, **kw):
+        try:
+            return call(*args, **kw)
+        except Exception as e:  # noqa: BLE001 — un appel en échec vaut None, pas une exception
+            log.warning("jellyfin %s: %s", getattr(self, "base", "") or "(URL absente)", e)
+            return None
+
+    def get(self, path, params=None, **kw):
+        return self._safe(super().get, path, params, **kw)
+
+    def post(self, path, body=None, **kw):
+        return self._safe(super().post, path, body, **kw)
+
+    def delete(self, path, **kw):
+        return self._safe(super().delete, path, **kw)
+
+
 class YouTube(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._lib_id = None
+        # Client Jellyfin partagé (core.http) : timeout obligatoire, et None == APPEL EN
+        # ÉCHEC et rien d'autre. La distinction est vitale ici : autodelete SAUTE tout son
+        # cycle quand un listing revient None, parce qu'un « aucun item » confondu avec
+        # « Jellyfin injoignable » ferait supprimer des vidéos jugées non regardées à tort.
+        self._jf = _JellyfinClient(
+            getattr(bot.cfg, "jellyfin_url", "") or "",
+            {"Authorization": f'MediaBrowser Token="{getattr(bot.cfg, "jellyfin_api_key", "") or ""}"',
+             "Accept": "application/json"},
+            timeout=20, label="jellyfin")
 
     async def cog_load(self):
         self._migrate_delays_to_hours()
@@ -425,6 +412,21 @@ class YouTube(commands.Cog):
             return json.loads(r.read() or b"{}")
 
     async def _yt(self, method, path, body=None, timeout=20):
+        """Appel ytgrab. None == injoignable ; un DICT peut être le corps d'une erreur HTTP.
+
+        ⚠️ Volontairement PAS core.http.ApiClient (2026-08-11) : `request_json` rend None
+        sur toute HTTPError, or ici le CORPS de l'erreur porte deux informations dont le
+        cog dépend :
+          - le diagnostic de ytgrab (« playlist refusée », « yt-dlp: … ») affiché tel quel
+            dans l'embed ; le perdre transformerait chaque refus en « service injoignable » ;
+          - le 404 « job inconnu » de GET /jobs/{id}, que `_track` reconnaît à l'absence de
+            clé « state » : c'est le signe que ytgrab a REDÉMARRÉ et tué le yt-dlp, donc un
+            ARRÊT (« ⏹️ Arrêté ») et pas une panne. Rendu None, ce cas deviendrait
+            indiscernable d'un CT120 éteint et l'embed tournerait ~10 h dans le vide.
+        Les deux invariants de core.http sont tenus ici : timeout toujours posé, et None
+        réservé à l'échec d'appel. Duplication ASSUMÉE avec `cogs/docker._dk`, qui parle au
+        même service et a le même besoin.
+        """
         try:
             return await asyncio.to_thread(self._yt_sync, method, path, body, timeout)
         except urllib.error.HTTPError as e:
@@ -437,28 +439,10 @@ class YouTube(commands.Cog):
             return None
 
     # ---------------------------------------------------------------- jellyfin
-    def _jf_sync(self, method, path):
-        url = self.bot.cfg.jellyfin_url.rstrip("/") + path
-        key = self.bot.cfg.jellyfin_api_key
-        req = urllib.request.Request(
-            url, method=method,
-            headers={"Authorization": f'MediaBrowser Token="{key}"',
-                     "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else {}
-
-    async def _jf(self, method, path):
-        try:
-            return await asyncio.to_thread(self._jf_sync, method, path)
-        except Exception as e:  # noqa: BLE001
-            log.warning("jellyfin %s %s: %s", method, path, e)
-            return None
-
     async def _youtube_lib_id(self):
         if self._lib_id:
             return self._lib_id
-        vf = await self._jf("GET", "/Library/VirtualFolders")
+        vf = await self._jf.aget("/Library/VirtualFolders")
         for f in vf or []:
             if (f.get("Name") or "").lower() == YT_LIB_NAME.lower():
                 self._lib_id = f.get("ItemId")
@@ -497,7 +481,7 @@ class YouTube(commands.Cog):
         suffix = "" if hours is not None else " (réglage global)"
         if h < 0:
             return f"jamais supprimé automatiquement{suffix}"
-        return f"auto-suppression dans {_fmt_delay(h)} si non regardé{suffix}"
+        return f"auto-suppression dans {render.fmt_delay(h)} si non regardé{suffix}"
 
     async def _reconcile_delays(self):
         """Ré-enregistre les délais des fichiers livrés par des jobs qu'aucun _track ne
@@ -579,7 +563,7 @@ class YouTube(commands.Cog):
         if delai is None:
             g = self._global_hours()
             emb = discord.Embed(title="⚙️ Auto-suppression /yt", color=0x5865F2)
-            emb.add_field(name="Délai global", value=_fmt_delay(g), inline=False)
+            emb.add_field(name="Délai global", value=render.fmt_delay(g), inline=False)
             emb.add_field(
                 name="Délais par téléchargement",
                 value=(f"{len(overrides)} fichier(s) avec un délai spécifique "
@@ -591,10 +575,10 @@ class YouTube(commands.Cog):
             return
         self.bot.state.set("yt_autodelete_hours", int(delai))
         self.bot.audit.record(user=f"{itx.user} ({itx.user.id})", action="yt-config",
-                              target=f"delai={_delay_label(delai)}", result="ok")
+                              target=f"delai={render.fmt_delay(delai)}", result="ok")
         emb = discord.Embed(
             title="⚙️ Auto-suppression /yt",
-            description=f"Délai global réglé sur **{_delay_label(delai)}**.\n"
+            description=f"Délai global réglé sur **{render.fmt_delay(delai)}**.\n"
                         "S'applique aux téléchargements sans délai spécifique "
                         "(existants comme futurs).",
             color=0x2ECC71)
@@ -766,31 +750,19 @@ class YouTube(commands.Cog):
             return
 
         count = p.get("count") or 0
-        if p.get("size_est"):
-            size_txt = f"≈ {_fmt_bytes(p['size_est'])}"
-            if p.get("sampled"):
-                size_txt += f" (étalonné sur {p['sampled']} élément(s) réel(s))"
-            else:
-                size_txt += " (estimation grossière)"
-        else:
-            size_txt = "❓ inconnue — impossible d'estimer, prudence avant de confirmer"
-        lines = []
-        for e in (p.get("entries") or [])[:10]:
-            d = f" ({_fmt_dur(e['duration'])})" if e.get("duration") else ""
-            lines.append(f"• {str(e.get('title') or '?')[:70]}{d}")
-        if count > 10:
-            lines.append(f"… et {count - 10} autre(s)")
         emb = discord.Embed(
             title=("🎵 Playlist musique détectée" if audio else "📃 Playlist détectée"),
             description=f"**{str(p.get('title') or 'Playlist')[:150]}**\n[Lien]({url})",
             color=0xE5A50A)
         emb.add_field(name="Contenu",
-                      value=f"**{count}** élément(s) · durée totale {_fmt_dur(p.get('duration'))}"
+                      value=f"**{count}** élément(s) · durée totale {render.fmt_dur(p.get('duration'))}"
                             + (" · liste tronquée à 500" if p.get("truncated") else ""),
                       inline=False)
-        emb.add_field(name="Taille totale estimée", value=size_txt, inline=False)
-        if lines:
-            emb.add_field(name="Aperçu", value="\n".join(lines)[:1024], inline=False)
+        emb.add_field(name="Taille totale estimée", value=render.size_estimate_text(p),
+                      inline=False)
+        apercu = render.entries_preview(p, count)
+        if apercu:
+            emb.add_field(name="Aperçu", value=apercu, inline=False)
         if (p.get("size_est") or 0) > 30 * 1024 ** 3:
             emb.add_field(name="⚠️ Gros volume",
                           value="Plus de 30 Gio — vérifie l'espace libre avant de confirmer "
@@ -872,28 +844,10 @@ class YouTube(commands.Cog):
             files = j.get("files") or []
             view.sync(state)
 
-            if state in ("queued", "running", "paused"):
-                paused = state == "paused"
-                emb.color = 0x5865F2 if paused else 0xE5A50A
-                val = _bar(j.get("percent", "0%"))
-                if j.get("pl_count"):
-                    val += f"\n📃 Élément **{j.get('pl_idx', '?')}/{j['pl_count']}**" \
-                           + (f" · {len(files)} terminé(s)" if files else "")
-                if paused:
-                    val += f"\n⏸️ **En pause** — mis en pause par **{j.get('paused_by', '?')}**"
-                else:
-                    extra = []
-                    if j.get("speed"):
-                        extra.append(j["speed"])
-                    if j.get("eta") and j.get("eta") != "Unknown":
-                        extra.append(f"ETA {j['eta']}")
-                    if j.get("size"):
-                        extra.append(j["size"])
-                    if extra:
-                        val += "\n" + " · ".join(extra)
-                    if j.get("stage"):
-                        val += f"\n_{j['stage']}_"
-                emb.add_field(name="Progression", value=val, inline=False)
+            if state in ACTIVE:
+                emb.color = 0x5865F2 if state == "paused" else 0xE5A50A
+                emb.add_field(name="Progression",
+                              value=render.progress_text(j, files), inline=False)
                 if fn:
                     emb.add_field(name="Fichier", value=f"`{fn[:90]}`", inline=False)
 
@@ -992,7 +946,7 @@ class YouTube(commands.Cog):
 
     async def _scan_library(self):
         # déclenche un scan de bibliothèque pour que Jellyfin détecte le nouveau fichier
-        await self._jf("POST", "/Library/Refresh")
+        await self._jf.apost("/Library/Refresh")
 
     # ---------------------------------------------------------------- auto-delete
     @tasks.loop(minutes=15)
@@ -1009,7 +963,7 @@ class YouTube(commands.Cog):
         if not lib:
             return
         # récupère les users réels (pour savoir si "quelqu'un a commencé")
-        users = await self._jf("GET", "/Users") or []
+        users = await self._jf.aget("/Users") or []
         uids = [u.get("Id") for u in users if u.get("Id")]
         if not uids:
             return
@@ -1017,8 +971,7 @@ class YouTube(commands.Cog):
         started = {}      # itemId -> bool (visionnage commencé par n'importe qui)
         meta = {}         # itemId -> {name, path, created}
         for uid in uids:
-            data = await self._jf(
-                "GET",
+            data = await self._jf.aget(
                 f"/Users/{uid}/Items?parentId={lib}&recursive=true"
                 f"&includeItemTypes=Video,Movie,Episode&fields=DateCreated,Path,MediaSources"
                 f"&enableUserData=true")
@@ -1063,7 +1016,7 @@ class YouTube(commands.Cog):
             created = self._parse_dt(m["created"])
             if created is None or created > now - timedelta(hours=d):
                 continue
-            ok = await self._jf("DELETE", f"/Items/{iid}")
+            ok = await self._jf.adelete(f"/Items/{iid}")
             if ok is None:
                 log.warning("échec suppression item %s (%s)", iid, m["name"])
                 continue
@@ -1071,7 +1024,7 @@ class YouTube(commands.Cog):
                 removed_keys.add(key)
             log.info("auto-suppr YouTube non-regardé >%dh: %s", d, m["name"])
             await self._notify(
-                f"🗑️ **Supprimé** (non regardé depuis {_fmt_delay(d)}) : {m['name']}")
+                f"🗑️ **Supprimé** (non regardé depuis {render.fmt_delay(d)}) : {m['name']}")
         # Écriture : on repart d'une lecture FRAÎCHE de l'état — la boucle ci-dessus
         # contient des awaits pendant lesquels un _store_delays (fin de download) a pu
         # écrire ; réécrire notre photo effacerait son entrée (lost update).
@@ -1124,50 +1077,28 @@ class YouTube(commands.Cog):
         except Exception:  # noqa: BLE001
             return None
 
-    def _supervision_category(self, guild):
-        """Catégorie « 📊 Supervision <SERVER_KEY> » provisionnée, ou None.
-
-        La constante SUPERVISION_CAT (« 📊 Supervision » tout court) est PÉRIMÉE depuis le
-        passage multi-serveurs : provision crée « 📊 Supervision R820 ». Chercher l'ancien
-        nom ne trouvait rien, et le salon naissait hors catégorie donc public (2026-08-11).
-        """
-        prov = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("super")
-        if prov:
-            c = guild.get_channel(prov)
-            if isinstance(c, discord.CategoryChannel):
-                return c
-        want = _norm(f"{SUPERVISION_CAT} {getattr(self.bot.cfg, 'server_key', 'R820')}")
-        c = next((x for x in guild.categories if _norm(x.name) == want), None)
-        if c is not None:
-            return c
-        return discord.utils.get(guild.categories, name=SUPERVISION_CAT)
-
     async def _notify(self, text):
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
             return
-        ch = discord.utils.get(guild.text_channels, name=NOTICE_CHANNEL)
+        # La catégorie vient de core.channels, SOURCE UNIQUE DE VÉRITÉ : le nom en dur
+        # « 📊 Supervision » était PÉRIMÉ depuis le passage multi-serveurs (provision crée
+        # « 📊 Supervision <SERVER_KEY> »), donc introuvable, donc salon créé à la racine
+        # et lisible de tout le serveur (2026-08-11).
+        # ensure_channel porte la règle : PAS de catégorie -> PAS de salon. Un journal de
+        # téléchargements manquant se répare au prochain cycle de provisioning ; un journal
+        # public, non.
+        ch = await channels.ensure_channel(
+            self.bot, guild, NOTICE_CHANNEL,
+            channels.supervision_category(self.bot, guild),
+            topic="Téléchargements YouTube à la demande (/yt)")
         if ch is None:
-            cat = self._supervision_category(guild)
-            if cat is None:
-                # ⚠️ Sans catégorie, create_text_channel crée le salon À LA RACINE, avec
-                # les permissions par défaut du serveur : le journal des téléchargements
-                # serait lisible de tout le monde. On préfère ne PAS créer et le dire
-                # (2026-08-11) — provision créera « 📊 Supervision <clé> » au prochain
-                # cycle, et ce salon naîtra alors correctement rangé.
-                log.warning("catégorie de supervision introuvable : salon #%s NON créé "
-                            "(il serait public). Il le sera au prochain cycle de "
-                            "provisioning.", NOTICE_CHANNEL)
-                return
-            try:
-                ch = await guild.create_text_channel(NOTICE_CHANNEL, category=cat,
-                                                     topic="Téléchargements YouTube à la demande (/yt)")
-            except discord.HTTPException as e:
-                # ne pas avaler : sans ce salon, une suppression automatique reste
-                # totalement invisible pour l'utilisateur (2026-08-11).
-                log.warning("salon #%s introuvable et non créable: %s", NOTICE_CHANNEL, e)
-                return
+            # ne pas avaler : sans ce salon, une suppression automatique reste totalement
+            # invisible pour l'utilisateur (2026-08-11).
+            log.warning("suppression automatique non annoncée : salon #%s indisponible",
+                        NOTICE_CHANNEL)
+            return
         try:
             await ch.send(text)
         except discord.HTTPException as e:

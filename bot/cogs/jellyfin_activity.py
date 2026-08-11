@@ -10,13 +10,12 @@ se cale sur l'entrée la plus récente sans spammer tout l'historique.
 
 Salon provisionné par provision.py (_provision_jellyfin_log_channel) ; channel_id
 recâblé en direct après provisioning, comme NodeChannel."""
-import asyncio
-import json
 import logging
-import urllib.request
 
 import discord
 from discord.ext import commands, tasks
+
+from ..core.http import ApiClient
 
 log = logging.getLogger("discord-bot.jellyfinactivity")
 
@@ -71,13 +70,12 @@ class JellyfinActivity(commands.Cog):
 
     # ------------------------------------------------------------------ API
 
-    def _fetch(self):
-        url = (f"{self.cfg.jellyfin_url}/System/ActivityLog/Entries"
-               f"?startIndex=0&limit={PAGE_SIZE}")
-        req = urllib.request.Request(
-            url, headers={"Authorization": f'MediaBrowser Token="{self.cfg.jellyfin_api_key}"'})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return json.loads(r.read()).get("Items") or []
+    def _client(self):
+        """Client de l'API Jellyfin — en-tête MediaBrowser Token : Jellyfin 10.11 ignore
+        X-Emby-Token et `api_key=`."""
+        return ApiClient(self.cfg.jellyfin_url,
+                         {"Authorization": f'MediaBrowser Token="{self.cfg.jellyfin_api_key}"'},
+                         timeout=8, label="jellyfin activity")
 
     def _format(self, entry):
         when = (entry.get("Date") or "")[:19].replace("T", " ")
@@ -94,11 +92,16 @@ class JellyfinActivity(commands.Cog):
     async def poll(self):
         if not (self.channel_id and self.enabled):
             return
-        try:
-            items = await asyncio.to_thread(self._fetch)
-        except Exception:
-            log.debug("Jellyfin ActivityLog indisponible", exc_info=True)
+        # quiet=True : Jellyfin éteint est un cas NOMINAL ici et l'échec se répète toutes
+        # les 2 min -> journal de debug (l'erreur exacte, 401 = clé périmée, y reste
+        # trouvable au lieu d'être avalée).
+        data = await self._client().aget("/System/ActivityLog/Entries",
+                                         {"startIndex": 0, "limit": PAGE_SIZE}, quiet=True)
+        if data is None:
+            # None = appel EN ÉCHEC, à ne pas confondre avec « aucune entrée » : dans les
+            # deux cas on ne publie rien, mais le curseur ne doit surtout pas bouger.
             return
+        items = (data.get("Items") if isinstance(data, dict) else None) or []
         if not items:
             return
         # Jellyfin renvoie du plus récent au plus ancien

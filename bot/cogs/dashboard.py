@@ -87,14 +87,14 @@ class Dashboard(commands.Cog):
                                            "dash.png", True)
             if file:
                 emb.set_image(url="attachment://dash.png")
-        adict = bot.state.d.get("alerts", {}) or {}
         # Compter TOUTES les alertes encore maintenues, quel que soit le cog qui les
         # écrit : le filtre sur Alerts.OWNED_KEYS ({"ipmi_temp"}) excluait les 6 clés
         # servarr_* bien vivantes (VPN down, qBittorrent, ratio…), si bien que le
         # tableau de bord épinglé affichait « alertes actives: 0 » pendant que le
-        # kill-switch AirVPN avait coupé le trafic (2026-08-11). Les clés PÉRIMÉES,
-        # elles, sont purgées au démarrage par Alerts.__init__ (LEGACY_KEYS).
-        nb = sum(1 for v in adict.values() if isinstance(v, dict) and v.get("level"))
+        # kill-switch AirVPN avait coupé le trafic (2026-08-11). `alerts_active()` fait
+        # l'UNION des espaces de noms (alerts: / servarr:) ; les clés périmées, elles,
+        # sont purgées au démarrage par Alerts.__init__.
+        nb = len(bot.state.alerts_active())
         emb.set_footer(text=f"alertes actives: {nb} · rafraîchi")
         return emb, file
 

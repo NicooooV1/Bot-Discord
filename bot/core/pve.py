@@ -1050,6 +1050,41 @@ class Pve:
     async def atask_status(self, upid):
         return await asyncio.to_thread(self.task_status, upid)
 
+    async def apoll_task(self, upid, timeout=180, poll_every=2, max_fails=5):
+        """Suit une tâche PVE jusqu'à `timeout` secondes de temps RÉEL.
+
+        Renvoie "OK", le code de sortie PVE, "running" (pas finie dans le délai) ou
+        "lost" (NOTRE suivi s'est interrompu — la tâche, elle, continue côté Proxmox).
+        `core.format.outcome_text()` rend ce verdict pour l'utilisateur.
+
+        Trois cogs avaient leur propre copie (actions, ct_channels, rdv), avec les mêmes
+        deux défauts corrigés le 2026-08-11 :
+          - un SEUL hoquet réseau (pveproxy rechargé, tunnel WG qui clignote sur un UPID
+            « avy: ») terminait le suivi sur « unknown » : une sauvegarde RÉUSSIE passait
+            pour un échec. On tolère `max_fails` échecs consécutifs.
+          - la borne était un COMPTE d'itérations supposant N secondes par tour ; un échec
+            réseau coûte le timeout distant (jusqu'à 30 s), donc la durée réelle dérivait
+            très au-delà de la valeur annoncée. La borne est l'horloge MONOTONE.
+        """
+        deadline = time.monotonic() + max(2, timeout)
+        fails = 0
+        while time.monotonic() < deadline:
+            try:
+                st = await self.atask_status(upid)
+            except Exception:  # noqa: BLE001
+                fails += 1
+                if fails >= max_fails:
+                    log.warning("suivi de la tâche %s abandonné (%d échecs consécutifs) "
+                                "— la tâche continue côté PVE", upid, fails, exc_info=True)
+                    return "lost"
+                await asyncio.sleep(poll_every)
+                continue
+            fails = 0
+            if (st or {}).get("status") == "stopped":
+                return st.get("exitstatus") or "OK"
+            await asyncio.sleep(poll_every)
+        return "running"
+
     # Le paramètre est « notes-template » (tiret), pas « notes_template » : avec l'underscore
     # l'API répond 400 « property is not defined in schema » AVANT tout contrôle de
     # permission — le bouton 💾 des salons d'invités était donc inopérant depuis toujours

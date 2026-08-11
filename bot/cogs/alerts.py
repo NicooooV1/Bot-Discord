@@ -7,9 +7,11 @@ CT-down stay owned by the existing Grafana -> Discord webhook (no duplication).
 The same read-only evaluator (`_evaluate`) feeds both the background loop and the
 `/alerts` command so thresholds live in exactly one place.
 
-⚠️ L'espace de noms `state["alerts"]` est PARTAGÉ avec le cog servarr (clés
-`servarr_*`) : tout ce qui purge ou compte ce dict doit raisonner sur les clés
-PÉRIMÉES (LEGACY_KEYS), jamais sur « tout ce qui n'appartient pas à ce cog ».
+⚠️ L'état de de-dup vit dans un ESPACE DE NOMS propre à ce cog (`state.ns("alerts")`,
+clés rangées « alerts:<clé> ») : le cog servarr écrit dans le sien (« servarr:… ») et les
+deux ne peuvent plus se marcher dessus. Ce qui COMPTE les alertes (le tableau de bord,
+/health, le pied de page de /alerts) doit en revanche lire l'UNION des espaces, via
+`state.alerts_active()`. Voir `core/state.AlertSpace` pour le pourquoi.
 """
 import asyncio
 import logging
@@ -29,18 +31,30 @@ class Alerts(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._chan_warned = False
+        # Espace de de-dup PROPRE à ce cog. `adopt` reprend les clés nues écrites par la
+        # version précédente (migration sans perte : sans elle, toute alerte en cours
+        # serait re-postée au premier démarrage) — y compris les périmées, sinon elles
+        # resteraient non préfixées dans state.json et continueraient d'apparaître dans
+        # /health et le tableau de bord.
+        # ⚠️ `_alerts` et PAS `alerts` : discord.py installe la commande d'application
+        # sur l'instance sous le nom de sa méthode (`Cog.__new__` -> setattr(self,
+        # "alerts", <Command>)). Un attribut `self.alerts` écraserait cette référence —
+        # la commande resterait enregistrée (elle vit dans __cog_app_commands__), mais
+        # tout `self.alerts.autocomplete(...)` / `.error(...)` ajouté plus tard tomberait
+        # sur l'espace d'alertes, avec une AttributeError incompréhensible.
+        self._alerts = bot.state.ns("alerts", adopt=self.OWNED_KEYS | self.LEGACY_KEYS)
         # Purge des clés de de-dup que la boucle ne maintient PLUS (OWNED_KEYS a été
         # restreint à {ipmi_temp}) : sinon d'anciens criticals persistés (thinpool/
         # backup…) resteraient des faux positifs permanents dans /health et /alerts.
-        # ⚠️ Purger sur « pas dans OWNED_KEYS » effaçait aussi les 6 clés servarr_*,
-        # BIEN VIVANTES et écrites dans le même dict — et comme `alerts` est chargé
-        # AVANT `servarr`, celui-ci repartait d'un état vide à chaque démarrage : le
-        # tunnel VPN coupé depuis 3 jours était re-pagé à chaque reboot matinal, et une
-        # condition résolue pendant l'arrêt ne postait jamais son « ✅ Résolu ».
-        # On énumère donc explicitement les clés périmées (2026-08-11).
-        for k in list((bot.state.get("alerts", {}) or {}).keys()):
-            if k in self.LEGACY_KEYS:
-                bot.state.clear_alert(k)
+        # Purger sur « pas dans OWNED_KEYS » est désormais SÛR : cet espace ne contient
+        # que nos clés. Avant le cloisonnement, le même test effaçait aussi les 6 clés
+        # servarr_* bien vivantes du dict partagé — et comme `alerts` est chargé AVANT
+        # `servarr`, celui-ci repartait d'un état vide à chaque démarrage : le tunnel VPN
+        # coupé depuis 3 jours était re-pagé à chaque reboot matinal, et une condition
+        # résolue pendant l'arrêt ne postait jamais son « ✅ Résolu » (2026-08-11).
+        for k in self._alerts.keys():
+            if k not in self.OWNED_KEYS:
+                self._alerts.clear(k)
         self.loop.change_interval(seconds=bot.cfg.alert_poll_seconds)
         self.loop.start()
 
@@ -73,7 +87,7 @@ class Alerts(commands.Cog):
 
     async def _fire(self, ch, key, level, title, desc):
         """Edge-trigger: post on rising/changed level, post recovery on clear."""
-        prev = self.bot.state.alert_level(key)
+        prev = self._alerts.level(key)
         if level and level != prev:
             if alert_snoozed(self.bot.state, key):
                 return   # en sommeil (Snooze) : on ne pague pas
@@ -81,14 +95,14 @@ class Alerts(commands.Cog):
             emb = discord.Embed(title=title, description=desc, color=color)
             emb.set_footer(text=f"alerte: {key} [{level}]")
             await ch.send(embed=emb, view=AlertActionView())
-            self.bot.state.set_alert(key, level)
+            self._alerts.set_level(key, level)
         elif not level and prev:
             # Le Snooze doit aussi taire le retour au vert : sinon le dernier message
             # d'une alerte mise en sommeil part quand même (2026-08-11).
             if not alert_snoozed(self.bot.state, key):
                 await ch.send(embed=discord.Embed(
                     title=f"✅ Résolu — {title}", description=desc, color=fmt.GREEN))
-            self.bot.state.clear_alert(key)
+            self._alerts.clear(key)
 
     async def _evaluate(self):
         """Read-only: current level of every owned-gap check.
@@ -162,7 +176,7 @@ class Alerts(commands.Cog):
                 mx = max(v for _, v in vals)
                 what, warn_t, crit_t = "capteur IPMI", 75.0, 85.0
             level = self._hysteresis(mx, warn_t, crit_t,
-                                     self.bot.state.alert_level("ipmi_temp"))
+                                     self._alerts.level("ipmi_temp"))
             # Une décimale : le seuil bas est un seuil d'AMBIANCE (32 °C) et la source
             # est un `last()` brut. Arrondi à l'unité, l'alerte « max 32°C » et sa
             # résolution « Résolu — max 32°C » étaient rigoureusement identiques.
@@ -217,10 +231,10 @@ class Alerts(commands.Cog):
     OWNED_KEYS = {"ipmi_temp"}
 
     #: Clés que la boucle a POSSÉDÉES par le passé et n'émet plus : elles resteraient
-    #: sinon persistées « crit » à vie dans state.json. Ce sont les SEULES que le
-    #: démarrage doit purger — le dict state["alerts"] est partagé avec servarr, dont
-    #: les clés sont vivantes et doivent survivre au redémarrage (c'est tout l'intérêt
-    #: de la de-dup edge-triggered).
+    #: sinon persistées « crit » à vie dans state.json. Depuis le cloisonnement, la purge
+    #: de démarrage se fait sur « pas dans OWNED_KEYS » (sûre : l'espace n'est qu'à nous) ;
+    #: cette liste sert à REPRENDRE les clés nues d'avant la migration, pour qu'elles
+    #: entrent dans notre espace et se fassent purger au lieu de traîner à la racine.
     LEGACY_KEYS = {"thinpool_usage", "backup_age", "raid_health", "smart_fail"}
 
     @tasks.loop(seconds=60)
@@ -298,11 +312,10 @@ class Alerts(commands.Cog):
             emb.description = ("⚠️ Dernière requête InfluxDB en ÉCHEC — la supervision "
                                "est aveugle, ce bilan est incomplet.\n"
                                + (emb.description or ""))[:4096]
-        # Pas de filtre OWNED_KEYS : l'état persisté appartient aussi à servarr, et les
-        # clés périmées sont purgées au démarrage (LEGACY_KEYS).
-        persisted = {k: v.get("level")
-                     for k, v in (bot.state.get("alerts", {}) or {}).items()
-                     if isinstance(v, dict) and v.get("level")}
+        # UNION des espaces : l'état persisté appartient aussi à servarr (« servarr:… »),
+        # et alerts_active() rend les clés NUES — le pied de page affiche donc exactement
+        # les mêmes noms d'alerte qu'avant le cloisonnement.
+        persisted = bot.state.alerts_active()
         if persisted:
             emb.set_footer(text=("État persisté: "
                                  + ", ".join(f"{k}[{l}]" for k, l in persisted.items()))[:2048])

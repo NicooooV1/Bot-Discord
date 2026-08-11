@@ -26,11 +26,12 @@ import urllib.request
 import discord
 from discord.ext import commands, tasks
 
+from ..core import channels
 from ..core.gates import GatedView
+from ..core.http import client_for, load_service_apis
 
 log = logging.getLogger("discord-bot.requests")
 
-APIS_FILE = "/opt/discord-bot/servarr-apis.json"
 GATE_CHANNEL = "demandes"
 POLL_SECONDS = 30
 TMDB_IMG = "https://image.tmdb.org/t/p/w342"
@@ -41,27 +42,6 @@ PROPS_PURGE_SECONDS = 3600
 PROPS_PURGE_BATCH = 10
 # Statut Seerr d'une demande : 1 = en attente. Tout le reste = déjà tranchée.
 SEERR_PENDING = 1
-
-
-def _load_apis():
-    """Charge servarr-apis.json.
-
-    Une lecture ratée désactive TOUT le portail (gatepoll n'est jamais démarré, /film
-    n'a plus de barrière) : la cause doit apparaître dans les logs, sinon la panne est
-    strictement muette et indiagnosticable (corrigé 2026-08-11).
-    """
-    try:
-        with open(APIS_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        log.warning("%s absent — portail de validation des demandes INACTIF", APIS_FILE)
-    except PermissionError:
-        log.error("%s illisible (droits du fichier) — portail de validation des "
-                  "demandes INACTIF", APIS_FILE)
-    except Exception:
-        log.exception("%s illisible (JSON invalide ?) — portail de validation des "
-                      "demandes INACTIF", APIS_FILE)
-    return {}
 
 
 class PortalUnavailable(RuntimeError):
@@ -103,7 +83,12 @@ class GateView(GatedView):
 class Requests(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.apis = _load_apis()
+        # None = Seerr non configuré. Sans lui, le portail reste INACTIF (gatepoll jamais
+        # démarré) : `core.http.load_service_apis` journalise la cause, sinon la panne est
+        # muette et indiagnosticable. 2026-08-11.
+        # Ce cog n'appelle QUE Seerr : pas de `self.apis` à conserver (contrairement à
+        # medias/servarr, qui relisent l'entrée « qbit »).
+        self.seerr = client_for(load_service_apis(), "seerr")
         # Sérialise les décisions : _decide lisait req_props/req_gate_msgs, puis attendait
         # jusqu'à 15 s la réponse de Seerr, puis réécrivait le dict lu AVANT l'attente.
         # Deux clics concurrents postaient donc deux fois et se ressuscitaient l'un
@@ -114,25 +99,31 @@ class Requests(commands.Cog):
 
     async def cog_load(self):
         self.bot.add_view(GateView(self))          # boutons persistants au reboot
-        if "seerr" in self.apis:
+        if self.seerr is not None:
             self.gatepoll.start()
 
     def cog_unload(self):
         self.gatepoll.cancel()
 
     # ------------------------------------------------------------ HTTP (Seerr)
+    # `self.seerr` (core.http.ApiClient) porte l'URL, la clé et le TIMEOUT : plus de bloc
+    # urllib recopié pour les lectures. Restent deux appels construits à la main, car le
+    # client partagé rend `None` pour TOUTE erreur et perd justement ce dont ce cog vit :
+    #   - `_post` a besoin du CODE HTTP (409 « déjà demandé » se classe, 401/429/408 se
+    #     rejouent — cf. `_decide`) ;
+    #   - `_get_sync` a besoin de laisser remonter le 404 (demande supprimée depuis l'UI
+    #     Seerr, cas COURANT) pour ne pas le confondre avec une panne réseau.
+    # Ils prennent quand même url/headers/timeout de `self.seerr` : une seule source pour
+    # les identifiants.
     def _get_sync(self, path):
-        a = self.apis["seerr"]
-        req = urllib.request.Request(a["url"] + path, headers={"X-Api-Key": a["key"]})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        req = urllib.request.Request(self.seerr.url(path), headers=self.seerr.headers)
+        with urllib.request.urlopen(req, timeout=self.seerr.timeout) as r:
             return json.loads(r.read())
 
     async def _get(self, path):
-        try:
-            return await asyncio.to_thread(self._get_sync, path)
-        except Exception as e:
-            log.warning("GET %s: %s", path, e)
+        if self.seerr is None:
             return None
+        return await self.seerr.aget(path)
 
     async def _request_state(self, rid):
         """État d'UNE demande Seerr -> ("supprimee"|"connue"|"inconnue", statut).
@@ -158,12 +149,11 @@ class Requests(commands.Cog):
         return "connue", det.get("status")
 
     def _post_sync(self, path, body):
-        a = self.apis["seerr"]
         data = json.dumps(body).encode() if body is not None else b""
-        req = urllib.request.Request(a["url"] + path, data=data,
-                                     headers={"X-Api-Key": a["key"], "Content-Type": "application/json"},
-                                     method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
+        req = urllib.request.Request(
+            self.seerr.url(path), data=data, method="POST",
+            headers={**self.seerr.headers, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.seerr.timeout) as r:
             return r.status
     async def _post(self, path, body=None):
         try:
@@ -199,110 +189,50 @@ class Requests(commands.Cog):
         return posted
 
     # ------------------------------------------------------------ channel
-    def _lock_category_name(self):
-        """Nom RÉEL de la catégorie verrouillée, comme provision.py la fabrique.
-
-        Chercher « Lock » tout court ne trouvait jamais « 🔒 Lock R820 » : le cog créait
-        alors une SECONDE catégorie, sans overwrites — donc visible de @everyone — et y
-        posait #demandes (titres demandés + pseudo du demandeur). 2026-08-11.
-        """
-        return f"🔒 Lock {getattr(self.bot.cfg, 'server_key', 'R820')}"
-
-    def _fallback_overwrites(self, guild):
-        """Overwrites minimaux si le cog Provision est absent : @everyone ne voit rien,
-        le bot et les rôles M/O du nœud voient. Une catégorie « nue » est PUBLIQUE."""
-        cfg = self.bot.cfg
-        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-        me = guild.me
-        if me is not None:
-            ow[me] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, embed_links=True,
-                manage_messages=True, manage_channels=True, read_message_history=True)
-        for rid in (getattr(cfg, "node_mod_role_id", 0), getattr(cfg, "node_owner_role_id", 0)):
-            r = guild.get_role(rid) if rid else None
-            if r is not None:
-                ow[r] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    use_application_commands=True)
-        return ow
-
-    async def _lock_category(self, guild):
-        """Catégorie Lock de PROVISION (jamais un doublon nu, qui serait public).
-
-        Ordre : id publié par le cog Provision -> id mémorisé dans l'état -> nom réel.
-        En dernier recours seulement, on la crée — avec ses overwrites.
-        """
-        prov = self.bot.get_cog("Provision")
-        pid = ((getattr(prov, "prov", None) or {}).get("categories") or {}).get("lock")
-        cat = guild.get_channel(pid) if pid else None
-        if not isinstance(cat, discord.CategoryChannel):
-            cid = self.bot.state.get("lock_category_id")
-            cat = guild.get_channel(cid) if cid else None
-        if not isinstance(cat, discord.CategoryChannel):
-            cat = discord.utils.get(guild.categories, name=self._lock_category_name())
-        if cat is None:
-            ow = None
-            if prov is not None:
-                try:
-                    ow = prov._lock_overwrites(guild)     # source de vérité (rôles M/O)
-                except Exception:
-                    log.exception("overwrites Lock via Provision — repli local")
-            try:
-                cat = await guild.create_category(
-                    self._lock_category_name(),
-                    overwrites=ow or self._fallback_overwrites(guild),
-                    reason="portail demandes")
-                log.info("catégorie %s créée (overwrites posés)", cat.name)
-            except discord.HTTPException:
-                log.exception("création de la catégorie %s — portail #%s indisponible",
-                              self._lock_category_name(), GATE_CHANNEL)
-                return None
-        if self.bot.state.get("lock_category_id") != cat.id:
-            self.bot.state.set("lock_category_id", cat.id)
-        return cat
-
     async def _channel(self):
+        """Salon #demandes, DANS la catégorie Lock provisionnée — ou rien du tout.
+
+        La catégorie est résolue par `core.channels` (id publié par provision, puis nom
+        réel « 🔒 Lock <SERVER_KEY> »). Ce cog ne CRÉE plus de catégorie : chercher
+        « Lock » tout court ne trouvait jamais « 🔒 Lock R820 », une SECONDE catégorie
+        naissait — sans overwrites, donc visible de @everyone — et #demandes y publiait
+        les titres demandés ET le pseudo du demandeur.
+
+        Pas de catégorie provisionnée -> pas de salon -> portail indisponible :
+        `propose()` lève PortalUnavailable et /film REFUSE (fail-closed). L'état se
+        répare tout seul : provision recrée la CATÉGORIE (il ne connaît pas #demandes,
+        qui n'appartient qu'à ce cog), et le tour suivant de `gatepoll` (30 s) repose le
+        salon dedans. 2026-08-11.
+        """
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
         if guild is None:
             log.warning("guild %s introuvable — portail #%s indisponible", gid, GATE_CHANNEL)
             return None
         st = self.bot.state.get("req_gate") or {}
+        cat = channels.lock_category(self.bot, guild)
         ch = guild.get_channel(st.get("channel")) if st.get("channel") else None
-        if ch is not None:
-            return ch
-        cat = await self._lock_category(guild)
-        if cat is None:
-            return None
-        ch = discord.utils.get(cat.text_channels, name=GATE_CHANNEL)
         if ch is None:
-            # Un homonyme AILLEURS dans le serveur était adopté tel quel, donc laissé
-            # public : on le rapatrie dans la catégorie Lock et on resynchronise ses
-            # permissions plutôt que d'y publier qui demande quoi. 2026-08-11.
-            stray = discord.utils.get(guild.text_channels, name=GATE_CHANNEL)
-            if stray is not None:
-                try:
-                    await stray.edit(category=cat, sync_permissions=True,
-                                     reason="#demandes doit vivre dans la catégorie Lock")
-                    ch = stray
-                    log.warning("#%s trouvé hors de « %s » — rapatrié, permissions "
-                                "resynchronisées", GATE_CHANNEL, cat.name)
-                except discord.HTTPException:
-                    log.exception("#%s hors de la catégorie Lock et non déplaçable — "
-                                  "portail indisponible (rien ne sera posté en public)",
-                                  GATE_CHANNEL)
-                    return None
-        if ch is None:
-            try:
-                ch = await guild.create_text_channel(
-                    GATE_CHANNEL, category=cat,
-                    topic="Validation des demandes Seerr — Approuver / Refuser (admins)")
-                log.info("salon #%s créé dans « %s »", GATE_CHANNEL, cat.name)
-            except discord.HTTPException:
-                log.exception("création du salon #%s", GATE_CHANNEL)
+            ch = await channels.ensure_channel(
+                self.bot, guild, GATE_CHANNEL, cat,
+                topic="Validation des demandes Seerr — Approuver / Refuser (admins)")
+            if ch is None:
+                log.warning("salon #%s indisponible — portail de validation hors service",
+                            GATE_CHANNEL)
                 return None
-        st["channel"] = ch.id
-        self.bot.state.set("req_gate", st)
+        if channels.is_public(ch) is True:
+            # Homonyme resté hors de la catégorie Lock : on le remet sous clé. Si le
+            # déplacement échoue, on refuse de publier qui demande quoi devant tout le
+            # serveur — portail déclaré indisponible, donc /film refuse.
+            if not await channels.seal_if_public(
+                    self.bot, ch, cat, why="titres demandés + pseudo du demandeur"):
+                log.error("#%s reste lisible de @everyone — portail indisponible "
+                          "(rien ne sera posté en public)", GATE_CHANNEL)
+                return None
+        if st.get("channel") != ch.id:
+            st = dict(self.bot.state.get("req_gate") or {})
+            st["channel"] = ch.id
+            self.bot.state.set("req_gate", st)
         return ch
 
     # ------------------------------------------------------------ embed

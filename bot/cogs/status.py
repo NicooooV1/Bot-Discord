@@ -1,6 +1,7 @@
 """Status & overview commands: /status /ping /node /ct /cts."""
 import asyncio
 import logging
+import subprocess
 
 import discord
 from discord import app_commands
@@ -22,10 +23,47 @@ FIELD_MAX = 1024
 FIELDS_MAX = 25
 DESC_MAX = 4096
 
+#: dépôt git déployé en production (l'unité systemd tourne depuis ce répertoire)
+REPO_DIR = "/opt/discord-bot"
+
+
+def _git_version(path=REPO_DIR):
+    """Commit git déployé (« a1b2c3d »), ou None si l'information est indisponible.
+
+    ⚠️ BLOQUANT (fork + exec) : à appeler depuis un thread, JAMAIS dans la boucle
+    d'événements. Lu une seule fois au démarrage — le commit ne peut pas changer sans
+    redémarrage du service, et /health n'a pas à payer un fork à chaque appel.
+
+    Tolère tout : git absent du conteneur, répertoire qui n'est pas un dépôt, droits
+    refusés. Dans ce cas None, et /health omet simplement la ligne (une supervision ne
+    doit pas tomber parce qu'un outil de développement manque).
+    """
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("version git indisponible (%s)", e)
+        return None
+    if r.returncode != 0:
+        log.debug("version git indisponible: %s", (r.stderr or "").strip()[:120])
+        return None
+    return (r.stdout or "").strip() or None
+
 
 class Status(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._version = None      # commit déployé, rempli une fois au démarrage
+
+    async def cog_load(self):
+        # Lecture détachée : `git rev-parse` est un fork, il n'a rien à faire dans la
+        # boucle d'événements au moment où le bot se connecte. bg.spawn garde une
+        # référence forte sur la tâche (sinon le GC peut l'emporter en plein vol).
+        async def _read():
+            self._version = await asyncio.to_thread(_git_version)
+            log.info("version déployée: %s", self._version or "inconnue")
+
+        bg.spawn(_read(), name="Status.version", logger=log)
 
     def _scope(self):
         """Suffixe de libellé quand un compteur ne couvre QUE le cluster primaire.
@@ -261,14 +299,22 @@ class Status(commands.Cog):
                          f"{len(suivies) - len(cassees)}/{len(suivies)} boucles saines"
                          + (" · en échec: " + ", ".join(cassees[:5]) if cassees else "")))
 
-        # Pas de filtre OWNED_KEYS ici : /health doit montrer TOUTES les alertes encore
-        # maintenues, y compris celles de servarr (VPN, qBittorrent…) qui vivent dans le
-        # même dict. Les clés périmées, elles, sont purgées au démarrage par Alerts.
-        firing = {k: v.get("level") for k, v in (bot.state.get("alerts", {}) or {}).items()
-                  if isinstance(v, dict) and v.get("level")}
+        # UNION des espaces de noms : /health doit montrer TOUTES les alertes encore
+        # maintenues, y compris celles de servarr (VPN, qBittorrent…) qui vivent dans
+        # l'espace « servarr: ». alerts_active() rend les clés NUES, donc l'affichage est
+        # identique. Les clés périmées, elles, sont purgées au démarrage par Alerts.
+        firing = bot.state.alerts_active()
         if firing:
             rows.append(("crit" if any(l == "crit" for l in firing.values()) else "warn",
                          "Alertes actives", ", ".join(f"{k} [{l}]" for k, l in firing.items())))
+
+        # Ce qui TOURNE réellement : sans cette ligne, la seule façon de savoir quelle
+        # version est déployée était d'aller lire le dépôt sur l'hôte. En dernier (donc
+        # la première rognée si l'embed dépasse 25 champs) : c'est la ligne la moins
+        # urgente. Niveau « na » : une version n'est ni saine ni en panne, et elle ne
+        # doit pas peser sur le verdict global.
+        if self._version:
+            rows.append(("na", "Version", f"`{self._version}`"))
 
         order = {"crit": 3, "warn": 2, "ok": 1, "na": 0}
         worst = max((order.get(l, 0) for l, _, _ in rows), default=1)

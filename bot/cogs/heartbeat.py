@@ -94,6 +94,11 @@ class Heartbeat(commands.Cog):
             return
         self._skipped = 0
 
+        # urlopen local, et PAS core.http (2026-08-11) : un check healthchecks.io répond
+        # « OK » en texte brut. `request_json` renverrait donc None — c'est-à-dire
+        # « appel en échec » selon son invariant — sur un ping parfaitement transmis, et
+        # `self._fails` grimperait indéfiniment en journalisant de fausses pannes. Ici
+        # seul le CODE HTTP compte, pas le corps : il n'y a rien à factoriser.
         def _ping():
             req = urllib.request.Request(self.url, headers={"User-Agent": "edmine-heartbeat"})
             with urllib.request.urlopen(req, timeout=8) as r:

@@ -1,9 +1,10 @@
 """Safe actions (admin + channel gated, confirmation, audit, UPID polling):
-/ctctl start|stop|restart, /backup, /audit."""
-import asyncio
+/ctctl start|stop|restart, /backup, /audit.
+
+Le suivi d'une tâche PVE (UPID) vit dans `Pve.apoll_task` et son rendu dans
+`core.format.outcome_text` : ce cog n'en garde plus de copie (2026-08-11)."""
 import datetime
 import logging
-import time
 
 import discord
 from discord import app_commands
@@ -22,12 +23,6 @@ ACTIONS = [app_commands.Choice(name="start", value="start"),
            app_commands.Choice(name="restart", value="restart")]
 
 
-def _outcome_text(outcome, done_label):
-    """Conservé comme alias local : l'implémentation vit dans core/format (partagée
-    avec ct_channels, qui avait sa propre version divergente)."""
-    return fmt.outcome_text(outcome, done_label)
-
-
 class Actions(commands.Cog):
     # groupe /backup : créer / supprimer une sauvegarde PBS
     backup = app_commands.Group(name="backup",
@@ -35,39 +30,6 @@ class Actions(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-
-    async def _poll(self, upid, timeout=180):
-        """Suit une tâche PVE jusqu'à `timeout` secondes de temps RÉEL.
-
-        2026-08-11 — deux pièges corrigés :
-        - un SEUL hoquet (ConnectionError/ReadTimeout de `requests`, `pveproxy` rechargé,
-          tunnel WG qui clignote pour un UPID « avy: ») terminait le suivi sur
-          « unknown » alors que la tâche continue de tourner : sur un `backup create`
-          la fenêtre de poll fait 900 s, la probabilité n'a rien de négligeable. On
-          tolère 5 échecs consécutifs avant d'abandonner ;
-        - la borne était un COMPTE d'itérations (`timeout // 2`) qui supposait 2 s par
-          tour. Un échec réseau coûte le timeout distant (jusqu'à 30 s) : la durée réelle
-          dérivait très au-delà de la valeur annoncée. La borne est désormais l'horloge
-          murale (`time.monotonic`).
-        """
-        deadline = time.monotonic() + max(2, timeout)
-        fails = 0
-        while time.monotonic() < deadline:
-            try:
-                st = await self.bot.pve.atask_status(upid)
-            except Exception:
-                fails += 1
-                if fails >= 5:
-                    log.warning("suivi de la tâche %s abandonné (%d échecs consécutifs) "
-                                "— la tâche continue côté PVE", upid, fails, exc_info=True)
-                    return "lost"
-                await asyncio.sleep(2)
-                continue
-            fails = 0
-            if st.get("status") == "stopped":
-                return st.get("exitstatus") or "OK"
-            await asyncio.sleep(2)
-        return "running"
 
     async def _confirm(self, itx, description):
         # caller has already deferred (ephemeral) -> send the prompt via followup
@@ -119,8 +81,10 @@ class Actions(commands.Cog):
         self.bot.audit.record(user=who, action=act, target=f"{name}/{vmid}",
                               result="submitted", upid=str(upid))
         await itx.followup.send(f"⏳ `{act}` lancé sur **{name}** — suivi…", ephemeral=True)
-        outcome = await self._poll(str(upid))
-        result = _outcome_text(outcome, "terminé")
+        # « lost » n'est PAS un échec : c'est NOTRE suivi qui s'arrête, la tâche continue
+        # côté Proxmox (rendu par outcome_text).
+        outcome = await self.bot.pve.apoll_task(str(upid))
+        result = fmt.outcome_text(outcome, "terminé")
         await itx.followup.send(f"**{name}** {act}: {result}", ephemeral=True)
 
     @backup.command(name="create", description="Lancer une sauvegarde vzdump d'un conteneur vers PBS.")
@@ -154,8 +118,8 @@ class Actions(commands.Cog):
         self.bot.audit.record(user=who, action="backup", target=f"{name}/{vmid}",
                               result="submitted", upid=str(upid))
         await itx.followup.send(f"⏳ Sauvegarde de **{name}** lancée — suivi…", ephemeral=True)
-        outcome = await self._poll(str(upid), timeout=900)
-        result = _outcome_text(outcome, "terminée")
+        outcome = await self.bot.pve.apoll_task(str(upid), timeout=900)
+        result = fmt.outcome_text(outcome, "terminée")
         # le poll peut dépasser les 15 min du token d'interaction -> followup 404.
         # On tente le followup éphémère, puis on retombe sur un message de salon.
         try:
@@ -279,8 +243,8 @@ class BackupDeleteView(GatedView):
                                   result="submitted", upid=str(res))
         # les UPID du cluster AVEYRON arrivent préfixés « avy: » (task_status les route)
         if isinstance(res, str) and (res.startswith("UPID") or res.startswith("avy:UPID")):
-            outcome = await self.cog._poll(res, timeout=180)
-            result = _outcome_text(outcome, "supprimée")
+            outcome = await self.cog.bot.pve.apoll_task(res, timeout=180)
+            result = fmt.outcome_text(outcome, "supprimée")
         else:
             result = "✅ supprimée"
         await itx.followup.send(f"🗑️ Sauvegarde de **{self.name}** {result}.", ephemeral=True)
