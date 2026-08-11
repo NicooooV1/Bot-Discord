@@ -66,7 +66,12 @@ YT_MEDIA_PREFIX = "/mnt/media/YouTube"
 AUTO_DELETE_HOURS = 96        # défaut = 4 jours ; surchargé par /yt-config (state.json)
 POLL_SECONDS = 8
 NOTICE_CHANNEL = "youtube"
-SUPERVISION_CAT = "📊 Supervision"
+SUPERVISION_CAT = "📊 Supervision"   # provision crée « 📊 Supervision <SERVER_KEY> »
+
+
+def _norm(s):
+    """Nom de catégorie normalisé (même règle que Provision._ensure_category)."""
+    return "".join(c for c in str(s).lower() if c.isalnum())
 
 ACTIVE = ("queued", "running", "paused")
 
@@ -1119,6 +1124,24 @@ class YouTube(commands.Cog):
         except Exception:  # noqa: BLE001
             return None
 
+    def _supervision_category(self, guild):
+        """Catégorie « 📊 Supervision <SERVER_KEY> » provisionnée, ou None.
+
+        La constante SUPERVISION_CAT (« 📊 Supervision » tout court) est PÉRIMÉE depuis le
+        passage multi-serveurs : provision crée « 📊 Supervision R820 ». Chercher l'ancien
+        nom ne trouvait rien, et le salon naissait hors catégorie donc public (2026-08-11).
+        """
+        prov = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("super")
+        if prov:
+            c = guild.get_channel(prov)
+            if isinstance(c, discord.CategoryChannel):
+                return c
+        want = _norm(f"{SUPERVISION_CAT} {getattr(self.bot.cfg, 'server_key', 'R820')}")
+        c = next((x for x in guild.categories if _norm(x.name) == want), None)
+        if c is not None:
+            return c
+        return discord.utils.get(guild.categories, name=SUPERVISION_CAT)
+
     async def _notify(self, text):
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
@@ -1126,7 +1149,17 @@ class YouTube(commands.Cog):
             return
         ch = discord.utils.get(guild.text_channels, name=NOTICE_CHANNEL)
         if ch is None:
-            cat = discord.utils.get(guild.categories, name=SUPERVISION_CAT)
+            cat = self._supervision_category(guild)
+            if cat is None:
+                # ⚠️ Sans catégorie, create_text_channel crée le salon À LA RACINE, avec
+                # les permissions par défaut du serveur : le journal des téléchargements
+                # serait lisible de tout le monde. On préfère ne PAS créer et le dire
+                # (2026-08-11) — provision créera « 📊 Supervision <clé> » au prochain
+                # cycle, et ce salon naîtra alors correctement rangé.
+                log.warning("catégorie de supervision introuvable : salon #%s NON créé "
+                            "(il serait public). Il le sera au prochain cycle de "
+                            "provisioning.", NOTICE_CHANNEL)
+                return
             try:
                 ch = await guild.create_text_channel(NOTICE_CHANNEL, category=cat,
                                                      topic="Téléchargements YouTube à la demande (/yt)")

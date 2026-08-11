@@ -18,7 +18,13 @@ from ..core.permissions import read_check, is_admin, can_read
 
 log = logging.getLogger("discord-bot.meta")
 
-LOCK_CATEGORY = "Lock"      # même catégorie que #ratio
+LOCK_CATEGORY = "Lock"      # repli historique : la vraie est « 🔒 Lock <SERVER_KEY> »
+
+
+def _norm(s):
+    """Nom de catégorie normalisé — « Lock » et « 🔒 Lock R820 » ne se ressemblent que
+    comparés en alphanumérique minuscule (même règle que Provision._ensure_category)."""
+    return "".join(c for c in str(s).lower() if c.isalnum())
 HELP_CHANNEL = "help"
 
 # command name -> category; anything unlisted lands in "Autres"
@@ -194,11 +200,27 @@ class Meta(commands.Cog):
         if ch is not None:
             return ch
         cat = None
-        cat_id = self.bot.state.get("lock_category_id")
-        if cat_id:
-            c = guild.get_channel(cat_id)
+        # 1) l'id publié par Provision : c'est LA catégorie verrouillée qui fait autorité
+        prov = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("lock")
+        if prov:
+            c = guild.get_channel(prov)
             if isinstance(c, discord.CategoryChannel):
                 cat = c
+        # 2) l'id mémorisé par un cog satellite
+        if cat is None:
+            cat_id = self.bot.state.get("lock_category_id")
+            if cat_id:
+                c = guild.get_channel(cat_id)
+                if isinstance(c, discord.CategoryChannel):
+                    cat = c
+        # 3) le NOM provisionné « 🔒 Lock <SERVER_KEY> », comparé en alphanumérique
+        #    (2026-08-11) : chercher « Lock » tout court désignait une catégorie
+        #    DIFFÉRENTE, que le bot créait alors sans overwrites — #help y naissait
+        #    visible de tout le serveur. Même correctif que servarr._lock_category.
+        if cat is None:
+            want = _norm(f"Lock {getattr(self.bot.cfg, 'server_key', 'R820')}")
+            cat = next((x for x in guild.categories if _norm(x.name) == want), None)
+        # 4) dernier repli historique
         if cat is None:
             cat = discord.utils.get(guild.categories, name=LOCK_CATEGORY)
         if cat is None:
