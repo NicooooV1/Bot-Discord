@@ -6,7 +6,12 @@ CT-down stay owned by the existing Grafana -> Discord webhook (no duplication).
 
 The same read-only evaluator (`_evaluate`) feeds both the background loop and the
 `/alerts` command so thresholds live in exactly one place.
+
+⚠️ L'espace de noms `state["alerts"]` est PARTAGÉ avec le cog servarr (clés
+`servarr_*`) : tout ce qui purge ou compte ce dict doit raisonner sur les clés
+PÉRIMÉES (LEGACY_KEYS), jamais sur « tout ce qui n'appartient pas à ce cog ».
 """
+import asyncio
 import logging
 
 import discord
@@ -23,11 +28,18 @@ log = logging.getLogger("discord-bot.alerts")
 class Alerts(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Purge des clés de de-dup que la boucle ne maintient plus (OWNED_KEYS a été
+        self._chan_warned = False
+        # Purge des clés de de-dup que la boucle ne maintient PLUS (OWNED_KEYS a été
         # restreint à {ipmi_temp}) : sinon d'anciens criticals persistés (thinpool/
         # backup…) resteraient des faux positifs permanents dans /health et /alerts.
+        # ⚠️ Purger sur « pas dans OWNED_KEYS » effaçait aussi les 6 clés servarr_*,
+        # BIEN VIVANTES et écrites dans le même dict — et comme `alerts` est chargé
+        # AVANT `servarr`, celui-ci repartait d'un état vide à chaque démarrage : le
+        # tunnel VPN coupé depuis 3 jours était re-pagé à chaque reboot matinal, et une
+        # condition résolue pendant l'arrêt ne postait jamais son « ✅ Résolu ».
+        # On énumère donc explicitement les clés périmées (2026-08-11).
         for k in list((bot.state.get("alerts", {}) or {}).keys()):
-            if k not in self.OWNED_KEYS:
+            if k in self.LEGACY_KEYS:
                 bot.state.clear_alert(k)
         self.loop.change_interval(seconds=bot.cfg.alert_poll_seconds)
         self.loop.start()
@@ -47,8 +59,16 @@ class Alerts(commands.Cog):
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(cid)
-            except Exception:
+            except Exception as e:
+                # Un salon d'alertes injoignable = plus AUCUNE alerte postée : ça ne
+                # peut pas rester silencieux. Une seule fois par panne, la boucle
+                # repasse ici toutes les 60 s (2026-08-11).
+                if not self._chan_warned:
+                    self._chan_warned = True
+                    log.warning("salon d'alertes %s injoignable (%s) — plus aucune "
+                                "alerte ne sera postée tant que ça dure", cid, e)
                 return None
+        self._chan_warned = False
         return ch
 
     async def _fire(self, ch, key, level, title, desc):
@@ -63,17 +83,30 @@ class Alerts(commands.Cog):
             await ch.send(embed=emb, view=AlertActionView())
             self.bot.state.set_alert(key, level)
         elif not level and prev:
-            await ch.send(embed=discord.Embed(
-                title=f"✅ Résolu — {title}", description=desc, color=fmt.GREEN))
+            # Le Snooze doit aussi taire le retour au vert : sinon le dernier message
+            # d'une alerte mise en sommeil part quand même (2026-08-11).
+            if not alert_snoozed(self.bot.state, key):
+                await ch.send(embed=discord.Embed(
+                    title=f"✅ Résolu — {title}", description=desc, color=fmt.GREEN))
             self.bot.state.clear_alert(key)
 
     async def _evaluate(self):
         """Read-only: current level of every owned-gap check.
-        Returns list of (key, level, title, desc); level is None when nominal."""
+        Returns list of (key, level, title, desc); level is None when nominal.
+
+        « Read-only » = n'écrit rien ; le niveau d'`ipmi_temp` LIT en revanche le niveau
+        persisté pour appliquer son hystérésis (cf. `_hysteresis`), il dépend donc du
+        cycle précédent — c'est voulu, et /alerts affiche ainsi exactement ce que la
+        boucle a décidé."""
         inf = self.bot.influx
         out = []
 
-        tp = await inf.thinpool()
+        # Les 6 lectures sont indépendantes : groupées, /alerts (interactif) répond au
+        # coût de la plus lente au lieu de leur somme.
+        tp, bs, (ctrl, _), disks, health, temps = await asyncio.gather(
+            inf.thinpool(), inf.backup_summary(), inf.raid(), inf.raid_disks(),
+            inf.smart_health(), inf.ipmi_temps())
+
         if tp and tp.get("pool_bytes"):
             # ALARME sur l'USAGE RÉEL (données/pool), PAS sur la surallocation : un thinpool
             # surprovisionné à 193 % est NORMAL en thin provisioning ; le danger (corruption)
@@ -88,7 +121,6 @@ class Alerts(commands.Cog):
             out.append(("thinpool_usage", level, "🗄️ Thinpool presque plein",
                         f"local-lvm usage réel **{dp:.0f}%** (un pool plein corrompt les volumes)"))
 
-        bs = await inf.backup_summary()
         if bs:
             age = bs.get("oldest_age_seconds")
             nob = int(bs.get("guests_without_backup", 0))
@@ -102,8 +134,6 @@ class Alerts(commands.Cog):
             out.append(("backup_age", level, "🛟 Sauvegardes en retard",
                         f"plus ancienne: {fmt.humanize_duration(age)} · sans backup: {nob}"))
 
-        ctrl, _ = await inf.raid()
-        disks = await inf.raid_disks()
         if ctrl:
             offline = [d.get("slot") for d in disks if not d.get("online")]
             bad = (not ctrl.get("vd_optimal")) or (not ctrl.get("batt_good")) or offline
@@ -113,13 +143,11 @@ class Alerts(commands.Cog):
                 desc += f" · slots offline: {offline}"
             out.append(("raid_health", "crit" if bad else None, "🧱 RAID dégradé", desc))
 
-        health = await inf.smart_health()
         if health:
             failed = [dev for dev, h in health if not bool(h)]
             out.append(("smart_fail", "crit" if failed else None, "💽 SMART FAIL",
                         f"disques en échec: {failed or '—'}"))
 
-        temps = await inf.ipmi_temps()
         vals = [(n, v) for n, v in temps if v is not None]
         if vals:
             # The ambient *inlet* sensor is the environmental-health signal; CPU/planar
@@ -133,11 +161,33 @@ class Alerts(commands.Cog):
             else:
                 mx = max(v for _, v in vals)
                 what, warn_t, crit_t = "capteur IPMI", 75.0, 85.0
-            level = "crit" if mx >= crit_t else ("warn" if mx >= warn_t else None)
+            level = self._hysteresis(mx, warn_t, crit_t,
+                                     self.bot.state.alert_level("ipmi_temp"))
+            # Une décimale : le seuil bas est un seuil d'AMBIANCE (32 °C) et la source
+            # est un `last()` brut. Arrondi à l'unité, l'alerte « max 32°C » et sa
+            # résolution « Résolu — max 32°C » étaient rigoureusement identiques.
             out.append(("ipmi_temp", level, "🌡️ Température élevée",
-                        f"{what} max **{mx:.0f}°C**"))
+                        f"{what} max **{mx:.1f}°C**"))
 
         return out
+
+    #: marge de retour (°C) : un capteur d'ambiance qui bat autour de son seuil ne doit
+    #: pas repasser au vert au premier dixième de degré.
+    HYSTERESIS_C = 2.0
+
+    @classmethod
+    def _hysteresis(cls, mx, warn_t, crit_t, prev):
+        """Niveau AVEC hystérésis asymétrique : on monte aux seuils nominaux, on ne
+        redescend qu'une fois `HYSTERESIS_C` degrés SOUS le seuil franchi.
+
+        Sans ça, `_fire` étant purement edge-triggered, une entrée d'air oscillant entre
+        31,7 et 32,2 °C en août postait « 🌡️ Température élevée » puis « ✅ Résolu »
+        jusqu'à une fois par minute toute la nuit — fatigue d'alerte sur le SEUL canal
+        d'alerte encore possédé par le bot (2026-08-11).
+        """
+        w = warn_t - cls.HYSTERESIS_C if prev in ("warn", "crit") else warn_t
+        c = crit_t - cls.HYSTERESIS_C if prev == "crit" else crit_t
+        return "crit" if mx >= c else ("warn" if mx >= w else None)
 
     async def _check_raid_grown(self, ch):
         """Grown-defects rising delta — one-shot info, not an edge-state alert."""
@@ -152,13 +202,26 @@ class Alerts(commands.Cog):
                 description=f"max grown defects {last} → **{cur_max}** ; "
                             "surveiller / remplacer le disque concerné.",
                 color=fmt.YELLOW))
-        self.bot.state.set("raid_grown_max", cur_max)
+        # N'écrire que sur CHANGEMENT : state.set() resérialise tout state.json (mkstemp
+        # + json.dump + os.replace), et cette valeur ne bouge presque jamais — c'était
+        # ~1440 réécritures complètes par jour pour rien. Le test porte sur l'inégalité,
+        # pas sur la hausse : un disque remplacé doit faire REDESCENDRE le baseline,
+        # sans quoi la prochaine hausse réelle passerait inaperçue (2026-08-11).
+        if last is None or last != cur_max:
+            self.bot.state.set("raid_grown_max", cur_max)
 
     # Grafana est désormais la source UNIQUE des alertes infra (thinpool/backup/RAID/
     # SMART) et log-based -> Discord #alertes avec un template soigné. Le bot ne poste
     # plus que l'IPMI (aucune règle Grafana ne couvre les capteurs IPMI) afin d'éviter
     # tout doublon. La commande /alerts continue d'évaluer TOUT (via _evaluate).
     OWNED_KEYS = {"ipmi_temp"}
+
+    #: Clés que la boucle a POSSÉDÉES par le passé et n'émet plus : elles resteraient
+    #: sinon persistées « crit » à vie dans state.json. Ce sont les SEULES que le
+    #: démarrage doit purger — le dict state["alerts"] est partagé avec servarr, dont
+    #: les clés sont vivantes et doivent survivre au redémarrage (c'est tout l'intérêt
+    #: de la de-dup edge-triggered).
+    LEGACY_KEYS = {"thinpool_usage", "backup_age", "raid_health", "smart_fail"}
 
     @tasks.loop(seconds=60)
     async def loop(self):
@@ -184,7 +247,7 @@ class Alerts(commands.Cog):
         await self.bot.wait_until_ready()
 
     @app_commands.command(
-        description="Alertes proactives actives (thinpool/backup/RAID/SMART/température).")
+        description="Alertes proactives actives (thinpool/backup/RAID/SMART/température/seedbox).")
     @read_check()
     async def alerts(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)
@@ -195,23 +258,54 @@ class Alerts(commands.Cog):
                 ephemeral=True)
             return
         findings = await self._evaluate()
+        # Les conditions servarr (VPN, port forwarding, qBittorrent, user-sync, ratio)
+        # sont postées dans le MÊME #alertes et persistées dans le MÊME dict : les
+        # omettre ici faisait répondre « ✅ Aucune alerte active » alors que le
+        # kill-switch AirVPN venait de couper le trafic (2026-08-11).
+        srv = bot.get_cog("Servarr")
+        if srv is not None:
+            try:
+                findings += await srv._evaluate()
+            except Exception:
+                log.exception("/alerts : évaluation servarr impossible")
+                findings.append(("servarr_eval", "warn", "📉 Seedbox",
+                                 "évaluation impossible — voir les logs du bot"))
         active = [(k, l, t, d) for (k, l, t, d) in findings if l]
         emb = discord.Embed(
             title="🚨 Alertes actives" if active else "✅ Aucune alerte active",
             color=(fmt.RED if any(l == "crit" for _, l, _, _ in active)
                    else fmt.YELLOW if active else fmt.GREEN))
         if active:
-            for k, l, t, d in active:
-                emb.add_field(name=f"{fmt.level_emoji(l)} {t}", value=d, inline=False)
+            # 25 champs max par embed : au-delà, Discord rejette TOUT l'envoi.
+            for k, l, t, d in active[:24]:
+                emb.add_field(name=f"{fmt.level_emoji(l)} {t}"[:256],
+                              value=(d or "—")[:1024], inline=False)
+            if len(active) > 24:
+                emb.add_field(name="…", value=f"{len(active) - 24} alertes supplémentaires",
+                              inline=False)
         else:
             watched = ", ".join(t for _, _, t, _ in findings) or "—"
-            emb.description = f"Tous les indicateurs surveillés sont au vert.\n{watched}"
+            emb.description = f"Tous les indicateurs surveillés sont au vert.\n{watched}"[:4096]
+        # Un ✅ vert alors qu'InfluxDB ne répond plus est un feu vert MENSONGER : toutes
+        # les requêtes renvoient [] et chaque contrôle se tait. Le drapeau vient de
+        # core/influx (getattr : on ne dépend pas de sa présence).
+        if getattr(bot.influx, "blind", False):
+            # …mais ne JAMAIS adoucir un bilan déjà rouge : l'aveuglement est une
+            # incertitude, pas une bonne nouvelle. Repeindre en jaune un embed portant
+            # un « crit » ferait passer une alerte critique pour un avertissement.
+            if not any(l == "crit" for _, l, _, _ in active):
+                emb.color = fmt.YELLOW
+            emb.description = ("⚠️ Dernière requête InfluxDB en ÉCHEC — la supervision "
+                               "est aveugle, ce bilan est incomplet.\n"
+                               + (emb.description or ""))[:4096]
+        # Pas de filtre OWNED_KEYS : l'état persisté appartient aussi à servarr, et les
+        # clés périmées sont purgées au démarrage (LEGACY_KEYS).
         persisted = {k: v.get("level")
                      for k, v in (bot.state.get("alerts", {}) or {}).items()
-                     if v.get("level") and k in self.OWNED_KEYS}
+                     if isinstance(v, dict) and v.get("level")}
         if persisted:
-            emb.set_footer(text="État persisté: "
-                                + ", ".join(f"{k}[{l}]" for k, l in persisted.items()))
+            emb.set_footer(text=("État persisté: "
+                                 + ", ".join(f"{k}[{l}]" for k, l in persisted.items()))[:2048])
         await itx.followup.send(embed=emb, ephemeral=True)
 
 

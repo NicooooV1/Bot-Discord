@@ -17,8 +17,11 @@ host_status, tasks globales, backup_all) restent ceux du R820. Cluster distant
 injoignable => les invités distants sont simplement omis (le R820 n'est jamais impacté),
 avec une fenêtre de grâce via cache pour éviter d'archiver leurs salons sur un blip.
 """
+import asyncio
+import concurrent.futures
 import json
 import logging
+import threading
 import time
 
 log = logging.getLogger("discord-bot.pve")
@@ -115,13 +118,41 @@ class _RemoteCluster:
         if cfg.avy_action_token_secret:
             self._rw = _mk_remote_client(cfg, cfg.avy_action_token_id,
                                          cfg.avy_action_token_secret)
+        else:
+            # 2026-08-11 : sans ce log, l'oubli du secret (AVY_* n'est documenté NULLE PART
+            # dans config.env.example) ne se voyait qu'au premier /ctctl sur un invité -avy,
+            # sous la forme d'un « 'NoneType' object has no attribute 'nodes' ».
+            log.warning("cluster %s : jeton d'action absent (AVY_PVE_ACTION_TOKEN_SECRET) "
+                        "— actions distantes DÉSACTIVÉES, lectures seules", self.key)
         self._gnodes = {}
         self._nodes_cache = None
         self._nodes_ts = 0.0
 
+    @property
+    def actions_enabled(self):
+        return self._rw is not None
+
+    @property
+    def _action_api(self):
+        """Client d'ÉCRITURE, ou une erreur parlante. Les 4 méthodes d'action passent par
+        là : tous les appelants affichent déjà `❌ Échec : {e}` et auditent l'exception,
+        le message remonte donc tel quel plutôt qu'un AttributeError sur None (2026-08-11).
+
+        Nommée `_action_api` et non `_wr` : à une transposition de lettres près de `_rw`
+        (le client brut, qui peut valoir None), la garde se contournait à la première
+        faute de frappe d'une future méthode d'écriture — relecture 2026-08-11."""
+        if self._rw is None:
+            raise RuntimeError(f"cluster {self.key} : jeton d'action non configuré "
+                               f"(AVY_PVE_ACTION_TOKEN_SECRET)")
+        return self._rw
+
     def nodes_online(self, ttl=60):
+        # `is None` et non `not …` : une liste VIDE est une réponse légitime (cluster
+        # arrêté, perte de quorum) et doit être mise en cache comme les autres, sinon
+        # chaque pbs_content/delete_backup/running_vzdump_vmids re-payait un /nodes
+        # distant pendant toute la fenêtre dégradée (2026-08-11).
         now = time.time()
-        if not self._nodes_cache or now - self._nodes_ts > ttl:
+        if self._nodes_cache is None or now - self._nodes_ts > ttl:
             self._nodes_cache = [n["node"] for n in self._ro.nodes.get()
                                  if n.get("status") == "online"]
             self._nodes_ts = now
@@ -208,15 +239,15 @@ class _RemoteCluster:
         kw = {"all": 1, "storage": self.storage, "mode": mode}
         if exclude:
             kw["exclude"] = exclude
-        return self._rw.nodes(node).vzdump.post(**kw, **notes)
+        return self._action_api.nodes(node).vzdump.post(**kw, **notes)
 
     def action(self, verb, vmid, gtype):
-        api = self._rw.nodes(self.node_of(vmid))
+        api = self._action_api.nodes(self.node_of(vmid))
         ep = api.qemu(vmid) if gtype == "qemu" else api.lxc(vmid)
         return getattr(ep.status, verb).post()
 
     def backup(self, vmid, mode, notes):
-        return self._rw.nodes(self.node_of(vmid)).vzdump.post(
+        return self._action_api.nodes(self.node_of(vmid)).vzdump.post(
             vmid=int(vmid), storage=self.storage, mode=mode, **notes)
 
     def _upid_node(self, upid):
@@ -232,27 +263,47 @@ class _RemoteCluster:
     def running_vzdump_vmids(self):
         """Vrais vmid (str) en cours de vzdump, agrégés sur les nœuds en ligne."""
         out = set()
-        for n in self.nodes_online():
+        nodes = self.nodes_online()
+        errs, last = 0, None
+        for n in nodes:
             try:
                 act = self._ro.nodes(n).tasks.get(source="active", limit=100) or []
-            except Exception:
+            except Exception as e:
+                # un nœud muet ne doit pas masquer les autres, mais le taire complètement
+                # cachait aussi un jeton sans Sys.Audit sur ce nœud (2026-08-11)
+                log.debug("cluster %s : tâches actives illisibles sur %s: %s", self.key, n, e)
+                errs, last = errs + 1, e
                 continue
             out |= {str(t.get("id")) for t in act
                     if t.get("type") == "vzdump"
                     and str(t.get("status", "")).lower() == "running" and t.get("id")}
+        # TOUS les nœuds muets : ce n'est plus « un nœud absent » mais le lien. On propage
+        # pour que le coupe-circuit s'arme côté Pve — sinon, tant que le cache de
+        # nodes_online reste chaud (60 s), on re-payait un timeout PAR NŒUD à chaque cycle
+        # sans que rien ne l'arme, l'échec étant avalé ici (2026-08-11).
+        if nodes and errs == len(nodes) and last is not None:
+            raise last
         return out
 
+    def _any_node(self):
+        """Un nœud en ligne quelconque — le stockage de sauvegarde est PARTAGÉ (CIFS sur
+        tous les nœuds), n'importe lequel répond. Liste vide = cluster entier hors ligne :
+        on lève au lieu d'un `[0]` -> IndexError « list index out of range » incompréhensible
+        côté Discord (2026-08-11). AvyUnreachable est définie plus bas dans le module : la
+        résolution du nom se fait à l'appel, pas à la définition."""
+        nodes = self.nodes_online()
+        if not nodes:
+            raise AvyUnreachable(f"aucun nœud en ligne sur {self.key}")
+        return nodes[0]
+
     def pbs_content(self, vmid=None):
-        # le stockage est partagé (CIFS tous nœuds) : n'importe quel nœud en ligne répond
-        node = self.nodes_online()[0]
-        items = self._ro.nodes(node).storage(self.storage).content.get()
+        items = self._ro.nodes(self._any_node()).storage(self.storage).content.get()
         if vmid is not None:
             items = [i for i in items if str(i.get("vmid")) == str(vmid)]
         return items
 
     def delete_backup(self, volid):
-        node = self.nodes_online()[0]
-        return self._rw.nodes(node).storage(self.storage).content(volid).delete()
+        return self._action_api.nodes(self._any_node()).storage(self.storage).content(volid).delete()
 
 
 class LlmExecError(RuntimeError):
@@ -276,11 +327,24 @@ class _LlmBridge:
     (ACL /vms/<vmid>, PAS /vms) — même en cas de fuite du jeton, le pire cas reste une
     exécution de commande dans cette VM précise, jamais sur le reste du cluster."""
 
+    # Concurrence des CONVERSATIONS (2026-08-11). Chaque appel occupe un thread jusqu'à
+    # 90 s (sondage exec-status à travers le tunnel WG) et /assistant comme #chat-ia
+    # lancent une conversation PAR MESSAGE, jusqu'à 3 tours, sans file ni anti-rebond :
+    # huit questions d'affilée immobilisaient huit workers du pool PARTAGÉ d'asyncio
+    # (~6-8 dans le CT106), donc AUSSI les lectures PVE/Influx des boucles de fond —
+    # embeds épinglés figés et boutons hors du budget de 3 s, sans rien dans les logs.
+    # On REFUSE au-delà de la limite au lieu d'attendre : attendre immobiliserait
+    # justement le worker qu'on cherche à libérer. Le moniteur périodique (monitor(),
+    # 1 appel / 5 min) n'est PAS compté — le refuser afficherait « IA locale
+    # injoignable » à tort dans le salon AVY-LLM.
+    _MAX_CHATS_INFLIGHT = 2
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.node = cfg.avy_llm_node
         self.vmid = cfg.avy_llm_vmid
         self._api = _mk_remote_client(cfg, cfg.avy_llm_token_id, cfg.avy_llm_token_secret)
+        self._chat_sem = threading.BoundedSemaphore(self._MAX_CHATS_INFLIGHT)
 
     @staticmethod
     def _fix_mojibake(s):
@@ -295,18 +359,26 @@ class _LlmBridge:
 
     def _exec(self, argv):
         """Lance argv (liste, PAS de shell — execve direct par le guest-agent) et
-        attend la fin. Renvoie (stdout, stderr, exitcode)."""
+        attend la fin. Renvoie (stdout, stderr, exitcode).
+
+        Le sondage part court puis ralentit (0,3 s -> plafond 2 s) : une réponse rapide
+        revient en ~0,3 s au lieu de 1,5 s, et une réponse lente coûte ~48 requêtes au
+        lieu de 60 sur le tunnel WG (2026-08-11 ; chiffre recompté à la relecture — le
+        plafond de 2 s ne divise pas le nombre de sondages par 3, c'est la LATENCE des
+        réponses courtes qui gagne, pas le volume)."""
         ep = self._api.nodes(self.node).qemu(self.vmid).agent
         r = ep.exec.post(command=argv)
         pid = r["pid"]
         deadline = time.time() + 90
+        delay = 0.3
         while time.time() < deadline:
             st = ep("exec-status").get(pid=pid)
             if st.get("exited"):
                 out = self._fix_mojibake(st.get("out-data", ""))
                 err = self._fix_mojibake(st.get("err-data", ""))
                 return out, err, st.get("exitcode")
-            time.sleep(1.5)
+            time.sleep(delay)
+            delay = min(2.0, delay * 1.6)
         raise LlmExecError("timeout (90s) en attente de la réponse du modèle")
 
     def chat(self, messages, tools=None, max_tokens=700, temperature=0.3):
@@ -320,7 +392,16 @@ class _LlmBridge:
                 f"http://localhost:{self.cfg.avy_llm_port}/v1/chat/completions",
                 "-H", "Content-Type: application/json",
                 "--data-binary", json.dumps(payload)]
-        out, err, code = self._exec(argv)
+        # refus immédiat au-delà de _MAX_CHATS_INFLIGHT (cf. commentaire de classe) :
+        # l'appelant affiche le message tel quel, personne n'attend en occupant un worker
+        if not self._chat_sem.acquire(blocking=False):
+            raise LlmExecError(
+                f"trop de demandes en cours ({self._MAX_CHATS_INFLIGHT} au maximum) "
+                f"— réessaie dans un instant")
+        try:
+            out, err, code = self._exec(argv)
+        finally:
+            self._chat_sem.release()
         if not out:
             raise LlmExecError(f"réponse vide (exitcode={code}, err={err[:200]})")
         try:
@@ -436,6 +517,7 @@ class Pve:
             except Exception:
                 log.exception("init du client du cluster %s", cfg.avy_key)
         self._llm = None
+        self._llm_pool = None       # pool dédié, créé à la 1re utilisation (_llm_executor)
         if getattr(cfg, "avy_llm_enabled", False):
             try:
                 self._llm = _LlmBridge(cfg)
@@ -463,6 +545,39 @@ class Pve:
             raise LlmExecError("assistant IA local non configuré")
         return self._llm_guarded(self._llm.monitor)
 
+    def _llm_executor(self):
+        """Pool DÉDIÉ aux appels IA (créé à la première utilisation).
+
+        `asyncio.to_thread` utilise le pool PAR DÉFAUT de la boucle (~6-8 threads ici),
+        partagé avec toutes les lectures PVE/Influx/qBittorrent : un appel IA qui dure
+        90 s y prend une place que les boucles de fond attendent. Ces deux enveloppes
+        sortent l'IA de ce pool — à préférer à `asyncio.to_thread(pve.llm_chat, …)`
+        (2026-08-11).
+
+        Taille = _MAX_CHATS_INFLIGHT + 2, et surtout PAS 2 (relecture 2026-08-11) : la
+        limite de concurrence est le sémaphore de _LlmBridge, qui REFUSE tout de suite
+        au-delà de 2 conversations. Avec un pool de 2, les demandes en trop n'auraient
+        jamais atteint ce refus : elles auraient attendu en file DANS l'exécuteur (file
+        non bornée) jusqu'à 90 s — exactement le comportement « mise en file muette »
+        que le sémaphore existe pour éviter. Les workers libres servent au refus
+        immédiat et au monitor() périodique, qui n'est pas compté par le sémaphore et ne
+        doit pas rester coincé derrière deux conversations."""
+        if self._llm_pool is None:
+            self._llm_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_LlmBridge._MAX_CHATS_INFLIGHT + 2, thread_name_prefix="llm")
+        return self._llm_pool
+
+    async def allm_chat(self, messages, tools=None, max_tokens=700, temperature=0.3):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._llm_executor(),
+            lambda: self.llm_chat(messages, tools=tools, max_tokens=max_tokens,
+                                  temperature=temperature))
+
+    async def allm_monitor(self):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._llm_executor(), self.llm_monitor)
+
     @property
     def enabled(self):
         return self._ro is not None
@@ -475,6 +590,14 @@ class Pve:
     @property
     def avy_enabled(self):
         return self._avy is not None
+
+    @property
+    def avy_actions_enabled(self):
+        """`actions_enabled` ne parle QUE du R820 : un déploiement où le jeton d'action
+        distant manque laisse quand même passer les gardes des cogs. L'échec reste
+        explicite grâce à _RemoteCluster._action_api ; cette propriété permet de l'annoncer AVANT
+        (diagnostic de démarrage, gardes côté cogs) — 2026-08-11."""
+        return self._avy is not None and self._avy.actions_enabled
 
     @property
     def avy_key(self):
@@ -781,19 +904,30 @@ class Pve:
         cluster secondaire arrivent DÉCALÉS, cohérents avec guest_map)."""
         try:
             act = self.tasks(source="active", limit=100)
-        except Exception:
+        except Exception as e:
+            log.debug("tâches actives R820 illisibles: %s", e)
             act = []
         out = {str(t.get("id")) for t in (act or [])
                if t.get("type") == "vzdump"
                and str(t.get("status", "")).lower() == "running" and t.get("id")}
         if self._avy is not None:
             try:
+                # 2026-08-11 : passe désormais par le coupe-circuit. Cette lecture est
+                # appelée à CHAQUE cycle des salons (2 min) : sans lui, elle re-payait le
+                # timeout de 30 s du client distant pendant toute une coupure WG, alors que
+                # le reste du code ne sonde plus qu'une fois par fenêtre AVY_BACKOFF.
                 out |= {str(int(v) + AVY_OFFSET)
-                        for v in self._avy.running_vzdump_vmids()}
-            except Exception:
-                pass
+                        for v in self._avy_read(self._avy.running_vzdump_vmids)}
+            except Exception as e:
+                # une sauvegarde distante non listée ne coûte qu'un badge 💾 manquant :
+                # jamais une panne du bot, mais plus jamais un échec totalement muet
+                log.debug("vzdump en cours (cluster distant) illisible: %s", e)
         return out
 
+    # task_status / task_log / pbs_content ci-dessous appellent le cluster distant SANS
+    # coupe-circuit : ce sont des suivis d'ACTION déclenchée par l'utilisateur (même
+    # exemption assumée que avy_backup_node) — on tente toujours, quitte à payer le
+    # timeout, plutôt que de répondre « injoignable » sans avoir essayé.
     def task_status(self, upid):
         if str(upid).startswith(AVY_UPID_PREFIX):
             return self._avy.task_status(str(upid)[len(AVY_UPID_PREFIX):])
@@ -869,6 +1003,52 @@ class Pve:
         """'lxc' ou 'qemu' — pour router les actions vers la bonne API."""
         g = self.guest_map().get(name)
         return g.get("type") if g else None
+
+    # ------------------------------------------------------------------ API async
+    # proxmoxer est SYNCHRONE (requests) : un appel depuis la boucle d'événements la
+    # gèle jusqu'à 15 s (R820) ou 30 s (Aveyron) — plus aucune interaction acquittée,
+    # plus de heartbeat gateway, reconnexion possible de la session Discord.
+    #
+    # Le contrat « enveloppez chaque appel dans to_thread » n'existait qu'en commentaire
+    # (pve.py:5) : 92 sites le respectaient, 9 l'avaient oublié (audit 2026-08-11).
+    # Ces enveloppes rendent le contrat EXÉCUTABLE — appeler `await pve.aguest_map()`
+    # est plus court que la version fautive, donc c'est le chemin naturel.
+    #
+    # Même patron que Influx.aq(), déjà en place côté InfluxDB.
+
+    async def acall(self, fn, *args, **kwargs):
+        """Enveloppe générique : `await pve.acall(pve.node_status, "pve")`."""
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def aresources(self):
+        return await asyncio.to_thread(self.resources)
+
+    async def aguest_map(self, ttl=30):
+        return await asyncio.to_thread(self.guest_map, ttl)
+
+    async def aguest_status(self, vmid, gtype):
+        return await asyncio.to_thread(self.guest_status, vmid, gtype)
+
+    async def aguest_config(self, vmid, gtype):
+        return await asyncio.to_thread(self.guest_config, vmid, gtype)
+
+    async def avmid_of(self, name):
+        return await asyncio.to_thread(self.vmid_of, name)
+
+    async def aguest_type(self, name):
+        return await asyncio.to_thread(self.guest_type, name)
+
+    async def aserver_of_name(self, name):
+        return await asyncio.to_thread(self.server_of_name, name)
+
+    async def astorage_for(self, vmid):
+        return await asyncio.to_thread(self.storage_for, vmid)
+
+    async def apbs_content(self, vmid=None):
+        return await asyncio.to_thread(self.pbs_content, vmid)
+
+    async def atask_status(self, upid):
+        return await asyncio.to_thread(self.task_status, upid)
 
     # Le paramètre est « notes-template » (tiret), pas « notes_template » : avec l'underscore
     # l'API répond 400 « property is not defined in schema » AVANT tout contrôle de

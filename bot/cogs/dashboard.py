@@ -11,7 +11,7 @@ from ..core import format as fmt
 from ..core import render
 from ..core.permissions import admin_check
 from ..views.refresh import RefreshView
-from .alerts import Alerts  # source unique des clés d'alerte réellement maintenues
+from .graphs import to_local   # même repère de temps (cfg.tz) pour tous les graphes
 
 log = logging.getLogger("discord-bot.dashboard")
 
@@ -36,9 +36,17 @@ class Dashboard(commands.Cog):
         if not bot.influx.enabled:
             emb.description = "⚠️ InfluxDB non configuré (`INFLUX_TOKEN`)."
         else:
-            cpu = await bot.influx.host_cpu_series("6h")
-            mem = await bot.influx.host_mem_series("6h")
-            load = await bot.influx.host_load()
+            # 7 lectures Flux indépendantes : groupées, le dashboard coûte la plus lente
+            # au lieu de leur somme — le bouton 🔄 et /dashboard sont interactifs.
+            # ⚠️ influx.raid() renvoie un TUPLE (ctrl, summ).
+            cpu, mem, load, cts, st, (ctrl, _), bs = await asyncio.gather(
+                bot.influx.host_cpu_series("6h"),
+                bot.influx.host_mem_series("6h"),
+                bot.influx.host_load(),
+                bot.influx.ct_table(),
+                bot.influx.storages(),
+                bot.influx.raid(),
+                bot.influx.backup_summary())
             cur = []
             if cpu[1]:
                 cur.append(f"CPU **{cpu[1][-1]:.0f}%**")
@@ -48,38 +56,45 @@ class Dashboard(commands.Cog):
                 cur.append(f"load {float(load.get('load1') or 0):.2f}")
             emb.add_field(name=f"Hôte {bot.cfg.pve_node}", value=" · ".join(cur) or "—", inline=False)
 
-            cts = await bot.influx.ct_table()
             up = [c for c in cts if c["running"]]
             top = "\n".join(
                 f"🟢 {c['name']} — CPU {c['cpu_pct']:.0f}% · RAM {c['ram_pct']:.0f}% "
                 f"({fmt.humanize_bytes(c['mem'])}/{fmt.humanize_bytes(c['maxmem'])})"
                 for c in up[:5]) or "—"
-            emb.add_field(name=f"Top CT ({len(up)}/{len(cts)})", value=top, inline=True)
+            # ct_table() ne couvre que le bucket « Proxmox » : les invités Aveyron sont
+            # dans un autre bucket et ne sont PAS comptés ici — le dire (2026-08-11).
+            scope = " · R820" if getattr(bot.pve, "avy_enabled", False) else ""
+            emb.add_field(name=f"Top CT ({len(up)}/{len(cts)}){scope}",
+                          value=top[:1024], inline=True)
 
-            st = await bot.influx.storages()
             emb.add_field(name="Stockage",
-                          value="\n".join(f"{s['name']} — {fmt.pct_of(s['used'], s['total'])}"
-                                          for s in st[:4]) or "—",
+                          value=("\n".join(f"{s['name']} — {fmt.pct_of(s['used'], s['total'])}"
+                                           for s in st[:4]) or "—")[:1024],
                           inline=True)
 
-            ctrl, _ = await bot.influx.raid()
             if ctrl:
                 emb.add_field(name="RAID",
                               value="optimal ✅" if ctrl.get("vd_optimal") else "⚠️ dégradé",
                               inline=True)
-            bs = await bot.influx.backup_summary()
             if bs:
                 emb.add_field(name="Backup +ancien",
                               value=fmt.humanize_duration(bs.get("oldest_age_seconds")), inline=True)
 
+            # Influx horodate en UTC : ramener dans cfg.tz avant le rendu, sinon l'axe
+            # du dashboard est décalé de 2 h l'été par rapport aux messages Discord.
             file = await asyncio.to_thread(render.timeseries, "Hôte CPU/RAM (6h)", "%",
-                                           {"CPU%": cpu, "RAM%": mem}, "dash.png", True)
+                                           to_local({"CPU%": cpu, "RAM%": mem}, bot.cfg.tz),
+                                           "dash.png", True)
             if file:
                 emb.set_image(url="attachment://dash.png")
         adict = bot.state.d.get("alerts", {}) or {}
-        # N'afficher que les alertes que le bot maintient encore (OWNED_KEYS) — sinon
-        # d'anciennes clés persistées feraient remonter des faux "actives".
-        nb = sum(1 for k, v in adict.items() if k in Alerts.OWNED_KEYS and v.get("level"))
+        # Compter TOUTES les alertes encore maintenues, quel que soit le cog qui les
+        # écrit : le filtre sur Alerts.OWNED_KEYS ({"ipmi_temp"}) excluait les 6 clés
+        # servarr_* bien vivantes (VPN down, qBittorrent, ratio…), si bien que le
+        # tableau de bord épinglé affichait « alertes actives: 0 » pendant que le
+        # kill-switch AirVPN avait coupé le trafic (2026-08-11). Les clés PÉRIMÉES,
+        # elles, sont purgées au démarrage par Alerts.__init__ (LEGACY_KEYS).
+        nb = sum(1 for v in adict.values() if isinstance(v, dict) and v.get("level"))
         emb.set_footer(text=f"alertes actives: {nb} · rafraîchi")
         return emb, file
 
@@ -93,7 +108,8 @@ class Dashboard(commands.Cog):
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(d["channel_id"])
-            except Exception:
+            except Exception as e:
+                log.warning("dashboard: salon %s introuvable (%s)", d["channel_id"], e)
                 return
         try:
             msg = await ch.fetch_message(d["message_id"])
@@ -143,7 +159,10 @@ class Dashboard(commands.Cog):
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(d["channel_id"])
-            except Exception:
+            except Exception as e:
+                # Boucle de 2 min : en debug pour ne pas noyer les logs si le salon a
+                # été supprimé, mais plus jamais en silence total.
+                log.debug("dashboard: salon %s injoignable (%s)", d["channel_id"], e)
                 return
         try:
             msg = await ch.fetch_message(d["message_id"])
@@ -161,13 +180,17 @@ class Dashboard(commands.Cog):
         except Exception:
             log.exception("dashboard build failed")
             return
-        kwargs = {"embed": emb, "view": RefreshView(self.bot)}
-        if file:
-            kwargs["attachments"] = [file]
+        # PURGER explicitement les pièces jointes quand il n'y a pas de nouvelle image :
+        # sans `attachments`, discord.py CONSERVE l'ancienne. Quand telegraf s'arrête,
+        # render.timeseries renvoie None et l'embed perd son set_image — le vieux
+        # dash.png restait alors attaché au message, présenté comme courant, pendant que
+        # les champs affichaient « — » (2026-08-11).
+        kwargs = {"embed": emb, "view": RefreshView(self.bot),
+                  "attachments": [file] if file else []}
         try:
             await msg.edit(**kwargs)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.debug("dashboard: édition du message impossible (%s)", e)
 
     @refresh_loop.before_loop
     async def _before(self):

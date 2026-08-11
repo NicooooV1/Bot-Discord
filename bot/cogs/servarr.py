@@ -4,6 +4,7 @@ commandes /ratio et /langues. Lit InfluxDB (métriques) + Radarr (audit langues)
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,24 +14,38 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
+from ..core.gates import GatedView
 from ..core.permissions import read_check, admin_check
 from ..views.alertaction import AlertActionView, alert_snoozed
 
 log = logging.getLogger("discord-bot.servarr")
 
 RATIO_WARN = 1.0
-LOCK_CATEGORY = "Lock"
+LOCK_CATEGORY = "Lock"      # repli historique : la vraie catégorie est « 🔒 Lock <clé> »
 RATIO_CHANNEL = "ratio"
 APIS_FILE = "/opt/discord-bot/servarr-apis.json"
 # Vraies stats C411 (le tracker, ≠ ratio local qBittorrent) — saisies via /setratio.
 DEFAULT_C411 = {"ratio": 2.96, "up_to": 2.592, "dl_go": 898.1, "bonus_go": 269.8}
 
 
+def _norm(s):
+    """Nom de catégorie normalisé (même règle que Provision._ensure_category) : « Lock »
+    et « 🔒 Lock R820 » ne se ressemblent que comparés en alphanumérique minuscule."""
+    return "".join(c for c in str(s).lower() if c.isalnum())
+
+
 def _load_apis():
     try:
         with open(APIS_FILE) as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        # informatif : sans ce fichier, /langues et le débit temps réel sont muets pour
+        # toujours — l'avaler en silence laissait croire à une seedbox à 0 o/s.
+        log.warning("%s absent : /langues et le débit qBittorrent seront indisponibles",
+                    APIS_FILE)
+        return {}
+    except Exception as e:  # noqa: BLE001 — JSON cassé : le bot doit démarrer quand même
+        log.warning("%s illisible: %s", APIS_FILE, e)
         return {}
 
 
@@ -63,7 +78,14 @@ class Servarr(commands.Cog):
         self.bot = bot
         self.apis = _load_apis()
         self._ratio_cache = None    # dernières données Influx (qb/vpn/sync/fl) — pour le débit live
+        self._ratio_gen = 0         # n° de génération du cache : dit à la boucle débit qu'il a bougé
         self._ratio_msg = None      # message #ratio gardé en cache (édité toutes les 10 s)
+        self._ratio_view = None     # UNE seule instance de la vue persistante (cf. _view)
+        self._last_debit = None     # dernier débit publié -> pas de PATCH Discord inutile
+        self._debit_ticks = 0       # tours depuis la dernière édition (réédition forcée)
+        self._last_manual_refresh = 0.0   # anti-rebond du bouton Rafraîchir
+        self._qbit_warn_at = 0.0    # dernière panne qBittorrent journalisée (throttle)
+        self._ratio_public_warned = False  # #ratio lisible de @everyone : signalé 1 fois
         self._qbit_cookie = None    # session qBittorrent réutilisée (débit direct temps réel)
         self._pin_lock = asyncio.Lock()   # sérialise ensure+pin_edit (ratiochan vs /setratio)
         self.loop.change_interval(seconds=bot.cfg.alert_poll_seconds)
@@ -73,8 +95,19 @@ class Servarr(commands.Cog):
 
     async def cog_load(self):
         # vue persistante (bouton Rafraîchir survit aux redémarrages)
-        self.bot.add_view(RatioRefreshView(self))
+        self.bot.add_view(self._view())
         self.bot.add_view(AlertActionView())   # boutons Snooze sur les alertes seedbox
+
+    def _view(self):
+        """L'UNIQUE instance de la vue du message #ratio.
+
+        Chaque édition en réinstanciait une (8 640 fois par jour) : autant d'entrées
+        réenregistrées dans le ViewStore de discord.py pour un bouton strictement
+        identique. Une vue persistante (timeout=None + custom_id) se réutilise
+        telle quelle (2026-08-11)."""
+        if self._ratio_view is None:
+            self._ratio_view = RatioRefreshView(self)
+        return self._ratio_view
 
     def cog_unload(self):
         self.loop.cancel()
@@ -92,10 +125,13 @@ class Servarr(commands.Cog):
         return rows[0] if rows else None
 
     async def _read(self):
-        qb = await self._pivot("qbittorrent", ["host"])
-        vpn = await self._pivot("servarr_vpn", ["host", "country"])
-        sync = await self._pivot("servarr_sync", ["host"])
-        return qb, vpn, sync
+        # Les 3 pivots sont indépendants : enchaînés, ils empilaient leurs latences sur
+        # un chemin emprunté par /ratio, le bouton Rafraîchir ET la boucle d'alertes
+        # (60 s). Influx.aq part dans son propre thread, gather les chevauche (2026-08-11).
+        return await asyncio.gather(
+            self._pivot("qbittorrent", ["host"]),
+            self._pivot("servarr_vpn", ["host", "country"]),
+            self._pivot("servarr_sync", ["host"]))
 
     async def _freeleech_count(self):
         b = self.bot.cfg.influx_bucket
@@ -115,10 +151,25 @@ class Servarr(commands.Cog):
                 return json.loads(r.read())
         try:
             return await asyncio.to_thread(_sync)
-        except Exception:
+        except Exception as e:  # noqa: BLE001 — panne réseau / 401 / timeout
+            # ⚠️ None ≠ [] : l'appelant DOIT distinguer « injoignable » de « rien à
+            # signaler ». Sans cette trace, une clé API révoquée passait totalement
+            # inaperçue (audit 2026-08-11).
+            log.warning("api %s %s: %s", app, path, e)
             return None
 
     # --------------------------------------------- débit qBittorrent en direct
+    def _qbit_warn(self, what, err):
+        """Journalise une panne qBittorrent au plus une fois toutes les 5 min.
+
+        La boucle débit interroge qBittorrent toutes les 10 s : journaliser chaque échec
+        noierait les logs (8 640 lignes/jour) — les avaler en silence, à l'inverse, rendait
+        une seedbox injoignable indiscernable d'une seedbox à l'arrêt (2026-08-11)."""
+        now = time.monotonic()
+        if now - self._qbit_warn_at > 300:
+            self._qbit_warn_at = now
+            log.warning("qbit %s: %s", what, err)
+
     def _qbit_login(self, a):
         data = urllib.parse.urlencode({"username": a["user"], "password": a["pass"]}).encode()
         req = urllib.request.Request(a["url"] + "/api/v2/auth/login", data=data,
@@ -141,9 +192,11 @@ class Servarr(commands.Cog):
             if not self._qbit_cookie:
                 try:
                     self._qbit_cookie = self._qbit_login(a)
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    self._qbit_warn("login", e)
                     return None
                 if not self._qbit_cookie:
+                    self._qbit_warn("login", "aucun cookie de session renvoyé")
                     return None
             try:
                 req = urllib.request.Request(a["url"] + "/api/v2/transfer/info",
@@ -158,15 +211,22 @@ class Servarr(commands.Cog):
                 if e.code in (401, 403):     # session expirée -> on se reconnecte une fois
                     self._qbit_cookie = None
                     continue
+                self._qbit_warn("transfer/info", f"HTTP {e.code}")
                 return None
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                self._qbit_warn("transfer/info", e)
                 return None
+        # sortie de boucle = 401/403 DEUX fois de suite (relogin accepté puis session
+        # refusée) : c'était le dernier chemin muet, celui d'un mot de passe qBittorrent
+        # changé — le débit tombait à « rien » sans une ligne de log (relecture 2026-08-11)
+        self._qbit_warn("transfer/info", "session refusée 2× (401/403) — identifiants ?")
         return None
 
     async def _qbit_transfer(self):
         try:
             return await asyncio.to_thread(self._qbit_transfer_sync)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            self._qbit_warn("transfer (thread)", e)
             return None
 
     # --------------------------------------------- pilotage torrents (pause/reprise)
@@ -180,9 +240,11 @@ class Servarr(commands.Cog):
             if not self._qbit_cookie:
                 try:
                     self._qbit_cookie = self._qbit_login(a)
-                except Exception:
+                except Exception as e:  # noqa: BLE001 — l'appelant affiche « injoignable »,
+                    log.warning("qbit login (%s): %s", path, e)   # mais la cause doit être tracée
                     return None
                 if not self._qbit_cookie:
+                    log.warning("qbit login (%s): aucun cookie de session renvoyé", path)
                     return None
             try:
                 body = urllib.parse.urlencode(data).encode() if data is not None else None
@@ -201,6 +263,9 @@ class Servarr(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning("qbit %s: %s", path, e)
                 return None
+        # 401/403 deux fois de suite : l'appelant dira « injoignable », la cause réelle
+        # (identifiants refusés) doit apparaître dans les journaux (relecture 2026-08-11)
+        log.warning("qbit %s: session refusée 2× (401/403) — identifiants ?", path)
         return None
 
     async def _qbit_downloads(self):
@@ -245,7 +310,9 @@ class Servarr(commands.Cog):
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(cid)
-            except Exception:
+            except Exception as e:  # noqa: BLE001 — salon supprimé / permission retirée
+                # sans cette trace, TOUTES les alertes seedbox disparaissaient en silence
+                log.warning("salon d'alertes %s inaccessible: %s", cid, e)
                 return None
         return ch
 
@@ -286,9 +353,39 @@ class Servarr(commands.Cog):
             usu = int(sync.get("usersync_up", 0) or 0)
             out.append(("servarr_sync_down", None if usu else "warn", "🔁 Daemon user-sync arrêté",
                         "la synchro des comptes Jellyfin⇄Seerr ne tourne plus"))
-        ratio = float(self._c411().get("ratio", 0) or 0)   # ratio C411 réel (via /setratio), pas le local qBit
-        out.append(("servarr_ratio_low", "warn" if ratio < RATIO_WARN else None, "📉 Ratio bas",
-                    f"ratio **{ratio:.2f}** sous le seuil {RATIO_WARN:.2f} — surveille ton compte C411"))
+        # --- ratio C411 : on alerte sur la MESURE du tracker, jamais sur la saisie.
+        # ⚠️ PIÈGE CORRIGÉ (2026-08-11) : cette alerte lisait self._c411(), c.-à-d. le
+        # dernier chiffre TAPÉ À LA MAIN via /setratio (défaut 2.96). Elle suivait donc la
+        # saisie dans les deux sens : un ratio réel qui plonge ne déclenchait rien, et une
+        # vieille saisie basse serait restée bloquée en alarme après remontée. La relève
+        # officielle (mesure `c411`, collecteur CT120) est la source de vérité — on la lit
+        # dans le cache alimenté par _fetch_ratio_data (cycle 10 min) : la redemander ici
+        # rejouerait une requête Flux toutes les 60 s pour une donnée qui bouge tous les
+        # quarts d'heure.
+        cache = self._ratio_cache or {}
+        off = cache.get("official")
+        if off and off.get("up"):
+            r = float(off.get("ratio") or 0)
+            mini = float(off.get("min_ratio") or 0) or RATIO_WARN   # mini EXIGÉ par C411
+            warned = bool(off.get("warned"))                        # avertissement du tracker
+            if r < mini:
+                desc = (f"ratio C411 **{r:.2f}** sous le mini exigé **{mini:.2f}** — "
+                        f"seed davantage (risque de sanction du tracker)")
+            elif warned:
+                desc = f"C411 a émis un avertissement de ratio (ratio **{r:.2f}**)"
+            else:
+                desc = f"ratio C411 **{r:.2f}**, au-dessus du mini exigé {mini:.2f}"
+            out.append(("servarr_ratio_low", "warn" if (warned or r < mini) else None,
+                        "📉 Ratio bas", desc))
+            out.append(("servarr_c411_stale", None, "🔌 Relevé C411 indisponible",
+                        "la relève automatique du tracker répond de nouveau"))
+        elif self._ratio_cache is not None:
+            # up=0 (cookie de session expiré) ou plus une ligne depuis 40 min : on ne SAIT
+            # plus quel est le ratio. On alerte sur l'aveuglement plutôt que d'inventer une
+            # valeur, et on laisse « ratio bas » dans l'état où il était.
+            out.append(("servarr_c411_stale", "warn", "🔌 Relevé C411 indisponible",
+                        "la relève automatique du ratio C411 ne répond plus (cookie de "
+                        "session expiré ?) — #ratio retombe sur une estimation"))
         return out
 
     @tasks.loop(seconds=60)
@@ -309,6 +406,87 @@ class Servarr(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ------------------------------------------------- salon #ratio (Lock)
+    def _lock_category(self, guild):
+        """Catégorie verrouillée où ranger #ratio.
+
+        ⚠️ PIÈGE (corrigé 2026-08-11) : la catégorie protégée est celle que provisionne le
+        cog Provision — « 🔒 Lock <SERVER_KEY> », avec ses overwrites (@everyone refusé,
+        M/O autorisés) et son _enforce_perms. Le nom « Lock » écrit en dur ici désignait
+        une catégorie DIFFÉRENTE (la normalisation alphanumérique donne « lock » ≠
+        « lockr820 ») : le bot en créait une seconde, sans le moindre overwrite, et #ratio
+        y naissait visible de @everyone. On adopte donc d'abord la catégorie provisionnée
+        (id persisté par Provision, puis nom normalisé) ; le repli « Lock » ne sert plus
+        qu'aux installations où l'auto-provisioning est désactivé.
+        ⚠️ On ne DÉPLACE aucun salon existant : un #ratio déjà en place reste où il est
+        (le déplacer le ferait disparaître d'un coup pour ceux qui le voient aujourd'hui).
+        """
+        cid = ((self.bot.state.get("prov") or {}).get("categories") or {}).get("lock")
+        c = guild.get_channel(cid) if cid else None
+        if isinstance(c, discord.CategoryChannel):
+            return c
+        want = _norm(f"Lock {getattr(self.bot.cfg, 'server_key', 'R820')}")
+        c = next((x for x in guild.categories if _norm(x.name) == want), None)
+        if c is not None:
+            return c
+        cat_id = self.bot.state.get("lock_category_id")
+        c = guild.get_channel(cat_id) if cat_id else None
+        if isinstance(c, discord.CategoryChannel):
+            return c
+        return discord.utils.get(guild.categories, name=LOCK_CATEGORY)
+
+    async def _seal_if_public(self, ch):
+        """Range un #ratio DÉJÀ EXISTANT qui serait lisible par @everyone.
+
+        ⚠️ La correction de `_lock_category` ne servait qu'aux salons à CRÉER : sur une
+        installation en place, `_ensure_ratio_channel` rend le salon mémorisé sans jamais
+        regarder sa catégorie. Un #ratio né avant le 2026-08-11 dans la catégorie « Lock »
+        nue reste donc lisible de tout le serveur — or il affiche le ratio, l'upload et le
+        download du compte du tracker privé.
+
+        On répare en DÉPLAÇANT le salon dans la vraie catégorie verrouillée, avec
+        `sync_permissions=True` : le salon hérite alors des overwrites de la catégorie.
+        On n'appelle JAMAIS `edit(overwrites=…)`, qui REMPLACE l'ensemble des overwrites
+        et pourrait retirer un accès légitime posé à la main.
+
+        Une seule tentative par démarrage, et uniquement si la catégorie cible existe et
+        est elle-même fermée à @everyone — sinon on se contente de le crier dans les logs
+        (déplacer vers une catégorie ouverte ne réglerait rien)."""
+        if self._ratio_public_warned:
+            return
+        self._ratio_public_warned = True
+        guild = getattr(ch, "guild", None)
+        if guild is None:
+            return
+        try:
+            if not ch.permissions_for(guild.default_role).view_channel:
+                return                       # déjà privé : rien à faire
+        except Exception:  # noqa: BLE001 — un diagnostic ne doit jamais casser le cycle
+            return
+        cat = self._lock_category(guild)
+        cat_ok = False
+        if isinstance(cat, discord.CategoryChannel):
+            try:
+                cat_ok = not cat.permissions_for(guild.default_role).view_channel
+            except Exception:  # noqa: BLE001
+                cat_ok = False
+        if not cat_ok:
+            log.warning("#%s est visible de @everyone (catégorie « %s ») et aucune "
+                        "catégorie verrouillée n'est disponible : à ranger à la main "
+                        "dans « 🔒 Lock %s »", getattr(ch, "name", "?"),
+                        getattr(getattr(ch, "category", None), "name", "aucune"),
+                        getattr(self.bot.cfg, "server_key", "R820"))
+            return
+        try:
+            await ch.edit(category=cat, sync_permissions=True,
+                          reason="ratio C411 lisible de @everyone — remise sous clé")
+            log.warning("#%s était visible de @everyone : déplacé dans « %s » et "
+                        "resynchronisé sur ses permissions (2026-08-11)",
+                        getattr(ch, "name", "?"), cat.name)
+        except discord.HTTPException as e:
+            log.error("#%s : remise sous clé impossible (%s) — le ratio du tracker reste "
+                      "lisible de tout le serveur, à ranger à la main",
+                      getattr(ch, "name", "?"), e)
+
     async def _ensure_ratio_channel(self):
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
@@ -317,33 +495,42 @@ class Servarr(commands.Cog):
         info = self.bot.state.get("servarr_ratio") or {}
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
         if ch is not None:
+            await self._seal_if_public(ch)
             return ch
-        cat = None
-        cat_id = self.bot.state.get("lock_category_id")
-        if cat_id:
-            c = guild.get_channel(cat_id)
-            if isinstance(c, discord.CategoryChannel):
-                cat = c
-        if cat is None:
-            cat = discord.utils.get(guild.categories, name=LOCK_CATEGORY)
+        cat = self._lock_category(guild)
         if cat is None:
             try:
-                cat = await guild.create_category(LOCK_CATEGORY, reason="salon ratio distant")
-            except discord.HTTPException:
+                # ⚠️ overwrites DÈS la création : une catégorie créée nue est visible de
+                # tout le serveur, et #ratio en hériterait (2026-08-11). Fenêtre publique
+                # nulle, au lieu de « créer puis sécuriser ».
+                cat = await guild.create_category(
+                    LOCK_CATEGORY,
+                    overwrites={guild.default_role:
+                                discord.PermissionOverwrite(view_channel=False),
+                                guild.me:
+                                discord.PermissionOverwrite(view_channel=True,
+                                                            send_messages=True)},
+                    reason="salon ratio distant (catégorie verrouillée)")
+            except discord.HTTPException as e:
+                log.warning("catégorie « %s » non créée: %s", LOCK_CATEGORY, e)
                 cat = None
         if cat is not None:
             self.bot.state.set("lock_category_id", cat.id)
         ch = discord.utils.get(guild.text_channels, name=RATIO_CHANNEL)
         if ch is None:
             try:
+                # pas d'overwrites explicites : le salon hérite (synchronise) ceux de la
+                # catégorie Lock, qui portent la confidentialité.
                 ch = await guild.create_text_channel(
                     RATIO_CHANNEL, category=cat, topic="Ratio C411 en temps réel — auto + bouton Rafraîchir")
-                log.info("salon #ratio créé")
-            except discord.HTTPException:
+                log.info("salon #ratio créé dans « %s »", getattr(cat, "name", "aucune catégorie"))
+            except discord.HTTPException as e:
+                log.warning("salon #%s non créé: %s", RATIO_CHANNEL, e)
                 return None
         cur = self.bot.state.get("servarr_ratio") or {}
         cur["channel"] = ch.id
         self.bot.state.set("servarr_ratio", cur)
+        await self._seal_if_public(ch)  # salon ADOPTÉ : il peut venir d'une catégorie ouverte
         return ch
 
     async def _pin_edit(self, ch, embed):
@@ -355,23 +542,29 @@ class Servarr(commands.Cog):
                 msg = await ch.fetch_message(mid)
             except discord.NotFound:
                 msg = None
-            except discord.HTTPException:
+            except discord.HTTPException as e:
+                log.warning("#ratio : message épinglé illisible: %s", e)
                 return
-        view = RatioRefreshView(self)
+        view = self._view()
         try:
             if msg is None:
                 msg = await ch.send(embed=embed, view=view)
                 try:
                     await msg.pin()
-                except discord.HTTPException:
-                    pass
+                except discord.HTTPException as e:
+                    log.warning("#ratio : épinglage impossible: %s", e)
                 info["message"] = msg.id
                 self.bot.state.set("servarr_ratio", info)
             else:
                 await msg.edit(embed=embed, view=view)
             self._ratio_msg = msg   # cache pour la boucle débit (10 s), évite un fetch
-        except discord.HTTPException:
-            pass
+        except discord.Forbidden:
+            # cas durable (permission retirée) : le signaler, sinon #ratio se fige sans
+            # une seule ligne de log (2026-08-11)
+            log.warning("#ratio : écriture refusée dans #%s (permissions)",
+                        getattr(ch, "name", "?"))
+        except discord.HTTPException as e:
+            log.warning("#ratio : publication impossible: %s", e)
 
     async def _qbit_24h(self):
         """Upload / download RÉELS sur 24 h = amplitude (spread) du compteur monotone
@@ -387,7 +580,9 @@ class Servarr(commands.Cog):
                 return v if (v is not None and v >= 0) else None
             except (KeyError, ValueError, TypeError, IndexError):
                 return None
-        return await _inc("alltime_ul"), await _inc("alltime_dl")
+        # les deux spread() sont indépendants : en série ils doublaient le chemin critique
+        ul, dl = await asyncio.gather(_inc("alltime_ul"), _inc("alltime_dl"))
+        return ul, dl
 
     async def _c411_official(self):
         """Ratio OFFICIEL lu direct sur C411 (mesure `c411`, collecteur CT120 toutes
@@ -412,17 +607,23 @@ class Servarr(commands.Cog):
                 "warned": int(num("warned")), "user": r.get("user", "C411")}
 
     async def _fetch_ratio_data(self):
-        """Récupère les données « lentes » (Influx) et les met en cache pour la boucle débit."""
-        qb, vpn, sync = await self._read()
-        fl = await self._freeleech_count()
-        up24h, dl24h = await self._qbit_24h()
-        off = await self._c411_official()
+        """Récupère les données « lentes » (Influx) et les met en cache pour la boucle débit.
+
+        Les 4 relevés sont indépendants et partent en parallèle (2026-08-11) : enchaînés,
+        ils empilaient 7 allers-retours Influx sur un chemin emprunté par /ratio, par le
+        bouton Rafraîchir et par le cycle 10 min.
+        ⚠️ _qbit_transfer() reste HORS de ce parallélisme (cf. _emb_ratio) : il partage
+        l'état mutable self._qbit_cookie avec le relogin automatique, et deux appels
+        concurrents se marcheraient dessus à l'expiration de la session."""
+        (qb, vpn, sync), fl, (up24h, dl24h), off = await asyncio.gather(
+            self._read(), self._freeleech_count(), self._qbit_24h(), self._c411_official())
         # initialise l'ancre live si absente (l'estimation démarre sans attendre un /setratio)
         if not (self.bot.state.get("c411_anchor") or {}).get("ul") and qb:
             c = self._c411()
             await self._set_c411_anchor(c.get("ratio"), c.get("up_to"), c.get("dl_go"), qb=qb)
         self._ratio_cache = {"qb": qb, "vpn": vpn, "sync": sync, "fl": fl,
                              "up24h": up24h, "dl24h": dl24h, "official": off}
+        self._ratio_gen += 1   # signale à la boucle débit que le fond de l'embed a changé
         return self._ratio_cache
 
     def _build_ratio_embed(self, data, speed=None):
@@ -474,10 +675,10 @@ class Servarr(commands.Cog):
         # --- DÉBIT + VOLUMES RÉELS de la seedbox (lus direct sur qBittorrent) ---
         if isinstance(speed, dict):
             up_s, dl_s = speed.get("up_speed", 0), speed.get("dl_speed", 0)
-            up_sess, dl_sess = speed.get("up_session"), speed.get("dl_session")
+            up_sess = speed.get("up_session")
         else:
             up_s = dl_s = 0
-            up_sess = dl_sess = None
+            up_sess = None
         if qb:
             if not up_s and not dl_s:
                 up_s, dl_s = (qb.get("up_speed", 0) or 0), (qb.get("dl_speed", 0) or 0)
@@ -593,6 +794,7 @@ class Servarr(commands.Cog):
         try:
             qb = await self._pivot("qbittorrent", ["host"])
         except Exception:
+            log.exception("c411_snapshot: pivot qbittorrent")
             qb = None
         live = self._c411_live({"qb": qb})
         return {"ratio": live["ratio"], "up_to": live["up_to"], "dl_go": live["dl_go"],
@@ -629,6 +831,13 @@ class Servarr(commands.Cog):
                 ch = await self._ensure_ratio_channel()
                 if ch is not None:
                     await self._pin_edit(ch, await self._emb_ratio())
+                else:
+                    # ⚠️ ce cycle est le SEUL à alimenter _ratio_cache, dont dépend
+                    # désormais l'alerte « ratio C411 » (_evaluate). Sans ce repli, un
+                    # #ratio introuvable (salon supprimé + création refusée, guild mal
+                    # configuré) rendait la surveillance du ratio muette en silence
+                    # (relecture 2026-08-11).
+                    await self._fetch_ratio_data()
             await self._push_c411()   # série continue C411 -> InfluxDB (Grafana)
         except Exception:
             log.exception("ratio channel refresh failed")
@@ -647,13 +856,37 @@ class Servarr(commands.Cog):
         speed = await self._qbit_transfer()
         if speed is None:
             return
+        # N'éditer QUE si l'affichage change réellement (2026-08-11) : la nuit, le débit
+        # reste à 0 o/s pendant des heures et l'ancienne boucle rejouait 8 640 PATCH
+        # Discord par jour pour un embed strictement identique. Le n° de génération du
+        # cache force l'édition quand le cycle lent a rafraîchi le fond, et la réédition
+        # tous les 30 tours (5 min) évite de rester figé si Discord a perdu une édition.
+        # ⚠️ le volume de SESSION fait partie de l'affichage (« 📦 Upload réel seedbox »)
+        # et nourrit l'extrapolation du ratio estimé : sans lui dans la comparaison, un
+        # débit strictement constant (limite d'upload qBittorrent) figeait le volume
+        # affiché jusqu'à la réédition forcée. On compare la valeur RENDUE, donc à la
+        # granularité exacte de ce que Discord montre (relecture 2026-08-11).
+        payload = (round(self._f(speed.get("up_speed"))),
+                   round(self._f(speed.get("dl_speed"))),
+                   fmt.humanize_bytes(self._f(speed.get("up_session"))),
+                   self._ratio_gen)
+        self._debit_ticks += 1
+        if payload == self._last_debit and self._debit_ticks < 30:
+            return
+        self._last_debit, self._debit_ticks = payload, 0
         try:
             emb = self._build_ratio_embed(self._ratio_cache, speed)
-            await self._ratio_msg.edit(embed=emb, view=RatioRefreshView(self))
+            await self._ratio_msg.edit(embed=emb, view=self._view())
         except discord.NotFound:
             self._ratio_msg = None   # message supprimé -> le cycle lent le recréera
-        except discord.HTTPException:
-            pass
+        except discord.Forbidden:
+            # panne DURABLE : rejouer l'échec toutes les 10 s n'apporte rien. On met la
+            # boucle rapide en veille et on rend la main au cycle lent (10 min), qui la
+            # réarmera dès qu'une édition repassera (il réassigne _ratio_msg).
+            log.warning("#ratio : édition refusée (permissions) — boucle débit en veille")
+            self._ratio_msg = None
+        except discord.HTTPException as e:
+            log.warning("#ratio : édition du débit impossible: %s", e)
 
     @ratiodebit.before_loop
     async def _before_debit(self):
@@ -728,7 +961,15 @@ class Servarr(commands.Cog):
         if "radarr" not in self.apis:
             await itx.followup.send("API Radarr non configurée.", ephemeral=True)
             return
-        mv = await self._api_get("radarr", "/api/v3/movie") or []
+        mv = await self._api_get("radarr", "/api/v3/movie")
+        if mv is None:
+            # ⚠️ `or []` transformait la panne (CT120 éteint, clé API révoquée, timeout)
+            # en bibliothèque vide : l'audit s'affichait en VERT « 0 sans VF », strictement
+            # indiscernable d'une bibliothèque parfaite (2026-08-11).
+            await itx.followup.send(
+                "⚠️ Radarr injoignable (ou clé API refusée) — audit impossible, "
+                "aucune donnée n'a été lue.", ephemeral=True)
+            return
         fr, undet, nofr = 0, 0, []
         for m in mv:
             if not m.get("hasFile"):
@@ -745,13 +986,27 @@ class Servarr(commands.Cog):
         emb.add_field(name="🇫🇷 Avec audio VF", value=str(fr))
         emb.add_field(name="Sans VF (autre langue)", value=str(len(nofr)))
         emb.add_field(name="Indéterminé (non tagué)", value=str(undet))
+        # le total brut lève l'ambiguïté restante : 0/0/0 sur une bibliothèque de 400 films
+        # veut dire « aucun fichier », pas « rien à signaler »
+        emb.add_field(name="Bibliothèque Radarr",
+                      value=f"{len(mv)} films, dont {fr + undet + len(nofr)} avec fichier",
+                      inline=False)
         if nofr:
             emb.add_field(name="Films sans VF",
                           value=("\n".join("• " + t for t in nofr[:20]))[:1024], inline=False)
         await itx.followup.send(embed=emb, ephemeral=True)
 
 
-class RatioRefreshView(discord.ui.View):
+class RatioRefreshView(GatedView):
+    """Bouton « Rafraîchir » du message épinglé de #ratio (vue persistante).
+
+    Porte « read » et pas « mod » : l'équivalent slash /ratio est @read_check() — exiger
+    le rôle Gestion ici retirerait au tier lecture un accès qu'il a déjà par commande. Le
+    2FA de session, lui, s'applique bien : GatedTree ne couvre QUE les commandes, un clic
+    de bouton ne passe jamais par lui (la vue n'avait aucune porte avant le 2026-08-11)."""
+
+    gate = "read"
+
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -759,12 +1014,21 @@ class RatioRefreshView(discord.ui.View):
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="servarr:ratio:refresh")
     async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
+        # anti-rebond : un clic = 4 relevés Influx + un appel qBittorrent, alors que
+        # l'embed se réédite déjà tout seul (débit 10 s, reste 10 min). Sans ça, un clic
+        # en rafale rejouait la charge autant de fois (2026-08-11).
+        now = time.monotonic()
+        if now - self.cog._last_manual_refresh < 10:
+            await itx.response.send_message(
+                "⏱️ Déjà à jour (rafraîchi il y a moins de 10 s).", ephemeral=True)
+            return
+        self.cog._last_manual_refresh = now
         await itx.response.defer()
         try:
             emb = await self.cog._emb_ratio()
             await itx.message.edit(embed=emb, view=self)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.warning("#ratio : rafraîchissement manuel impossible: %s", e)
 
 
 _TSTATE = {
@@ -804,24 +1068,31 @@ def _emb_torrents(dl):
     return emb
 
 
-class TorrentsView(discord.ui.View):
-    """Sélection multiple + ⏸️/▶️. qBittorrent 5.x : endpoints /stop et /start."""
+class TorrentsView(GatedView):
+    """Sélection multiple + ⏸️/▶️. qBittorrent 5.x : endpoints /stop et /start.
+
+    Porte « mod » + propriétaire du panneau : les boutons agissent RÉELLEMENT sur
+    qBittorrent, et /torrents est déjà @admin_check — personne d'autre qu'un gestionnaire
+    ne peut donc ouvrir ce panneau, la porte ne retire aucun accès légitime. Avant le
+    2026-08-11 le seul contrôle était l'identité de l'ouvreur : ni le rôle ni la session
+    2FA n'étaient réévalués au clic, si bien qu'un rôle retiré (ou une session révoquée
+    par le sweep de 30 s) laissait le panneau déjà posté pleinement opérant — et un clic
+    sur « Rafraîchir » relançait le timeout de 5 min indéfiniment.
+    ⚠️ L'ordre compte : la propriété du panneau est vérifiée AVANT le tier (GatedView le
+    fait dans cet ordre), sinon le seul utilisateur concerné court-circuiterait la porte."""
+
+    gate = "mod"
 
     def __init__(self, cog, owner_id, itx=None):
         super().__init__(timeout=300)
         self.cog = cog
         self.owner_id = owner_id
+        self.gate_user_id = owner_id   # panneau éphémère : réservé à celui qui l'a ouvert
         self._itx = itx          # interaction d'origine : seule voie pour éditer l'éphémère au timeout
         self.selected = []
         self.select = discord.ui.Select(placeholder="Torrent(s) à piloter…", min_values=1)
         self.select.callback = self._on_select
         self.add_item(self.select)
-
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if itx.user.id == self.owner_id:
-            return True
-        await itx.response.send_message("⛔ Ce panneau appartient à quelqu'un d'autre.", ephemeral=True)
-        return False
 
     def refill(self, dl):
         opts = []

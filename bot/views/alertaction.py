@@ -13,7 +13,7 @@ import time
 
 import discord
 
-from ..core.permissions import admin_button_ok
+from ..core.gates import GatedView
 
 log = logging.getLogger("discord-bot.alertaction")
 
@@ -40,17 +40,18 @@ def _key_from_msg(msg):
         return None
 
 
-class AlertActionView(discord.ui.View):
-    """Persistante : Snooze 1h / 4h sur un message d'alerte du bot."""
+class AlertActionView(GatedView):
+    """Persistante : Snooze 1h / 4h sur un message d'alerte du bot.
+
+    Tier **mod** : sans porte, tout membre voyant #alertes pouvait rendre le bot muet
+    pendant 4 h sur ipmi_temp — la seule alerte que Grafana ne couvre PAS."""
+
+    gate = "mod"
 
     def __init__(self):
         super().__init__(timeout=None)
 
     async def _act(self, itx, seconds, label):
-        # Sans ce controle, tout membre voyant #alertes pouvait rendre le bot muet
-        # pendant 4 h sur ipmi_temp — la seule alerte que Grafana ne couvre PAS.
-        if not await admin_button_ok(itx):     # rôle Gestion + session 2FA
-            return
         key = _key_from_msg(itx.message)
         if not key:
             await itx.response.send_message("Clé d'alerte introuvable.", ephemeral=True)

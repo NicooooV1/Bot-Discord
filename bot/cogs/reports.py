@@ -1,5 +1,12 @@
-"""Daily report at REPORT_HOUR:REPORT_MINUTE (Europe/Paris) + on_ready catch-up
-(the host is off at night, so a missed scheduled fire is replayed once on power-on)."""
+"""Daily report at REPORT_HOUR:REPORT_MINUTE (Europe/Paris) + catch-up loop
+(the host is off at night, so a missed scheduled fire is replayed once on power-on).
+
+Le rattrapage vit dans une boucle `catchup` de 5 min, PAS dans `on_ready` : le salon de
+rapports est câblé par `provision._rewire()` à la toute fin du provisioning, bien après
+que `on_ready` ait été dispatché — un rattrapage tenté une seule fois au démarrage lisait
+un id vide et se marquait « fait » (corrigé 2026-08-11). La boucle réessaie jusqu'à ce
+que le salon existe, puis devient un no-op (elle NE s'arrête PAS : une boucle arrêtée est
+comptée « en échec » par bg.REGISTRY, cf. le docstring de `catchup`)."""
 import asyncio
 import datetime as dt
 import logging
@@ -30,12 +37,15 @@ class Reports(commands.Cog):
         else:
             self.tz = dt.timezone.utc
         self._catchup_done = False
+        self._catchup_tries = 0
         t = dt.time(hour=bot.cfg.report_hour, minute=bot.cfg.report_minute, tzinfo=self.tz)
         self.daily.change_interval(time=t)
         self.daily.start()
+        self.catchup.start()
 
     def cog_unload(self):
         self.daily.cancel()
+        self.catchup.cancel()
 
     async def build_report(self, title):
         bot = self.bot
@@ -79,15 +89,22 @@ class Reports(commands.Cog):
         if ctrl:
             disks = await bot.influx.raid_disks()
             worst_gd = max((int(d.get("grown_defects", 0) or 0) for d in disks), default=0)
-            emb.add_field(name="RAID",
-                          value=("optimal ✅" if ctrl.get("vd_optimal") else "⚠️ dégradé")
-                                + f" · grown max {worst_gd}", inline=True)
+            # 2026-08-11 : le rapport ne regardait QUE vd_optimal. Un disque tombé alors
+            # que le VD reste « optimal » (hot spare déjà reconstruit) n'apparaissait
+            # nulle part — alors que /raid, /alerts et /status le signalent tous.
+            offline = [str(d.get("slot")) for d in disks if not d.get("online")]
+            value = ("optimal ✅" if ctrl.get("vd_optimal") else "⚠️ dégradé") \
+                + f" · grown max {worst_gd}"
+            if offline:
+                value += f" · ❌ slot(s) offline : {', '.join(offline[:6])}"
+            emb.add_field(name="RAID", value=value[:1024], inline=True)
 
         bs = await bot.influx.backup_summary()
         if bs:
             emb.add_field(name="Sauvegardes",
                           value=f"+ancienne {fmt.humanize_duration(bs.get('oldest_age_seconds'))} · "
-                                f"sans backup {int(bs.get('guests_without_backup', 0))}", inline=True)
+                                f"sans backup {int(bs.get('guests_without_backup') or 0)}",
+                          inline=True)
 
         ipmi = await bot.influx.ipmi_temps()
         if ipmi:
@@ -101,6 +118,7 @@ class Reports(commands.Cog):
             try:
                 rows = await avy.health_rows()
             except Exception:
+                log.warning("rapport : état du cluster Aveyron indisponible", exc_info=True)
                 rows = []
             if rows:
                 icon = {"crit": "🔥", "warn": "⚠️", "ok": "✅", "na": "➖"}
@@ -132,12 +150,17 @@ class Reports(commands.Cog):
         (sinon on ne doit PAS avancer last_daily, pour laisser le rattrapage jouer)."""
         cid = self.bot.cfg.report_channel_id
         if not cid:
+            # muet jusqu'ici : l'absence de rapport ne laissait AUCUNE trace (2026-08-11)
+            log.warning("rapport « %s » non publié : REPORT_CHANNEL_ID pas encore câblé "
+                        "(provision._rewire le renseigne en fin de provisioning)", title)
             return False
         ch = self.bot.get_channel(cid)
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(cid)
             except Exception:
+                log.warning("rapport « %s » non publié : salon %s introuvable",
+                            title, cid, exc_info=True)
                 return False
         emb, file = await self.build_report(title)
         try:
@@ -162,22 +185,66 @@ class Reports(commands.Cog):
         now = dt.datetime.now(self.tz)
         self.bot.state.set("last_daily", now.date().isoformat())
 
-    @daily.before_loop
-    async def _before(self):
-        await self.bot.wait_until_ready()
+    @tasks.loop(minutes=5)
+    async def catchup(self):
+        """Rattrapage du rapport manqué (l'hôte est éteint la nuit : un tir planifié
+        raté doit être rejoué une fois à l'allumage).
 
-    @commands.Cog.listener()
-    async def on_ready(self):
+        2026-08-11 — c'était un listener `on_ready` qui posait `_catchup_done = True`
+        AVANT la moindre tentative. Or `_post` lit `cfg.report_channel_id` dès sa
+        première instruction, et cet id n'est renseigné que par `provision._rewire()`,
+        tout à la fin de `provision_all()` : les deux `on_ready` partent en tâches
+        concurrentes et celle de Reports atteignait la lecture sans aucun point de
+        suspension — donc toujours 0. `_post` renvoyait False, le drapeau était déjà
+        consommé, et le rattrapage ne rejouait JAMAIS du processus (la boucle planifiée,
+        elle, ne repasse que le lendemain). Résultat : aucun rapport le jour du
+        démarrage, sans une ligne d'erreur. La boucle réessaie donc jusqu'à ce que le
+        salon soit câblé, puis devient un no-op.
+
+        ⚠️ Une fois le rattrapage réglé, on NE fait PAS `catchup.stop()` : `bg.REGISTRY`
+        (filet des boucles) juge une boucle « saine » sur `is_running()`, donc une boucle
+        volontairement arrêtée serait comptée en ÉCHEC et /health afficherait
+        « ⚠️ Avertissements · en échec: Reports.catchup » à CHAQUE démarrage — un faux
+        positif permanent sur la surface même qui doit rester digne de confiance
+        (2026-08-11). Le tour de boucle coûte un test de drapeau toutes les 5 min.
+        """
         if self._catchup_done:
             return
-        self._catchup_done = True
+        if not self.bot.cfg.report_channel_id:
+            return                       # provision._rewire() le renseignera
         now = dt.datetime.now(self.tz)
         sched = now.replace(hour=self.bot.cfg.report_hour,
                             minute=self.bot.cfg.report_minute, second=0, microsecond=0)
-        if self.bot.state.get("last_daily") != now.date().isoformat() and now >= sched:
-            log.info("posting catch-up daily report")
-            if await self._post("Rapport (rattrapage)"):
-                self._mark_today()
+        if self.bot.state.get("last_daily") == now.date().isoformat() or now < sched:
+            # rien à rattraper : soit c'est déjà publié, soit l'heure n'est pas passée
+            # (la boucle `daily` s'en chargera).
+            self._catchup_done = True
+            return
+        # borne : `_post` reconstruit tout le rapport (requêtes Influx + graphe) avant
+        # d'essayer d'envoyer. Sans plafond, un salon devenu inaccessible ferait tourner
+        # ce travail toutes les 5 min jusqu'au prochain redémarrage.
+        self._catchup_tries += 1
+        if self._catchup_tries > 12:
+            log.warning("rattrapage abandonné après %d tentatives", self._catchup_tries - 1)
+            self._catchup_done = True
+            return
+        log.info("publication du rapport de rattrapage")
+        if await self._post("Rapport (rattrapage)"):
+            self._mark_today()
+            self._catchup_done = True
+
+    # Un `before_loop` PAR boucle : empiler `@daily.before_loop` et `@catchup.before_loop`
+    # sur la même fonction ne « marche » que parce que `Loop.before_loop` renvoie la
+    # coroutine qu'on lui passe — un détail d'implémentation de discord.py. S'il changeait,
+    # le second décorateur recevrait None et le cog entier échouerait à l'IMPORT (plus
+    # aucun rapport quotidien). Trois lignes valent mieux que ce pari (relecture 2026-08-11).
+    @daily.before_loop
+    async def _before_daily(self):
+        await self.bot.wait_until_ready()
+
+    @catchup.before_loop
+    async def _before_catchup(self):
+        await self.bot.wait_until_ready()
 
 
 async def setup(bot):

@@ -12,10 +12,20 @@ Schema reminders (load-bearing):
 """
 import asyncio
 import logging
+import time
 
 log = logging.getLogger("discord-bot.influx")
 
 RANGE_AGG = {"1h": "30s", "6h": "2m", "24h": "5m", "7d": "30m", "30d": "2h"}
+
+# Champs autorisés de la mesure `system` (invités PVE). Les périodes viennent de
+# RANGE_AGG. Ces deux listes blanches ferment par CONSTRUCTION l'interpolation de
+# `field`/`num`/`den`/`rng` dans le corps des requêtes Flux : `range(start:-{rng})` est
+# hors littéral de chaîne, aucun échappement n'y protégerait quoi que ce soit. Aucun de
+# ces paramètres n'est atteignable par l'utilisateur AUJOURD'HUI (choix Discord validés
+# côté serveur) — la liste blanche est là pour que l'ajout d'une période libre
+# (« /graph range:3d ») reste sûr (2026-08-11).
+_FIELDS = {"cpu", "mem", "maxmem", "disk", "maxdisk", "uptime", "status"}
 
 
 def _esc(v):
@@ -30,6 +40,15 @@ class Influx:
     def __init__(self, cfg):
         self.cfg = cfg
         self._qapi = None
+        # état de la DERNIÈRE requête : sans lui, « Influx en panne » et « aucune donnée »
+        # sont indiscernables pour les ~40 sites qui testent la vérité du résultat, et la
+        # boucle d'alertes affiche un ✅ vert mensonger quand la supervision est morte
+        # (2026-08-11). On NE lève PAS et on continue de renvoyer [] : tous ces appelants
+        # supposent une liste.
+        self._fail_count = 0
+        self._last_error = None
+        self._last_error_ts = 0.0
+        self._last_ok_ts = 0.0
         if cfg.influx_enabled:
             try:
                 from influxdb_client import InfluxDBClient
@@ -49,15 +68,36 @@ class Influx:
     def _b(self):
         return self.cfg.influx_bucket
 
+    @property
+    def blind(self):
+        """Vrai quand la dernière requête Flux a ÉCHOUÉ (Influx arrêté, jeton révoqué,
+        bucket renommé, timeout) — à distinguer de « la requête a renvoyé zéro ligne ».
+
+        À consulter par la boucle d'alertes AVANT de conclure « tout est au vert » : sans
+        ça, un CT103 tombé la nuit rend la supervision aveugle en silence et /alerts
+        répond ✅ (feu vert mensonger). `enabled` reste la question séparée « InfluxDB
+        est-il configuré ? »."""
+        return self._fail_count > 0
+
+    @property
+    def last_error(self):
+        """Message de la dernière requête en échec (None si la dernière a réussi)."""
+        return self._last_error if self._fail_count else None
+
     # --- low level ---
     def _query(self, flux):
         if not self.enabled:
             return []
         try:
             tables = self._qapi.query(flux)
-        except Exception:
+        except Exception as e:
+            self._fail_count += 1
+            self._last_error = f"{type(e).__name__}: {e}"[:200]
+            self._last_error_ts = time.time()
             log.exception("flux query failed:\n%s", flux)
             return []
+        self._fail_count = 0
+        self._last_ok_ts = time.time()
         out = []
         for t in tables:
             for r in t.records:
@@ -154,6 +194,13 @@ class Influx:
     @staticmethod
     def _agg(rng):
         return RANGE_AGG.get(rng, "5m")
+
+    @staticmethod
+    def _rng(rng):
+        """Période SÛRE pour `range(start:-…)`. Même esprit de repli que _agg (qui, lui,
+        était déjà protégé par RANGE_AGG.get) : une période inconnue redevient « 24h »
+        au lieu d'être injectée telle quelle dans le corps de la requête (2026-08-11)."""
+        return rng if rng in RANGE_AGG else "24h"
 
     # --- live tables ---
     async def ct_table(self):
@@ -323,6 +370,10 @@ from(bucket:"{self._b}")
 
     # --- time series (for graphs) ---
     async def ct_series(self, host, field, rng="24h"):
+        if field not in _FIELDS:
+            log.warning("ct_series: champ %r hors liste blanche, requête abandonnée", field)
+            return [], []
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -383,9 +434,10 @@ from(bucket:"{self._b}")
         return r[0] if r else None
 
     async def disk_forecast(self, path):
-        """Jours avant saturation d'un disque hôte (projection linéaire ~7 j), avec les
-        tailles réelles (used/total en octets) pour l'affichage — pas seulement le %
-        (demande Nico 2026-07-20 : « les vraies tailles de données type 3.3To / 3.8To »)."""
+        """Jours avant saturation d'un disque hôte (projection linéaire sur l'écart RÉEL
+        entre les deux points, ~7-8 j), avec les tailles réelles (used/total en octets)
+        pour l'affichage — pas seulement le % (demande Nico 2026-07-20 : « les vraies
+        tailles de données type 3.3To / 3.8To »)."""
         esc = _esc(path)
         pct_filt = (f'|> filter(fn:(r)=> r._measurement=="disk" '
                     f'and r.host=="{self.cfg.pve_node}" and r.path=="{esc}" '
@@ -419,7 +471,19 @@ from(bucket:"{self._b}")
         if old is None or cur <= old:
             out["days"] = None                        # pas de croissance mesurable
             return out
-        rate = (cur - old) / 7.0                     # %/jour
+        # Le dénominateur était figé à 7 j alors que `first()` sur [-8d,-6d] renvoie le
+        # point le PLUS ANCIEN de la fenêtre, mesuré il y a ~8 j : le taux sortait
+        # surestimé de ~14 % et la date de saturation avancée d'autant (bascule en rouge
+        # trop tôt, seuils 30/90 j de provision). On calcule l'écart réel à partir des
+        # horodatages ; repli sur 7 j si `_time` manque, plutôt que pas de projection
+        # du tout (2026-08-11).
+        try:
+            elapsed = (now[0]["_time"] - past[0]["_time"]).total_seconds() / 86400.0
+        except (KeyError, IndexError, TypeError, AttributeError):
+            elapsed = None
+        if not elapsed or elapsed <= 0:
+            elapsed = 7.0
+        rate = (cur - old) / elapsed                 # %/jour
         out["rate"] = rate
         out["days"] = (100 - cur) / rate if rate > 0 else None
         return out
@@ -477,6 +541,7 @@ from(bucket:"{self._b}")
         }
 
     async def host_cpu_series(self, rng="24h"):
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -488,6 +553,7 @@ from(bucket:"{self._b}")
         return self._series(await self.aq(flux))
 
     async def host_mem_series(self, rng="24h"):
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -508,6 +574,7 @@ from(bucket:"{self._b}")
         return rows[0] if rows else None
 
     async def host_net_series(self, instance="vmbr0", rng="24h"):
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -525,6 +592,7 @@ from(bucket:"{self._b}")
         return (rx_t, rx_v), (tx_t, tx_v)
 
     async def host_disk_series(self, path="/", rng="24h"):
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -535,6 +603,12 @@ from(bucket:"{self._b}")
         return self._series(await self.aq(flux))
 
     async def ct_pct_series(self, host, num, den, rng="24h"):
+        # num/den finissent DANS un map() (`r.{num} / r.{den}`) : liste blanche obligatoire
+        if num not in _FIELDS or den not in _FIELDS:
+            log.warning("ct_pct_series: champs %r/%r hors liste blanche, requête abandonnée",
+                        num, den)
+            return [], []
+        rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
@@ -583,10 +657,3 @@ from(bucket:"{self._b}")
                             "used": size - avail, "pct": (size - avail) / size * 100.0})
         out.sort(key=lambda x: x["pct"], reverse=True)
         return out
-
-    async def scalar(self, flux):
-        rows = await self.aq(flux)
-        for r in rows:
-            if r.get("_value") is not None:
-                return r["_value"]
-        return None

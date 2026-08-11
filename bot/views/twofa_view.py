@@ -8,6 +8,8 @@ Module séparé de la cog pour être importable par le tree (__main__) sans impo
 import discord
 from discord import app_commands
 
+from ..core.gates import GatedView
+
 
 class NeedsTwoFA(app_commands.CheckFailure):
     """Levée par le tree quand la session de confiance est absente ou expirée.
@@ -23,8 +25,15 @@ class NeedsTwoFA(app_commands.CheckFailure):
         self.enrolled = enrolled
 
 
-class CodeModal(discord.ui.Modal):
-    """Modale générique de saisie d'un code (TOTP 6 chiffres ou code de secours)."""
+class CodeModal(GatedView, discord.ui.Modal):
+    """Modale générique de saisie d'un code (TOTP 6 chiffres ou code de secours).
+
+    Exemption assumée : c'est la saisie du 2FA elle-même. La barrer derrière une session
+    2FA enfermerait la clé à l'intérieur — plus personne ne pourrait déverrouiller."""
+
+    gate = None
+    gate_reason = ("saisie du code 2FA : la barrer derrière une session 2FA rendrait tout "
+                   "déverrouillage impossible (poule et œuf)")
 
     code = discord.ui.TextInput(
         label="Code à 6 chiffres (ou code de secours)",
@@ -40,21 +49,28 @@ class CodeModal(discord.ui.Modal):
         await self._cb(itx, str(self.code.value))
 
 
-class UnlockView(discord.ui.View):
+class UnlockView(GatedView):
     """Bouton « Déverrouiller » joint au refus du tree.
 
-    Éphémère et lié à un utilisateur : personne d'autre ne peut s'en servir.
-    """
+    Exemption assumée : c'est le bouton de déverrouillage 2FA — exiger une session 2FA
+    pour y accéder serait circulaire. La PROPRIÉTÉ reste vérifiée (gate_user_id) :
+    éphémère et lié à un utilisateur, personne d'autre ne peut s'en servir."""
+
+    gate = None
+    gate_reason = ("c'est le bouton de déverrouillage 2FA lui-même ; exiger une session "
+                   "2FA pour y accéder serait circulaire")
 
     def __init__(self, owner_id):
         super().__init__(timeout=180)
         self.owner_id = owner_id
+        self.gate_user_id = owner_id
 
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if itx.user.id == self.owner_id:
-            return True
-        await itx.response.send_message("⛔ Ce panneau n'est pas le tien.", ephemeral=True)
-        return False
+    async def on_denied(self, interaction, why):
+        if why == "user":
+            await interaction.response.send_message(
+                "⛔ Ce panneau n'est pas le tien.", ephemeral=True)
+            return
+        await super().on_denied(interaction, why)
 
     @discord.ui.button(label="Déverrouiller", emoji="🔓", style=discord.ButtonStyle.primary)
     async def unlock(self, itx: discord.Interaction, _b: discord.ui.Button):

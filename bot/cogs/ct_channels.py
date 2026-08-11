@@ -1,7 +1,12 @@
 """Per-CT live channels (Option A): the bot maintains one auto-refreshing pinned
-message per mapped Discord channel, showing that container's live status + CPU/RAM
-graph. Mapping comes from CT_CHANNELS (ctname:channelid,...). Message ids persist in
-state so it edits in place across restarts instead of spamming."""
+message per mapped Discord channel, showing that guest's live status (statut, RAM/CPU,
+IP/tags, PSI, extras Jellyfin/Docker). Mapping comes from CT_CHANNELS
+(ctname:channelid,...). Message ids persist in state so it edits in place across
+restarts instead of spamming.
+
+⚠️ Plus AUCUN graphe PNG n'est joint : l'upload d'image à chaque cycle saturait la
+limite de débit Discord (le graphe est resté sur le bouton 📈, à la demande). Le
+docstring annonçait encore « + CPU/RAM graph » (corrigé 2026-08-11)."""
 import asyncio
 import json
 import logging
@@ -12,7 +17,8 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.permissions import admin_button_ok
+from ..core.gates import GatedView
+from ..core.permissions import is_guild_owner
 from ..views.confirm import ConfirmView
 from .docker import _emoji as _docker_emoji
 
@@ -45,9 +51,21 @@ PSI_SHOW_PCT = 5
 # API par invité à CHAQUE cycle de rafraîchissement (~2 min, jusqu'à 45+ salons)
 CONFIG_CACHE_TTL = 1800
 
-# partagé avec provision.py (salon du nœud) -> défini une seule fois dans core/format
-_STATUS_EMOJI = fmt.STATUS_EMOJI
-_strip_status_emoji = fmt.strip_status_emoji
+# Auto-limitation des renommages de salon. Discord limite à 2 renommages / 10 min PAR
+# SALON et discord.py ne LÈVE PAS sur un 429 : il DORT jusqu'à expiration (aucun
+# max_ratelimit_timeout n'est configuré). Un `except HTTPException` n'attrape donc rien —
+# c'est ce sommeil, en série dans la boucle, qui figerait la mise à jour de TOUS les
+# autres salons. Marge volontaire au-dessus de 300 s (2/600 s pile) pour ne jamais
+# toucher le quota en bordure de fenêtre. Même garde-fou que node_channel._sync_emoji
+# (2026-08-11).
+RENAME_MIN_INTERVAL = 360
+
+# Sentinelle « serveur de cet invité non résolu ». À NE JAMAIS confondre avec None, qui
+# signifie « invité du R820 » : retomber sur None ferait garder les boutons d'un salon
+# AVEYRON par les rôles Gestion du R820 (fail-open de PÉRIMÈTRE d'autorisation).
+# is_admin() étant fail-closed sur une clé absente de GESTION_SERVERS, cette sentinelle
+# refuse par construction ; les handlers la traitent avec un message clair (2026-08-11).
+_SRV_UNRESOLVED = "__non-résolu__"
 
 
 class CtChannels(commands.Cog):
@@ -55,6 +73,10 @@ class CtChannels(commands.Cog):
         self.bot = bot
         self.map = bot.cfg.ct_channels
         self._config_cache = {}   # vmid -> (ts, {ip, tags, cores, memory})
+        # nom d'invité -> clé serveur (« AVY-PVE »…), mémorisée à chaque cycle : les
+        # boutons en ont besoin AVANT l'ACK des 3 s, où toute I/O PVE est interdite.
+        self._srv_of = {}
+        self._rename_ts = {}      # id de salon -> dernier renommage (time.monotonic)
         if self.map:
             self.refresh.change_interval(minutes=bot.cfg.dashboard_interval_min)
             self.refresh.start()
@@ -68,7 +90,14 @@ class CtChannels(commands.Cog):
             self.refresh.cancel()
 
     def _guest_config_cached(self, vmid, gtype):
-        """cores/mémoire/tags/IP (config PVE) — cache 30 min (voir CONFIG_CACHE_TTL)."""
+        """cores/mémoire/tags/IP (config PVE) — cache 30 min (voir CONFIG_CACHE_TTL).
+
+        ⚠️ On ne met en cache QUE les succès : l'écriture était auparavant hors du `try`,
+        donc un échec (5xx, timeout, AvyUnreachable pendant le coupe-circuit Aveyron)
+        mémorisait un `{}` pour 30 MINUTES et le champ « Config » (IP, cœurs, RAM, tags)
+        disparaissait des salons alors que le lien était revenu deux minutes plus tard.
+        Sur échec on ressert le dernier instantané connu (même périmé) et le re-essai a
+        lieu au cycle suivant, 2 min plus tard (corrigé 2026-08-11)."""
         now = time.time()
         hit = self._config_cache.get(vmid)
         if hit and now - hit[0] < CONFIG_CACHE_TTL:
@@ -82,8 +111,12 @@ class CtChannels(commands.Cog):
             for part in str(c.get("net0", "")).split(","):
                 if part.startswith("ip=") and "/" in part:
                     meta["ip"] = part[3:].split("/")[0]
-        except Exception:
-            pass
+        except Exception as e:
+            # debug et non warning : pendant le backoff Aveyron l'échec est ATTENDU et
+            # se répète pour chaque invité, à chaque cycle -> ce serait du bruit pur.
+            log.debug("config de %s illisible (%s) — on garde l'instantané précédent",
+                      vmid, type(e).__name__)
+            return hit[1] if hit else {}
         self._config_cache[vmid] = (now, meta)
         return meta
 
@@ -112,7 +145,10 @@ class CtChannels(commands.Cog):
         if meta.get("tags"):
             line.append("🏷 " + str(meta["tags"]).replace(";", " · "))
         if line:
-            emb.add_field(name="Config", value="  ".join(line), inline=False)
+            # [:1024] : la liste de tags d'un invité est libre côté PVE et un champ
+            # d'embed est refusé au-delà de 1024 caractères (l'embed entier partirait
+            # alors en erreur, pas seulement ce champ).
+            emb.add_field(name="Config", value="  ".join(line)[:1024], inline=False)
 
         if not running:
             return
@@ -139,19 +175,21 @@ class CtChannels(commands.Cog):
                 emb.add_field(name="🧬 Système", value=val[:1024], inline=False)
 
     async def build_ct(self, name):
+        """Embed live d'un invité. Ne renvoie QUE l'embed : plus aucun graphe n'est
+        joint depuis que l'upload d'image saturait la limite de débit Discord — la
+        signature `(emb, file)` invitait à le réintroduire (nettoyé 2026-08-11)."""
         bot = self.bot
         emb = discord.Embed(title=f"📦 {name}", color=fmt.BLURPLE)
         emb.timestamp = discord.utils.utcnow()
-        file = None
         described = False
         if bot.pve.enabled:
-            vmid = await asyncio.to_thread(bot.pve.vmid_of, name)
+            vmid = await bot.pve.avmid_of(name)
             if vmid:
                 # ⚠️ router VM/LXC : ct_status (API /lxc) LÈVE sur une VM QEMU (110/111/112)
                 # -> embed vide. Les VM passent par vm_status (API /qemu).
-                gtype = await asyncio.to_thread(bot.pve.guest_type, name)
+                gtype = await bot.pve.aguest_type(name)
                 try:
-                    cur = await asyncio.to_thread(bot.pve.guest_status, vmid, gtype)
+                    cur = await bot.pve.aguest_status(vmid, gtype)
                 except Exception:
                     cur = {}
                 running = cur.get("status") == "running"
@@ -209,7 +247,7 @@ class CtChannels(commands.Cog):
         if not described and not bot.influx.enabled:
             emb.description = "données indisponibles (PVE/InfluxDB non configurés)"
         emb.set_footer(text="rafraîchi")
-        return emb, file
+        return emb
 
     async def _add_jellyfin(self, emb):
         """Ajoute les stats Jellyfin (comme sur Grafana) au salon #jellyfin."""
@@ -253,9 +291,15 @@ class CtChannels(commands.Cog):
                     pp = "⏸️" if w["paused"] else "▶️"
                     head = (f"{pp} **{w['user']}** · {w['client']}"
                             + (f" · {tag}" if tag else "") + f" · {w['progress']:.0f} %")
-                    sub = f"🔊 {w['audio']}" if w.get("audio") else ""
-                    sub += (f" · 💬 {w['subtitle']}" if w.get("subtitle") else
-                           (" · 💬 aucun" if sub else "💬 aucun"))
+                    # liste + join : le « · » était collé en tête quand la piste audio
+                    # n'était pas identifiée (aucun flux MediaStreams ne correspond à
+                    # PlayState.AudioStreamIndex) alors qu'un sous-titre l'était ->
+                    # ligne « 　 · 💬 Français » (corrigé 2026-08-11).
+                    bits = []
+                    if w.get("audio"):
+                        bits.append(f"🔊 {w['audio']}")
+                    bits.append(f"💬 {w['subtitle']}" if w.get("subtitle") else "💬 aucun")
+                    sub = " · ".join(bits)
                     lines.append((head + f"\n　🎬 {w['title']}" + (f"\n　{sub}" if sub else ""))[:300])
                 emb.add_field(name="👀 Qui regarde", value="\n".join(lines)[:1024], inline=False)
             else:
@@ -320,7 +364,11 @@ class CtChannels(commands.Cog):
 
         try:
             data = await asyncio.to_thread(_sync)
-        except Exception:
+        except Exception as e:
+            # debug : Jellyfin muet = cas nominal quand CT120 est arrêté, et on retombe
+            # proprement sur InfluxDB — mais l'erreur exacte (401 = clé périmée) doit
+            # rester trouvable au lieu d'être avalée en silence (2026-08-11).
+            log.debug("jellyfin /Sessions indisponible: %s", e)
             return None
         out = []
         for s in data or []:
@@ -367,7 +415,15 @@ class CtChannels(commands.Cog):
         l'origine (corrigé 2026-07-15 ; PVE renvoie 'RUNNING' en majuscules)."""
         if not self.bot.pve.enabled:
             return set()
-        return await asyncio.to_thread(self.bot.pve.running_vzdump_vmids)
+        try:
+            return await asyncio.to_thread(self.bot.pve.running_vzdump_vmids)
+        except Exception:
+            # lecture réseau faillible : une liste de tâches illisible ne doit pas
+            # avorter TOUT le cycle (embeds non rafraîchis) — au pire l'emoji 🟠
+            # manque pendant un cycle (2026-08-11).
+            log.warning("tâches vzdump illisibles ce cycle — emoji 🟠 ignoré",
+                        exc_info=True)
+            return set()
 
     async def _sync_channel_emoji(self, ch, name, gm, backup_vmids):
         """Nomme le salon « {emoji}-{nom PVE} » : emoji de statut (🟢 allumé / 🟠 backup /
@@ -376,7 +432,18 @@ class CtChannels(commands.Cog):
         La base est TOUJOURS re-dérivée du nom PVE (et non du nom actuel du salon) : ça
         corrige les noms dérivés/abrégés (ex. « web » -> « server-web ») et suit un
         renommage côté PVE. Renomme seulement si ça change (Discord limite à
-        2 renommages / 10 min / salon)."""
+        2 renommages / 10 min / salon) et jamais plus d'une fois par RENAME_MIN_INTERVAL.
+
+        ⚠️ ABSENT ≠ ÉTEINT (corrigé 2026-08-11) : un invité absent de `gm` (échec de
+        `resources()`, ou lien Aveyron coupé au-delà d'AVY_STALE_MAX -> `_avy_resources`
+        renvoie [] et les ~12 invités -avy disparaissent) donnait `status=None` donc 🔴.
+        Une indisponibilité de la SUPERVISION s'affichait ainsi comme une panne totale
+        des machines, qui tournaient parfaitement. On garde l'emoji précédent : c'est la
+        dernière information vraie, et ça évite un aller-retour de renommages au retour
+        du lien. Pas d'emoji « inconnu » : il faudrait l'ajouter à fmt.STATUS_EMOJI,
+        sinon strip_status_emoji ne retrouve plus la base et provision recrée le salon."""
+        if name not in gm:
+            return
         info = gm.get(name) or {}
         vmid = info.get("vmid")
         if vmid is not None and str(vmid) in backup_vmids:
@@ -386,20 +453,56 @@ class CtChannels(commands.Cog):
         else:
             emoji = "🔴"
         desired = f"{emoji}-{fmt.slug(name)}"
-        if ch.name != desired:
+        if ch.name == desired:
+            return
+        # Auto-limitation PAR SALON : discord.py DORT sur un 429 de renommage au lieu de
+        # lever (le `except HTTPException` d'origine n'attrapait donc rien), et l'appel
+        # est en série -> un seul salon en attente de quota gèlerait la mise à jour de
+        # tous les autres. Le statut réel reste visible dans l'embed pendant ce temps.
+        now = time.monotonic()
+        if now - self._rename_ts.get(ch.id, -RENAME_MIN_INTERVAL) < RENAME_MIN_INTERVAL:
+            return
+        self._rename_ts[ch.id] = now
+        try:
+            await ch.edit(name=desired, reason="sync nom de salon = nom PVE + statut")
+        except discord.HTTPException as e:
+            # informatif : une permission manquante (Gérer les salons) se répéterait
+            # silencieusement à chaque cycle sans laisser la moindre trace.
+            log.warning("renommage de %s impossible (%s) — re-tenté plus tard", ch.id, e)
+
+    def _remember_servers(self, gm):
+        """Mémorise la clé serveur (« AVY-PVE »…) de chaque invité vu dans `guest_map`.
+
+        Les boutons ont besoin de cette clé AVANT l'ACK des 3 s, là où toute I/O PVE est
+        interdite : la calculer à la volée (`pve.server_of_name`) faisait un GET
+        proxmoxer DANS la boucle d'événements (2026-08-11). On ne RETIRE jamais une
+        entrée connue — un invité momentanément absent de `gm` (lien Aveyron coupé) doit
+        rester gardé par les rôles de SON serveur, jamais retomber sur ceux du R820."""
+        pve = self.bot.pve
+        for name, info in (gm or {}).items():
             try:
-                await ch.edit(name=desired, reason="sync nom de salon = nom PVE + statut")
-            except discord.HTTPException:
-                pass  # rate-limit -> re-tenté au prochain cycle
+                if not pve.is_avy_name(name):
+                    continue
+                node = (info or {}).get("node")
+                if node:
+                    self._srv_of[name] = pve.avy_server_key(node)
+            except Exception:  # noqa: BLE001 — un nom exotique ne doit pas tuer le cycle
+                log.debug("clé serveur indéterminable pour %s", name)
 
     @tasks.loop(minutes=2)
     async def refresh(self):
         states = dict(self.bot.state.get("ct_messages", {}) or {})
         # statut + backups en cours (une passe) pour l'emoji des salons
         try:
-            gm = await asyncio.to_thread(self.bot.pve.guest_map) if self.bot.pve.enabled else {}
+            gm = await self.bot.pve.aguest_map() if self.bot.pve.enabled else {}
         except Exception:
+            # gm vide = trou de DONNÉES, pas « tout est éteint » : _sync_channel_emoji
+            # ne renomme rien sur un invité absent. On journalise, sinon une panne de
+            # lecture PVE reste totalement invisible (embeds simplement plus pauvres).
+            log.warning("guest_map indisponible ce cycle — emojis de salon inchangés",
+                        exc_info=True)
             gm = {}
+        self._remember_servers(gm)
         backup_vmids = await self._running_backup_vmids()
         for name, cid in list(self.map.items()):
             ch = self.bot.get_channel(cid)
@@ -416,9 +519,8 @@ class CtChannels(commands.Cog):
                 except Exception:
                     log.warning("channel %s for CT %s injoignable ce cycle", cid, name)
                     continue
-            await self._sync_channel_emoji(ch, name, gm, backup_vmids)
             try:
-                emb, file = await self.build_ct(name)
+                emb = await self.build_ct(name)
             except Exception:
                 log.exception("build_ct failed for %s", name)
                 continue
@@ -436,8 +538,10 @@ class CtChannels(commands.Cog):
                     msg = await ch.send(embed=emb, view=CtControlView(self))
                     try:
                         await msg.pin()
-                    except discord.HTTPException:
-                        pass
+                    except discord.HTTPException as e:
+                        # 50 épingles max par salon : l'échec est bénin mais doit
+                        # rester traçable (message live non épinglé = introuvable).
+                        log.debug("épinglage impossible dans %s: %s", cid, e)
                     states[str(cid)] = msg.id
                     # Persistance IMMÉDIATE (pas en fin de boucle, ~20+ salons) : un
                     # redémarrage du bot EN COURS DE CYCLE (déploiement, crash, restart
@@ -447,19 +551,32 @@ class CtChannels(commands.Cog):
                     # jamais nettoyé) -> doublons observés 2026-07-17 sur 12 salons -avy.
                     self.bot.state.set("ct_messages", states)
                 else:
+                    # attachments=[] : purge les pièces jointes des anciens messages
+                    # épinglés, créés du temps où un graphe PNG était joint.
                     await msg.edit(embed=emb, view=CtControlView(self), attachments=[])
-            except discord.HTTPException:
-                continue
+            except discord.HTTPException as e:
+                # on n'abandonne pas le salon pour autant : l'emoji du NOM reste la
+                # seule information visible quand le message live n'est pas publiable.
+                log.warning("message live de %s non publié (%s)", name, e)
+            # Renommage du salon APRÈS l'embed (2026-08-11) : l'état live ne doit jamais
+            # attendre le nom du salon — si Discord fait dormir un renommage (quota
+            # 2/10 min par salon), au moins l'information est déjà à jour. Même ordre
+            # que node_channel.
+            await self._sync_channel_emoji(ch, name, gm, backup_vmids)
 
     @refresh.before_loop
     async def _before(self):
         await self.bot.wait_until_ready()
 
 
-class CtControlView(discord.ui.View):
+class CtControlView(GatedView):
     """Boutons persistants sous le dashboard de chaque invité : Rafraîchir + actions
     (Start/Stop/Reboot/Backup). L'invité est résolu par le salon du clic. Les ACTIONS
-    sont RÉSERVÉES aux administrateurs et demandent une confirmation (comme /ctctl)."""
+    sont RÉSERVÉES aux gestionnaires (rôle M/O DU SERVEUR de l'invité + session 2FA,
+    porte déclarée `gate = "mod"` et appliquée par GatedView.interaction_check) et
+    demandent une confirmation (comme /ctctl)."""
+
+    gate = "mod"
 
     def __init__(self, cog):
         super().__init__(timeout=None)
@@ -469,17 +586,74 @@ class CtControlView(discord.ui.View):
         return next((n for n, cid in self.cog.map.items() if cid == itx.channel_id), None)
 
     def _server(self, name):
-        """Clé serveur de l'invité (« AVEYRON ») ou None (R820) : les boutons d'un salon
-        AVEYRON exigent les rôles M/O AVEYRON, pas ceux du R820."""
-        try:
-            return self.cog.bot.pve.server_of_name(name) if name else None
-        except Exception:
+        """Clé serveur de l'invité (« AVY-PVE »…), None pour le R820, ou la sentinelle
+        _SRV_UNRESOLVED — le tout SANS AUCUNE I/O.
+
+        ⚠️ Deux pièges corrigés le 2026-08-11 :
+        1. cette clé est évaluée dans `interaction_check`, donc AVANT l'ACK des 3 s :
+           l'ancien `pve.server_of_name()` descendait jusqu'à `resources()` (GET
+           proxmoxer, 15 s de timeout R820 + Aveyron) DANS la boucle d'événements —
+           bot entièrement figé et « interaction failed » côté client. La clé est
+           désormais celle mémorisée par la boucle refresh (`cog._srv_of`) ;
+        2. l'ancien repli `except -> None` signifiait « invité du R820 » : une simple
+           erreur de lecture faisait garder les boutons d'un salon AVEYRON par les rôles
+           Gestion du R820 (fail-open de périmètre). On renvoie maintenant une sentinelle
+           qui REFUSE (is_admin est fail-closed sur une clé inconnue)."""
+        if not name:
             return None
+        srv = self.cog._srv_of.get(name)
+        if srv:
+            return srv
+        try:
+            # simple test de suffixe (« -avy »), aucune I/O : un invité d'Aveyron dont on
+            # ignore encore le NŒUD (donc les rôles) doit être refusé, pas rattaché au R820.
+            if self.cog.bot.pve.is_avy_name(name):
+                return _SRV_UNRESOLVED
+        except Exception:  # noqa: BLE001 — une décision d'autorisation ne s'échoue jamais en ouvert
+            log.exception("clé serveur de %s indéterminable — refus", name)
+            return _SRV_UNRESOLVED
+        return None
+
+    async def resolve_server(self, interaction):
+        """Serveur DYNAMIQUE : il dépend de l'invité du salon cliqué, pas de la vue."""
+        return self._server(self._guest(interaction))
+
+    def _breakglass(self, interaction):
+        """Propriétaire du guild / ADMIN_IDS : les deux replis que `is_admin` honore
+        AVANT tout contrôle de serveur.
+
+        ⚠️ Sans ce test, le refus « serveur non résolu » ci-dessous verrouillerait AUSSI
+        le propriétaire, et ce n'est pas un cas de bord : `_srv_of` est vide tant que la
+        boucle refresh n'a pas tourné (donc à chaque redémarrage du bot), et il le reste
+        indéfiniment si le lien Aveyron est coupé au-delà d'AVY_STALE_MAX au moment du
+        démarrage (`_avy_resources()` renvoie [] -> aucun invité -avy dans `guest_map`).
+        Le modèle écrit dans core/permissions dit l'inverse : « aucune configuration
+        cassée ne peut verrouiller totalement le bot ». Aucune porte n'est rouverte pour
+        autant — `is_admin` accorde déjà ces deux replis quelle que soit la clé serveur
+        (relecture 2026-08-11)."""
+        cfg = getattr(interaction.client, "cfg", None)
+        return (is_guild_owner(interaction)
+                or (cfg is not None
+                    and interaction.user.id in (getattr(cfg, "admin_ids", None) or ())))
+
+    async def interaction_check(self, interaction) -> bool:
+        # message explicite sur le cas « serveur non résolu » : sans ça l'utilisateur
+        # lirait « rôle Gestion __non-résolu__ » (fail-closed, mais incompréhensible).
+        if (await self.resolve_server(interaction) == _SRV_UNRESOLVED
+                and not self._breakglass(interaction)):
+            try:
+                await interaction.response.send_message(
+                    "⏳ Serveur de cet invité non résolu (supervision AVEYRON en cours "
+                    "de synchronisation) — réessaie dans une minute.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
+        return await super().interaction_check(interaction)
 
     async def _poll(self, upid, timeout=45):
         for _ in range(max(1, timeout // 3)):
             try:
-                st = await asyncio.to_thread(self.cog.bot.pve.task_status, upid)
+                st = await self.cog.bot.pve.atask_status(upid)
             except Exception:
                 return "unknown"
             if st.get("status") == "stopped":
@@ -490,44 +664,44 @@ class CtControlView(discord.ui.View):
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="ctchannels:refresh")
     async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
+        # porte (rôle Gestion DU SERVEUR de l'invité + 2FA) posée par GatedView, donc
+        # AVANT ce corps — pas le rôle A « vision »
         name = self._guest(itx)
-        # rôle Gestion (du serveur de l'invité) + 2FA — pas le rôle A « vision »
-        if not await admin_button_ok(itx, server=self._server(name)):
-            return
         await itx.response.defer()
         if name is None:
             return
         try:
-            emb, _ = await self.cog.build_ct(name)
+            emb = await self.cog.build_ct(name)
             await itx.message.edit(embed=emb, view=self, attachments=[])
         except discord.HTTPException:
             pass
         try:
             await self.cog.bot.action_feed(action="refresh", target=name, user=str(itx.user))
         except Exception:
-            pass
+            # le flux d'activité est un confort : son échec ne doit pas casser le
+            # rafraîchissement, mais il doit rester traçable (2026-08-11).
+            log.debug("action_feed refresh %s en échec", name, exc_info=True)
 
     async def _action(self, itx, act, verb):
+        # ⛔ ACTIONS RÉSERVÉES : rôle Gestion DU SERVEUR de l'invité + session 2FA (les
+        # boutons restent visibles du rôle A, mais inopérants pour lui) — appliqué par
+        # GatedView.interaction_check, qui répond lui-même sur refus.
         bot = self.cog.bot
-        cfg = bot.cfg
         name = self._guest(itx)
         if name is None:
             await itx.response.send_message("VM/conteneur introuvable pour ce salon.", ephemeral=True)
-            return
-        # ⛔ ACTIONS RÉSERVÉES : rôle Gestion DU SERVEUR de l'invité + session 2FA (les
-        # boutons restent visibles du rôle A, mais inopérants pour lui). admin_button_ok
-        # répond lui-même sur refus.
-        if not await admin_button_ok(itx, server=self._server(name)):
             return
         if not bot.pve.actions_enabled:
             await itx.response.send_message("Token d'action PVE non configuré "
                                             "(`PVE_ACTION_TOKEN_SECRET`).", ephemeral=True)
             return
-        # ACK dans les 3 s AVANT toute I/O PVE (sinon "interaction failed" si PVE lent/down)
+        # ACK dans les 3 s AVANT toute I/O PVE (sinon "interaction failed" si PVE lent/down) :
+        # la porte elle-même n'en fait plus aucune (cf. _server), c'est ici que commence
+        # le réseau, et tout passe par les enveloppes async de pve.
         await itx.response.defer(ephemeral=True)
         try:
-            vmid = await asyncio.to_thread(bot.pve.vmid_of, name)
-            gtype = await asyncio.to_thread(bot.pve.guest_type, name)
+            vmid = await bot.pve.avmid_of(name)
+            gtype = await bot.pve.aguest_type(name)
         except Exception as e:
             await itx.followup.send(f"❌ PVE injoignable : `{e}`", ephemeral=True)
             return
@@ -594,11 +768,10 @@ class CtControlView(discord.ui.View):
                        style=discord.ButtonStyle.secondary,
                        custom_id="ctchannels:graph", row=1)
     async def b_graph(self, itx: discord.Interaction, button: discord.ui.Button):
+        # porte posée par GatedView (rôle M/O du serveur de l'invité + 2FA)
         name = self._guest(itx)
         if name is None:
             await itx.response.send_message("VM/conteneur introuvable pour ce salon.", ephemeral=True)
-            return
-        if not await admin_button_ok(itx, server=self._server(name)):
             return
         await itx.response.defer(ephemeral=True)
         cog = self.cog.bot.get_cog("Graphs")
@@ -621,8 +794,11 @@ class CtControlView(discord.ui.View):
     async def b_terminal(self, itx: discord.Interaction, button: discord.ui.Button):
         name = self._guest(itx)
         # le terminal repose sur termproxy + compte botconsole du PVE R820 : pas de
-        # couverture du cluster AVEYRON (pas d'équivalent déployé là-bas)
-        if self._server(name):
+        # couverture du cluster AVEYRON (pas d'équivalent déployé là-bas). Test sur
+        # is_avy_name (pur test de chaîne) et non sur la clé serveur : ce garde-fou ne
+        # dépend pas du NŒUD, et il ne doit surtout pas déclencher d'I/O PVE avant
+        # l'ACK des 3 s — ce bouton n'a même pas de defer (2026-08-11).
+        if self.cog.bot.pve.is_avy_name(name):
             await itx.response.send_message(
                 "Terminal indisponible pour les VM/conteneurs du cluster AVEYRON.",
                 ephemeral=True)

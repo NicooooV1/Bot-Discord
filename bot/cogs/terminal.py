@@ -6,10 +6,18 @@ piloté par des boutons-touches → permet les applis plein-écran (claude, top,
 ouverte depuis le salon « 🔒 Lock ». Deux différences délibérées avec les guests :
   - transport SSH (clé dédiée) et non termproxy — PVE ne donne un shell root sur le nœud
     qu'à `root@pam` ; le détail du raisonnement est dans bot/core/nodeshell.py ;
-  - porte PROPRIÉTAIRE STRICTE (`_may_open_node`) : aucun rôle Discord n'y donne accès,
-    alors que la console des guests accepte TERMINAL_OWNER_ROLE_IDS.
+  - porte PROPRIÉTAIRE (`_may_open_node`) : `NODE_TERMINAL_OWNER_IDS` **OU** le rôle
+    « O <srv> » du serveur du nœud ; le tier **M** est refusé. La console des guests,
+    elle, accepte en plus `TERMINAL_OWNER_ROLE_IDS`.
+    ⚠️ Rectifié le 2026-08-11 : ce paragraphe annonçait « porte PROPRIÉTAIRE STRICTE :
+    aucun rôle Discord n'y donne accès ». C'est FAUX depuis la refonte des rôles du
+    2026-07-16, qui a délibérément ouvert la console du nœud au tier O (cf. le docstring
+    de `_may_open_node`). C'est le TEXTE qui avait dérivé, pas le code. Les mêmes phrases
+    périmées subsistent hors de ce fichier — README.md « Console root du nœud »,
+    config.env.example (NODE_TERMINAL_OWNER_IDS) et config.py — et restent à corriger.
 `TerminalSession` / `TerminalView` sont partagés : NodeShell expose le même contrat que
-PveConsole. Une session nœud se reconnaît à `vmid is None`.
+PveConsole. Une session nœud se reconnaît à `vmid is None` (et sa vue est la sous-classe
+`NodeTerminalView`, dont la porte est celle du nœud et non celle des guests).
 
 SÉCURITÉ (fonctionnalité la plus sensible du bot) :
   - compte PVE dédié LEAST-PRIVILEGE `botconsole@pve` (VM.Console) autorisé au niveau ACL
@@ -18,7 +26,10 @@ SÉCURITÉ (fonctionnalité la plus sensible du bot) :
   - guests sensibles ré-exclus côté bot (`TERMINAL_EXCLUDED_GUESTS`) — double barrière ;
   - thread PRIVÉ (aucun repli public) ; ⚠️ l'écran live est édité dans le fil (visible du
     propriétaire ET d'un membre « Gérer les fils »/Admin — compromis assumé pour le mode
-    interactif) ; timeout d'inactivité ; chaque saisie auditée ; sessions bornées.
+    interactif) ; timeout d'inactivité ; chaque saisie auditée ; sessions bornées ;
+  - 2026-08-11 : les BOUTONS de l'écran passent enfin une porte (`GatedView`). Avant, ils
+    ne vérifiaient QUE `owner_id` : ni le tier, ni la session 2FA n'étaient revalidés
+    après l'ouverture, si bien qu'une console ouverte survivait à l'expiration du 2FA.
 """
 import asyncio
 import logging
@@ -31,9 +42,24 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+from ..core import bg
+from ..core.gates import GatedView
+
 log = logging.getLogger("discord-bot.terminal")
 
 COLS, ROWS = 80, 24                     # taille terminal (tient dans un message Discord)
+
+# Intervalle MINIMUM entre deux éditions de l'écran (2026-08-11). `_last_edit` était écrit
+# et jamais relu : l'anti-rebond prévu n'existait pas et la boucle éditait le message à
+# chaque tick, soit jusqu'à 2 PATCH/s pour un `top`/`journalctl -f`. Le limiteur client de
+# discord.py absorbait la casse (il dort dans le bucket), mais on ne dépend pas d'un
+# comportement implicite de la bibliothèque.
+# ⚠️ 1,5 s et non 1 s : le budget d'édition est d'environ 5 PATCH / 5 s par salon (le fil
+# du terminal a son propre bucket), donc 1 édition/s tient EXACTEMENT sur la limite — le
+# moindre à-côté (un clic 🔄, une reprise après coupure) fait dormir la requête dans le
+# bucket, et les tests d'inactivité et de plafond absolu vivent dans la MÊME boucle : ils
+# seraient retardés d'autant sur un shell root. 1,5 s garde de la marge sans écran saccadé.
+EDIT_MIN_INTERVAL = 1.5
 
 try:
     import pyte
@@ -54,7 +80,12 @@ class PveConsole:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self._ssl = ssl.create_default_context()
+        # cfg.pve_verify_ssl vaut False, True, ou un CHEMIN de CA (config._verify_ssl).
+        # Sans cafile=, activer la vérification par un chemin ferait échouer la console en
+        # SSLCertVerificationError : le magasin système ne contient pas le CA auto-signé
+        # de PVE, et le bouton 🖥️ n'ouvrirait plus rien (2026-08-11).
+        _ca = cfg.pve_verify_ssl if isinstance(cfg.pve_verify_ssl, str) else None
+        self._ssl = ssl.create_default_context(cafile=_ca)
         if not cfg.pve_verify_ssl:
             self._ssl.check_hostname = False
             self._ssl.verify_mode = ssl.CERT_NONE
@@ -90,7 +121,9 @@ class PveConsole:
             ssl=self._ssl, protocols=["binary"], heartbeat=None)
         await self.ws.send_str(f"{t.get('user', self.cfg.pve_console_user)}:{t['ticket']}\n")
         await self.ws.send_str(f"1:{COLS}:{ROWS}:")        # resize (protocole 1:cols:rows:)
-        self._ping = asyncio.create_task(self._pinger())
+        # bg.spawn et non create_task : référence forte (la boucle ne garde qu'une weakref)
+        # + journalisation si le pinger meurt (2026-08-11)
+        self._ping = bg.spawn(self._pinger(), name=f"terminal:ping:{vmid}", logger=log)
 
     async def _pinger(self):
         try:
@@ -98,7 +131,9 @@ class PveConsole:
                 await asyncio.sleep(30)
                 await self.ws.send_str("2")
         except Exception:
-            pass
+            # perdre le keepalive n'est pas fatal (le websocket se fermera de lui-même et
+            # _reader terminera la session) mais ça explique une console qui « tombe »
+            log.debug("terminal: pinger arrêté", exc_info=True)
 
     async def send_raw(self, data: str):
         if self.ws is None or self.ws.closed:
@@ -116,14 +151,16 @@ class PveConsole:
             await asyncio.sleep(0.25)
             await self.ws.send_str(f"1:{COLS}:{ROWS}:")
         except Exception:
-            pass
+            log.debug("terminal: force_redraw impossible", exc_info=True)
 
     async def read_chunk(self, timeout=20):
         try:
             msg = await asyncio.wait_for(self.ws.receive(), timeout=timeout)
         except asyncio.TimeoutError:
-            return ""
+            return ""                    # simple inactivité : la session reste vivante
         except Exception:
+            # lien coupé : on marque la console morte, _reader clôturera la session
+            log.debug("terminal: lecture websocket interrompue", exc_info=True)
             self.ws = None
             return ""
         if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
@@ -172,6 +209,7 @@ class TerminalSession:
         # durée de vie absolue (0/None = illimitée) : posée pour la console du nœud
         self.max_min = max_min or 0
         self.msg = None                 # message "écran" édité en direct
+        self.view = None                # vue des boutons-touches (à stop() en fin de vie)
         self.started = time.monotonic()
         # ⚠️ DEUX horloges distinctes, et c'est essentiel :
         #  - last_active = dernière ACTIVITÉ (sortie du terminal comprise) -> sert au rendu ;
@@ -183,6 +221,7 @@ class TerminalSession:
         self.last_input = time.monotonic()
         self._dirty = True
         self._last_edit = 0.0
+        self._loop_errors = 0           # échecs consécutifs de _renderer (anti-inondation)
         self._tasks = []
         if _HAS_PYTE:
             self.screen = pyte.Screen(COLS, ROWS)
@@ -192,8 +231,33 @@ class TerminalSession:
             self._buf = ""
 
     def start(self):
-        self._tasks = [asyncio.create_task(self._reader()),
-                       asyncio.create_task(self._renderer())]
+        # bg.spawn : référence forte + journalisation d'une mort inattendue (2026-08-11)
+        self._tasks = [bg.spawn(self._reader(), name=f"terminal:reader:{self.name}",
+                                logger=log),
+                       bg.spawn(self._renderer(), name=f"terminal:renderer:{self.name}",
+                                logger=log)]
+        # ⚠️ INVARIANT : « une entrée dans cog.sessions sans _renderer vivant ne doit pas
+        # exister ». _renderer est la SEULE tâche qui applique le timeout d'inactivité ET
+        # le plafond absolu ; si elle disparaît (coupure TCP pendant une édition, bug), le
+        # shell root reste pilotable SANS aucune fermeture automatique — et, pour la
+        # console du nœud, garde le verrou d'unicité jusqu'au redémarrage du bot.
+        self._tasks[1].add_done_callback(self._renderer_gone)
+
+    def _renderer_gone(self, task):
+        """Filet du dernier recours : la tâche de rendu est morte -> on ferme la session.
+
+        Callback SYNCHRONE (asyncio) : la fermeture part dans une tâche détachée. Deux
+        garde-fous pour ne pas boucler sur `_end` : une annulation est une fermeture
+        VOULUE (close()), et une session déjà retirée de `cog.sessions` a déjà été close.
+        """
+        if task.cancelled():
+            return
+        if self.cog.sessions.get(self.thread.id) is not self:
+            return
+        log.warning("terminal %s: tâche de rendu perdue -> fermeture de la session",
+                    self.name)
+        bg.spawn(self.cog._end(self.thread.id, "tâche de rendu perdue"),
+                 name=f"terminal:end:{self.name}", logger=log)
 
     def _feed(self, raw):
         if not raw:
@@ -202,7 +266,10 @@ class TerminalSession:
             try:
                 self.stream.feed(raw)
             except Exception:
-                pass
+                # volontairement en debug : une séquence exotique peut faire trébucher
+                # pyte à chaque chunk, un warning inonderait journald
+                log.debug("terminal %s: pyte a rejeté un morceau de flux", self.name,
+                          exc_info=True)
         else:
             self._buf = (self._buf + _CTRL.sub("", _ANSI.sub("", raw)))[-4000:]
         self._dirty = True
@@ -230,7 +297,11 @@ class TerminalSession:
                     self._feed(raw)
                     self.last_active = time.monotonic()
         except asyncio.CancelledError:
-            pass
+            raise                       # fermeture voulue : close() a déjà tout géré
+        except Exception:
+            # une lecture qui casse ne doit pas laisser une session « vivante » muette
+            log.warning("terminal %s: boucle de lecture interrompue", self.name,
+                        exc_info=True)
         # console fermée par la fin du flux
         if not self.console.alive:
             await self.cog._end(self.thread.id, "session PVE fermée")
@@ -238,9 +309,15 @@ class TerminalSession:
     async def _renderer(self):
         idle_s = self.idle_min * 60
         max_s = self.max_min * 60
-        try:
-            while True:
-                await asyncio.sleep(0.5)
+        while True:
+            await asyncio.sleep(0.5)
+            # ⚠️ TOUT le corps est gardé (2026-08-11) : la seule garde était
+            # `except discord.HTTPException` autour de msg.edit, or discord.py ne convertit
+            # PAS les erreurs de transport — une coupure TCP (ECONNRESET = 104 sous Linux,
+            # non retentée par HTTPClient.request), un ClientConnectorError ou un
+            # TimeoutError remontaient bruts, tuaient la tâche en silence et emportaient
+            # avec eux le timeout d'inactivité ET le plafond absolu du shell root.
+            try:
                 # inactivité = pas de SAISIE (et non « pas de sortie ») — cf. __init__
                 if time.monotonic() - self.last_input > idle_s:
                     await self.cog._end(
@@ -252,15 +329,36 @@ class TerminalSession:
                     await self.cog._end(
                         self.thread.id, f"durée maximale atteinte ({self.max_min} min)")
                     return
-                if self._dirty and self.msg is not None:
+                # anti-rebond : cf. EDIT_MIN_INTERVAL. `_dirty` n'est consommé QUE si on
+                # édite vraiment, sinon la dernière sortie serait perdue.
+                if (self._dirty and self.msg is not None
+                        and time.monotonic() - self._last_edit >= EDIT_MIN_INTERVAL):
                     self._dirty = False
                     try:
                         await self.msg.edit(content=self.render())
                         self._last_edit = time.monotonic()
                     except discord.HTTPException:
+                        # 5xx/message supprimé : cette frame est ABANDONNÉE (`_dirty` a déjà
+                        # été consommé) — c'est voulu, réessayer en boucle sur un message
+                        # supprimé enverrait un 404 tous les demi-tours. La prochaine sortie
+                        # du terminal rallumera `_dirty` et redessinera l'écran.
                         pass
-        except asyncio.CancelledError:
-            pass
+                self._loop_errors = 0
+            except asyncio.CancelledError:
+                # redondant (CancelledError est une BaseException depuis 3.8) mais explicite
+                raise
+            except Exception:
+                # la boucle tourne 2 fois/s : une panne réseau DURABLE ferait ~1200 lignes
+                # en 10 min. On journalise le premier échec, puis au plus un par minute
+                # (120 tours) — d'où le modulo.
+                self._loop_errors += 1
+                if self._loop_errors == 1 or self._loop_errors % 120 == 0:
+                    log.warning("terminal %s: boucle de rendu (échec #%d)", self.name,
+                                self._loop_errors, exc_info=True)
+                # si l'échec est survenu DANS _end, la session est déjà dépilée : ne pas
+                # tourner à vide sur une session morte (close() ne s'auto-annule pas)
+                if self.cog.sessions.get(self.thread.id) is not self:
+                    return
 
     async def send_input(self, data, user, label):
         self.last_active = time.monotonic()
@@ -271,7 +369,9 @@ class TerminalSession:
         try:
             await self.console.send_raw(data)
         except Exception:
-            pass
+            # une frappe perdue en silence donnait un écran figé sans explication :
+            # on journalise, l'utilisateur verra la console se fermer via _reader
+            log.warning("terminal %s: saisie non transmise", self.name, exc_info=True)
 
     async def close(self):
         for t in self._tasks:
@@ -280,7 +380,14 @@ class TerminalSession:
         await self.console.close()
 
 
-class TextModal(discord.ui.Modal, title="Terminal — saisir du texte"):
+class TextModal(GatedView, discord.ui.Modal, title="Terminal — saisir du texte"):
+    # La porte de cette modale est PLUS SPÉCIFIQUE que les tiers G/M/O : propriétaire de
+    # LA session console + 2FA. Elle est reposée dans on_submit ci-dessous (une modale
+    # peut être soumise longtemps après son ouverture, 2FA expiré entre-temps).
+    gate = None
+    gate_reason = ("porte spécifique — propriétaire de la session console + session 2FA — "
+                   "vérifiée dans on_submit")
+
     txt = discord.ui.TextInput(
         label="Texte (Entrée ajoutée à la fin)",
         style=discord.TextStyle.paragraph,
@@ -293,26 +400,66 @@ class TextModal(discord.ui.Modal, title="Terminal — saisir du texte"):
         self.thread_id = thread_id
 
     async def on_submit(self, itx: discord.Interaction):
+        # ⚠️ Une MODALE ne passe pas par l'interaction_check de la vue qui l'a ouverte :
+        # la porte doit être reposée ici (2026-08-11). Une modale peut d'ailleurs rester
+        # ouverte longtemps côté client et être soumise après l'expiration du 2FA.
+        from ..core.permissions import session_2fa_ok, deny_2fa
         sess = self.cog.sessions.get(self.thread_id)
         if sess is None or not sess.console.alive or itx.user.id != sess.owner_id:
             await itx.response.send_message("Session terminée / non autorisée.", ephemeral=True)
+            return
+        if not session_2fa_ok(itx):
+            await deny_2fa(itx)
             return
         await itx.response.defer()
         text = str(self.txt.value)
         await sess.send_input(text + "\r", itx.user, text or "<Entrée>")
 
 
-class TerminalView(discord.ui.View):
+class TerminalView(GatedView):
+    """Boutons-touches de l'écran d'une console LXC.
+
+    Porte (2026-08-11) : tier **mod** + `gate_user_id` = l'ouvreur. Avant, chaque bouton
+    ne comparait que `owner_id` : le tier ET la session 2FA n'étaient vérifiés qu'à
+    l'OUVERTURE (`open_for`), donc une console survivait indéfiniment à l'expiration du
+    2FA tant qu'on frappait une touche avant le timeout d'inactivité. `GatedView` les
+    revalide à chaque clic — c'est la « défense en profondeur » retenue plutôt que fermer
+    la session sur expiration : `send_input` ne ré-arme PAS la session 2FA, une fermeture
+    automatique couperait donc les consoles en plein travail. Conséquence assumée : après
+    expiration, l'utilisateur doit `/2fa unlock` puis recliquer ; la console reste ouverte
+    entre-temps (et le timeout d'inactivité la fermera s'il ne revient pas).
+    Le tier « mod » ne restreint personne en pratique : le bouton 🖥️ qui mène à `open_for`
+    est porté par `CtControlView` (ct_channels.py), elle-même `gate = "mod"` avec le MÊME
+    serveur (None = R820 ; les invités d'Aveyron y sont refusés en amont) — la porte des
+    touches est donc exactement celle de l'ouverture, jamais plus fermée.
+    """
+
+    gate = "mod"
+
     def __init__(self, cog, thread_id, owner_id):
         super().__init__(timeout=None)
         self.cog = cog
         self.thread_id = thread_id
         self.owner_id = owner_id
+        self.gate_user_id = owner_id    # fil privé : seul l'ouvreur pilote le shell
+
+    async def _denied(self, itx, msg):
+        try:
+            if itx.response.is_done():
+                await itx.followup.send(msg, ephemeral=True)
+            else:
+                await itx.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    async def on_denied(self, itx, why):
+        if why == "user":
+            # message historique, plus parlant que le libellé générique de GatedView
+            await self._denied(itx, "🔒 Ce terminal n'est pas le tien.")
+            return
+        await super().on_denied(itx, why)
 
     async def _key(self, itx, key, label):
-        if itx.user.id != self.owner_id:
-            await itx.response.send_message("🔒 Ce terminal n'est pas le tien.", ephemeral=True)
-            return
         sess = self.cog.sessions.get(self.thread_id)
         if sess is None or not sess.console.alive:
             await itx.response.send_message("Session terminée.", ephemeral=True)
@@ -322,9 +469,6 @@ class TerminalView(discord.ui.View):
 
     @discord.ui.button(label="Texte", emoji="⌨️", style=discord.ButtonStyle.primary, row=0)
     async def b_text(self, itx, b):
-        if itx.user.id != self.owner_id:
-            await itx.response.send_message("🔒 Ce terminal n'est pas le tien.", ephemeral=True)
-            return
         if self.thread_id not in self.cog.sessions:
             await itx.response.send_message("Session terminée.", ephemeral=True)
             return
@@ -344,14 +488,14 @@ class TerminalView(discord.ui.View):
 
     @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def b_refresh(self, itx, b):
-        if itx.user.id != self.owner_id:
-            await itx.response.send_message("🔒", ephemeral=True)
-            return
+        # acquitter D'ABORD, comme tous les autres boutons : force_redraw contient un
+        # sleep(0.25) fixe qui amputait d'autant le budget de 3 s de la réponse initiale
+        # (2026-08-11).
+        await itx.response.defer()
         sess = self.cog.sessions.get(self.thread_id)
         if sess and sess.console.alive:
             await sess.console.force_redraw()
             sess._dirty = True
-        await itx.response.defer()
 
     @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
     async def b_left(self, itx, b):
@@ -375,11 +519,39 @@ class TerminalView(discord.ui.View):
 
     @discord.ui.button(label="Fermer", emoji="❌", style=discord.ButtonStyle.danger, row=2)
     async def b_close(self, itx, b):
-        if itx.user.id != self.owner_id:
-            await itx.response.send_message("🔒", ephemeral=True)
-            return
         await itx.response.defer()
         await self.cog._end(self.thread_id, f"fermé par {itx.user}")
+
+
+class NodeTerminalView(TerminalView):
+    """Écran de la console root de l'HYPERVISEUR : même UI, porte du NŒUD.
+
+    On ne réutilise pas `OwnerGatedView` (propriétaire du guild / ADMIN_IDS seulement) :
+    elle refuserait le tier **O** et les `NODE_TERMINAL_OWNER_IDS` qui ne sont pas dans
+    ADMIN_IDS, c'est-à-dire précisément les gens autorisés à OUVRIR cette console depuis
+    le salon Lock — la vue serait alors morte pour son propre ouvreur. On repose donc la
+    vraie porte du module, `_may_open_node` (user-ids dédiés OU rôle O, jamais M), qui est
+    STRICTEMENT plus fermée que le tier « owner » (may_lock accepte M). Ajouté 2026-08-11 :
+    avant, les boutons du shell root de l'hôte ne vérifiaient que `owner_id`.
+    """
+
+    gate = "owner"
+
+    async def interaction_check(self, itx) -> bool:
+        if not await super().interaction_check(itx):
+            return False
+        if not self.cog._may_open_node(itx):
+            await self.on_denied(itx, "role")
+            return False
+        return True
+
+    async def on_denied(self, itx, why):
+        if why == "role":
+            await self._denied(
+                itx, "🔒 Console de l'hyperviseur réservée au propriétaire "
+                     "(ou au rôle **O** du serveur du nœud).")
+            return
+        await super().on_denied(itx, why)
 
 
 class Terminal(commands.Cog):
@@ -392,14 +564,39 @@ class Terminal(commands.Cog):
         self._max = 3
         self._cleaned = False
 
-    def cog_unload(self):
-        for tid in list(self.sessions):
-            sess = self.sessions.pop(tid, None)
-            if sess:
-                try:
-                    asyncio.create_task(sess.close())
-                except RuntimeError:
-                    pass
+    async def cog_unload(self):
+        """Arrêt du bot : clôturer VRAIMENT les consoles root encore ouvertes.
+
+        L'ancienne version (synchrone) programmait `sess.close()` et rendait la main :
+        même exécutée, `close()` ne fait qu'annuler les tâches et fermer le lien — ni le
+        message « Terminal fermé » dans le fil, ni l'archivage, ni l'entrée d'audit
+        `terminal-close` n'étaient produits. C'est un trou de traçabilité sur la surface la
+        plus sensible du bot : on passe donc par `_end` (2026-08-11).
+        discord.py attend un `cog_unload` coroutine (cf. cogs/logs.py) et `Bot.close()`
+        décharge les cogs AVANT de fermer le client HTTP : les deux appels Discord de
+        `_end` fonctionnent encore ici.
+        ⚠️ Budget GLOBAL et non par session : `_end` fait 2 requêtes HTTP chacune et il
+        peut y avoir 3 sessions — un `wait_for` par session retarderait l'arrêt demandé
+        par systemd au-delà de son TimeoutStopSec.
+        """
+        tids = list(self.sessions)
+        if not tids:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(self._end(t, "arrêt du bot") for t in tids),
+                               return_exceptions=True), 5)
+        # le TimeoutError du budget compris : un arrêt ne doit JAMAIS lever, systemd
+        # attend le processus et discord.py avalerait l'exception sans un mot
+        except Exception:  # noqa: BLE001
+            log.warning("terminal: clôture des consoles à l'arrêt incomplète",
+                        exc_info=True)
+        finally:
+            # ce qui n'a pas pu être clôturé ne doit pas rester référencé ; les liens
+            # (websocket/SSH) tombent de toute façon avec le processus, et `on_ready`
+            # archivera les fils orphelins au prochain démarrage.
+            for tid in tids:
+                self.sessions.pop(tid, None)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -452,8 +649,10 @@ class Terminal(commands.Cog):
         try:
             await itx.response.defer(ephemeral=True)
             try:
-                gtype = await asyncio.to_thread(self.bot.pve.guest_type, name)
-                vmid = await asyncio.to_thread(self.bot.pve.vmid_of, name)
+                # enveloppes async de core/pve (proxmoxer est synchrone : un appel nu
+                # gèlerait la boucle d'événements jusqu'à 15 s)
+                gtype = await self.bot.pve.aguest_type(name)
+                vmid = await self.bot.pve.avmid_of(name)
             except Exception:
                 await itx.followup.send("❌ PVE injoignable.", ephemeral=True)
                 return
@@ -461,8 +660,9 @@ class Terminal(commands.Cog):
                 await itx.followup.send("Terminal réservé aux conteneurs LXC.", ephemeral=True)
                 return
             try:
-                st = await asyncio.to_thread(self.bot.pve.ct_status, vmid)
+                st = await self.bot.pve.aguest_status(vmid, "lxc")
             except Exception:
+                log.debug("terminal %s: statut LXC illisible", name, exc_info=True)
                 st = {}
             if st.get("status") != "running":
                 await itx.followup.send(f"**{name}** n'est pas démarré.", ephemeral=True)
@@ -510,8 +710,10 @@ class Terminal(commands.Cog):
             # (donc sans timeout d'inactivité) enregistrée dans self.sessions.
             try:
                 await thread.send(embed=emb)
-                sess.msg = await thread.send(
-                    "```\n(démarrage…)\n```", view=TerminalView(self, thread.id, itx.user.id))
+                # la vue est gardée sur la session : elle doit être stop()ée en fin de vie,
+                # sinon son entrée reste au ViewStore de discord.py jusqu'au redémarrage
+                sess.view = TerminalView(self, thread.id, itx.user.id)
+                sess.msg = await thread.send("```\n(démarrage…)\n```", view=sess.view)
                 self.sessions[thread.id] = sess
                 sess.start()
             except Exception:
@@ -642,8 +844,9 @@ class Terminal(commands.Cog):
             # bouton jusqu'au redémarrage du bot (aucun bouton ❌ n'ayant été posté).
             try:
                 await thread.send(embed=emb)
-                sess.msg = await thread.send(
-                    "```\n(démarrage…)\n```", view=TerminalView(self, thread.id, itx.user.id))
+                # NodeTerminalView : porte du NŒUD (cf. sa docstring), pas celle des guests
+                sess.view = NodeTerminalView(self, thread.id, itx.user.id)
+                sess.msg = await thread.send("```\n(démarrage…)\n```", view=sess.view)
                 self.sessions[thread.id] = sess
                 sess.start()
             except Exception:
@@ -675,6 +878,16 @@ class Terminal(commands.Cog):
         if sess is None:
             return
         await sess.close()
+        # libérer l'entrée du ViewStore : avec timeout=None et sans custom_id stable, une
+        # vue n'en sort QUE sur stop() — sinon chaque session en laissait une résidente
+        # jusqu'au redémarrage du bot (2026-08-11). Contrepartie assumée : un clic sur
+        # l'écran d'un terminal déjà fermé n'affiche plus « Session terminée. » mais
+        # l'échec générique de Discord — le fil est de toute façon archivé + verrouillé.
+        if sess.view is not None:
+            try:
+                sess.view.stop()
+            except Exception:  # noqa: BLE001 — ne doit jamais empêcher la clôture
+                log.debug("terminal %s: stop() de la vue", sess.name, exc_info=True)
         self.bot.audit.record(user="system",
                               action="terminal-close" if sess.vmid else "terminal-node-close",
                               target=sess.name, result=reason[:80])
@@ -683,6 +896,12 @@ class Terminal(commands.Cog):
             await sess.thread.edit(archived=True, locked=True)
         except discord.HTTPException:
             pass
+        except Exception:
+            # une erreur de TRANSPORT (coupure TCP) n'est pas une HTTPException : sans ce
+            # filet elle remonterait dans l'appelant — _renderer, _reader ou cog_unload —
+            # alors que la console, elle, est déjà fermée (2026-08-11).
+            log.warning("terminal %s: fil non clôturé proprement", sess.name,
+                        exc_info=True)
 
 
 async def setup(bot):

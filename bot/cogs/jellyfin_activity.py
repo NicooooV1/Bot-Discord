@@ -118,12 +118,35 @@ class JellyfinActivity(commands.Cog):
             except Exception:
                 log.warning("salon jellyfin-logs %s introuvable", self.channel_id)
                 return
-        for entry in new[:20]:      # garde-fou anti-flood sur un rattrapage ponctuel
+        # Garde-fou anti-flood : on n'envoie que 20 entrées par tour, et le curseur
+        # n'avance QUE sur ce qui est réellement parti. Avant (2026-08-11) il sautait à
+        # `new[-1]` — dernier élément de la liste COMPLÈTE : le reliquat au-delà de 20,
+        # comme tout ce qui suivait un envoi en échec, était perdu pour Discord (le
+        # curseur est persisté dans state.json, donc la perte survivait au redémarrage).
+        # Le reliquat est repris au cycle suivant, 20 par 20.
+        batch = new[:20]
+        sent = None
+        for i, entry in enumerate(batch):
             try:
                 await ch.send(self._format(entry))
-            except discord.HTTPException:
+            except (discord.Forbidden, discord.NotFound):
+                # Panne DURABLE (droit d'écriture retiré, salon supprimé) : garder le
+                # curseur ferait rejouer éternellement le même envoi voué à l'échec.
+                # On avance donc jusqu'au lot courant, mais on le DIT.
+                log.warning("jellyfin-logs %s inaccessible — %d entrée(s) non publiée(s), "
+                            "curseur avancé", self.channel_id, len(batch) - i,
+                            exc_info=True)
+                sent = batch[-1]["Id"]
                 break
-        self._last_id = new[-1]["Id"]
+            except discord.HTTPException:
+                # Panne transitoire : on s'arrête là, la suite repart au prochain tour.
+                log.warning("envoi vers jellyfin-logs échoué — reprise au cycle suivant",
+                            exc_info=True)
+                break
+            sent = entry["Id"]
+        if sent is None or sent == self._last_id:
+            return
+        self._last_id = sent
         self.bot.state.set("jellyfin_activity_last_id", self._last_id)
 
     @poll.before_loop

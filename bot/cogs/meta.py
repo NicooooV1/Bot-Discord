@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
+from ..core.gates import GatedView
 from ..core.permissions import read_check, is_admin, can_read
 
 log = logging.getLogger("discord-bot.meta")
@@ -21,6 +22,9 @@ LOCK_CATEGORY = "Lock"      # même catégorie que #ratio
 HELP_CHANNEL = "help"
 
 # command name -> category; anything unlisted lands in "Autres"
+# ⚠️ Table à tenir à jour quand une commande est ajoutée : une commande absente n'est pas
+# perdue (elle tombe dans « 🧩 Autres »), mais le classement perd son sens. Le cadenas 🔒,
+# lui, n'est PLUS déduit d'une liste (cf. _is_admin_cmd) — il ne peut donc pas périmer.
 CATEGORIES = [
     ("📊 État & métriques", ["status", "health", "ping", "node", "ct", "cts", "graph"]),
     ("💽 Stockage & matériel", ["storage", "thinpool", "raid", "smart", "temps", "ipmi"]),
@@ -30,10 +34,29 @@ CATEGORIES = [
     ("🔎 In-guest", ["sys", "df"]),
     ("🚨 Alertes & dashboard", ["alerts", "dashboard"]),
     ("🧲 Seedbox & médias", ["ratio", "setratio", "langues", "film", "serie"]),
+    ("🐳 Docker & torrents", ["docker", "torrents"]),
+    ("📥 Téléchargements YouTube/Twitch", ["yt", "tw", "musique", "yt-config", "dl"]),
+    ("🤖 Assistant IA", ["assistant"]),
+    ("🔐 Sécurité & accès", ["2fa", "gestion"]),
     ("🔧 Actions (admin)", ["ctctl", "backup", "audit"]),
     ("🪪 Divers", ["whoami", "help"]),
 ]
-ADMIN_CMDS = {"ctctl", "backup", "audit", "dashboard"}
+# Repli pour les commandes gardées par du code INLINE et non par @admin_check :
+# /gestion vérifie lui-même le tier O dans son corps, il n'a donc aucun check à inspecter.
+ADMIN_CMDS = {"gestion"}
+
+
+def _is_admin_cmd(cmd):
+    """🔒 déduit du CODE, pas d'une liste (2026-08-11).
+
+    `ADMIN_CMDS` listait 4 commandes pour 8 réellement gardées : /docker, /torrents,
+    /setratio, /logstream… s'affichaient SANS cadenas alors que la légende promet
+    l'inverse. `admin_check()` renvoie un prédicat local — repérable à son `__qualname__`
+    — attaché à `Command.checks` : la liste ne peut plus dériver du code."""
+    for chk in getattr(cmd, "checks", None) or ():
+        if "admin_check" in getattr(chk, "__qualname__", ""):
+            return True
+    return cmd.qualified_name.split(" ")[0] in ADMIN_CMDS
 
 
 class Meta(commands.Cog):
@@ -61,7 +84,7 @@ class Meta(commands.Cog):
                 nm = getattr(p, "display_name", None) or p.name
                 parts.append(f"<{nm}>" if p.required else f"[{nm}]")
             cmds[qn] = (" ".join(parts), (c.description or "").strip(),
-                        qn.split(" ")[0] in ADMIN_CMDS)
+                        _is_admin_cmd(c))
 
         def line(qn):
             sig, desc, admin = cmds[qn]
@@ -88,9 +111,13 @@ class Meta(commands.Cog):
         total = sum(len(lines) for _, lines in sections)
         emb = discord.Embed(
             title="📖 Aide — toutes les commandes du bot",
+            # la légende disait « salon admin + rôle autorisé » : faux pour /docker,
+            # /torrents, /setratio… qui sont `admin_check(require_admin_channel=False)`
+            # et se lancent depuis n'importe quel salon autorisé (2026-08-11).
             description=("Ce que fait chaque commande et comment l'utiliser.\n"
-                         "`<obligatoire>` · `[optionnel]` · 🔒 = réservé admin "
-                         "(salon admin + rôle autorisé)."),
+                         "`<obligatoire>` · `[optionnel]` · 🔒 = réservé aux "
+                         "gestionnaires (rôle Gestion ; certaines aussi confinées au "
+                         "salon admin)."),
             color=fmt.BLURPLE)
         emb.timestamp = discord.utils.utcnow()
         used = len(emb.title) + len(emb.description)
@@ -122,6 +149,41 @@ class Meta(commands.Cog):
         return emb
 
     # ------------------------------------------------------------------ salon
+    @staticmethod
+    def _satellite_overwrites(guild, parent=None):
+        """Permissions posées À LA CRÉATION des salons satellites de « Lock ».
+
+        Sans `overwrites=`, Discord fait hériter les permissions du serveur : au tout
+        premier démarrage sur un guild vierge, la catégorie « Lock » et #help naissaient
+        donc INSCRIPTIBLES par @everyone (2026-08-11). Personne d'autre que le bot n'y
+        écrit désormais.
+
+        ⚠️ `parent` (la catégorie d'accueil) n'est pas décoratif : dès qu'on passe
+        `overwrites=` à `create_text_channel`, Discord CESSE de recopier les permissions
+        de la catégorie. Or `lock_category_id` peut très bien désigner la vraie « 🔒 Lock
+        <clé> » de provision (requests._lock_category l'y écrit), qui masque @everyone :
+        un #help créé là avec nos seuls overwrites en ressortirait VISIBLE DE TOUS. On
+        repart donc des overwrites de la catégorie et on n'ajoute que le refus d'écriture
+        (relecture 2026-08-11). La visibilité de #help reste ainsi exactement celle de sa
+        catégorie, comme avant la correction.
+
+        ⚠️ À passer uniquement à `create_*`, JAMAIS à `edit(overwrites=)` : sur une
+        catégorie pré-existante, qui appartient à l'utilisateur et peut contenir ses
+        propres salons, `edit` REMPLACE l'ensemble des overwrites (cf.
+        provision._ensure_lock_category)."""
+        # `.overwrites` reconstruit des PermissionOverwrite neufs à chaque appel : les
+        # modifier ne touche pas le cache de la catégorie.
+        ow = dict(parent.overwrites) if parent is not None else {}
+        everyone = ow.get(guild.default_role) or discord.PermissionOverwrite()
+        everyone.update(send_messages=False, add_reactions=False)
+        ow[guild.default_role] = everyone
+        if guild.me is not None:      # sans le membre bot en cache, on ne s'auto-exclut pas
+            me = ow.get(guild.me) or discord.PermissionOverwrite()
+            me.update(view_channel=True, send_messages=True, embed_links=True,
+                      manage_messages=True)
+            ow[guild.me] = me
+        return ow
+
     async def _ensure_help_channel(self):
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
@@ -141,8 +203,11 @@ class Meta(commands.Cog):
             cat = discord.utils.get(guild.categories, name=LOCK_CATEGORY)
         if cat is None:
             try:
-                cat = await guild.create_category(LOCK_CATEGORY, reason="salon d'aide")
+                cat = await guild.create_category(
+                    LOCK_CATEGORY, overwrites=self._satellite_overwrites(guild),
+                    reason="salon d'aide")
             except discord.HTTPException:
+                log.warning("catégorie « %s » non créée", LOCK_CATEGORY, exc_info=True)
                 cat = None
         if cat is not None:
             self.bot.state.set("lock_category_id", cat.id)
@@ -151,9 +216,11 @@ class Meta(commands.Cog):
             try:
                 ch = await guild.create_text_channel(
                     HELP_CHANNEL, category=cat,
+                    overwrites=self._satellite_overwrites(guild, cat),
                     topic="Aide : toutes les commandes du bot — auto + bouton Rafraîchir")
                 log.info("salon #help créé")
             except discord.HTTPException:
+                log.warning("salon #%s non créé", HELP_CHANNEL, exc_info=True)
                 return None
         cur = self.bot.state.get("help_msg") or {}
         cur["channel"] = ch.id
@@ -178,13 +245,15 @@ class Meta(commands.Cog):
                 try:
                     await msg.pin()
                 except discord.HTTPException:
-                    pass
+                    log.warning("message d'aide non épinglé", exc_info=True)
                 info["message"] = msg.id
                 self.bot.state.set("help_msg", info)
             else:
                 await msg.edit(embed=embed, view=view)
         except discord.HTTPException:
-            pass
+            # avalé jusqu'ici : un embed rejeté (>6000 car.) ou un salon devenu
+            # inaccessible laissait #help figé sans une ligne de log (2026-08-11).
+            log.warning("publication du message d'aide impossible", exc_info=True)
 
     @tasks.loop(minutes=30)
     async def helpchan(self):
@@ -219,8 +288,12 @@ class Meta(commands.Cog):
                             color=fmt.GREEN if admin else fmt.BLURPLE)
         emb.add_field(name="Utilisateur",
                       value=f"{itx.user.mention} (`{itx.user.id}`)", inline=False)
-        emb.add_field(name="Rôles",
-                      value=", ".join(r.mention for r in roles) or "—", inline=False)
+        # un champ d'embed est limité à 1024 caractères : une trentaine de mentions de
+        # rôles suffit à faire rejeter tout le message par l'API (2026-08-11)
+        rtxt = ", ".join(r.mention for r in roles) or "—"
+        if len(rtxt) > 1024:
+            rtxt = rtxt[:1000].rsplit(",", 1)[0] + f", … (+{len(roles)} au total)"
+        emb.add_field(name="Rôles", value=rtxt, inline=False)
         emb.add_field(name="Actions admin", value="✅ autorisé" if admin else "❌ refusé")
         emb.add_field(name="Lecture", value="✅ autorisé" if read else "❌ refusé")
         if cfg.admin_role_ids:
@@ -229,7 +302,16 @@ class Meta(commands.Cog):
         await itx.response.send_message(embed=emb, ephemeral=True)
 
 
-class HelpRefreshView(discord.ui.View):
+class HelpRefreshView(GatedView):
+    """Bouton « Rafraîchir » du message épinglé de #help.
+
+    Tier « read » : le bouton ne fait que régénérer l'embed déjà affiché (aucune action
+    privilégiée), mais un bouton n'est jamais couvert par `GatedTree` — il lui faut donc
+    une porte déclarée, et « lecture + session 2FA » est celle qui correspond au salon
+    (2026-08-11)."""
+
+    gate = "read"
+
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -241,7 +323,7 @@ class HelpRefreshView(discord.ui.View):
         try:
             await itx.message.edit(embed=self.cog._help_embed(), view=self)
         except discord.HTTPException:
-            pass
+            log.warning("rafraîchissement de #help impossible", exc_info=True)
 
 
 async def setup(bot):

@@ -1,19 +1,29 @@
-"""Ephemeral, author-locked confirmation prompt for safe actions."""
+"""Confirmation éphémère verrouillée sur son auteur, pour les actions sensibles."""
 import discord
 
+from ..core.gates import GatedView
 
-class ConfirmView(discord.ui.View):
+
+class ConfirmView(GatedView):
+    # La porte de tier est celle de la COMMANDE qui ouvre cette confirmation (admin_check
+    # / read_check l'ont déjà appliquée) ; ici on ne garde que la PROPRIÉTÉ du prompt.
+    gate = None
+    gate_reason = ("confirmation d'une action déjà autorisée par la commande appelante ; "
+                   "seule la propriété (gate_user_id) est vérifiée")
+
     def __init__(self, author_id, timeout=30):
         super().__init__(timeout=timeout)
         self.author_id = author_id
+        self.gate_user_id = author_id
         self.value = None
         self.message = None  # set by caller so on_timeout can grey out the buttons
 
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if itx.user.id != self.author_id:
-            await itx.response.send_message("Ce n'est pas votre action.", ephemeral=True)
-            return False
-        return True
+    async def on_denied(self, interaction, why):
+        if why == "user":
+            await interaction.response.send_message(
+                "Ce n'est pas votre action.", ephemeral=True)
+            return
+        await super().on_denied(interaction, why)
 
     def _disable(self):
         for c in self.children:

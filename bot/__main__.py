@@ -15,7 +15,7 @@ from .core.pve import Pve
 from .core.state import State
 from .core.audit import Audit
 from .core.twofa import TwoFA
-from .core import permissions
+from .core import bg, permissions
 from .views.twofa_view import NeedsTwoFA
 
 logging.basicConfig(level=logging.INFO,
@@ -96,6 +96,8 @@ class MonitorBot(commands.Bot):
         self.state = State(cfg.state_path)
         self.audit = Audit(cfg.audit_path)
         self.audit.notifier = self.action_feed   # miroir des actions dans #live_log
+        # cogs dont le chargement a échoué : {nom: raison} — remonté par /health
+        self.failed_cogs = {}
         self._closing = False
         self._close_task = None
 
@@ -129,10 +131,16 @@ class MonitorBot(commands.Bot):
         self._close_task = asyncio.create_task(self.close())
 
     async def close(self):
-        try:
-            await self.loki.aclose()
-        except Exception:
-            pass
+        # Fermeture best-effort de chaque ressource : un échec sur l'une ne doit pas
+        # empêcher les autres de se fermer ni bloquer l'arrêt demandé par systemd.
+        for name, closer in (("loki", getattr(self.loki, "aclose", None)),
+                             ("influx", getattr(self.influx, "aclose", None))):
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001
+                log.warning("arrêt: fermeture de %s en échec", name, exc_info=True)
         await super().close()
 
     async def setup_hook(self):
@@ -145,8 +153,29 @@ class MonitorBot(commands.Bot):
         for ext in COGS:
             try:
                 await self.load_extension(f"bot.cogs.{ext}")
-            except Exception:
-                log.exception("failed loading cog %s", ext)
+            except Exception as exc:
+                # On NE quitte PAS : un cog manquant ne doit pas emporter le bot (sans
+                # `twofa`, le bouton « Déverrouiller » disparaîtrait — seul recours réel).
+                # Mais l'échec cesse d'être silencieux : il est mémorisé et remonté par
+                # /health, et les cogs qui dépendent d'un absent doivent fail-CLOSED
+                # plutôt que de dégrader un contrôle d'accès (cf. medias -> requests).
+                self.failed_cogs[ext] = f"{type(exc).__name__}: {exc}"[:200]
+                log.exception("CHARGEMENT DU COG %s EN ÉCHEC — fonctions absentes", ext)
+        if self.failed_cogs:
+            log.error("cogs non chargés: %s — /health le signale",
+                      ", ".join(sorted(self.failed_cogs)))
+
+        # Filet sur TOUTES les boucles de fond, en un seul point d'appel : une exception
+        # non rattrapée dans une tasks.loop l'arrête DÉFINITIVEMENT (discord.py ne la
+        # relance jamais). 21 boucles, 0 gestionnaire avant le 2026-08-11.
+        guarded = []
+        for cog in self.cogs.values():
+            try:
+                guarded += bg.guard_cog_loops(cog, logger=log)
+            except Exception:  # noqa: BLE001 — poser le filet ne doit casser aucun cog
+                log.exception("filet des boucles: %s", type(cog).__name__)
+        log.info("filet posé sur %d boucles de fond", len(guarded))
+
         from .views.refresh import RefreshView
         self.add_view(RefreshView(self))
         permissions.install_error_handler(self)

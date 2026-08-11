@@ -67,6 +67,37 @@ def _scrub_guest_wording(text):
         text = pat.sub(repl, text)
     return text
 
+
+def _ctx_len(messages):
+    """Taille du contexte envoyé au modèle. Compte AUSSI les `tool_calls` : ils ne sont
+    pas dans `content` et pèsent parfois plus lourd que la réponse elle-même."""
+    n = 0
+    for m in messages:
+        n += len(m.get("content") or "")
+        tc = m.get("tool_calls")
+        if tc:
+            # `default=str` : ces objets viennent du modèle, une valeur non sérialisable
+            # ne doit pas faire échouer une simple MESURE (2026-08-11).
+            n += len(json.dumps(tc, ensure_ascii=False, default=str))
+    return n
+
+
+def _trim_history(messages):
+    """Ramène le contexte sous MAX_HISTORY_CHARS en élaguant les tours d'outils les
+    plus ANCIENS (2026-08-11).
+
+    ⚠️ Un message `role=tool` doit rester précédé de l'`assistant` qui a demandé
+    l'appel, sinon l'API rejette la requête : on retire des GROUPES entiers
+    (assistant + résultats qui suivent), jamais un message isolé. Les deux messages
+    système et la demande de l'utilisateur sont toujours conservés."""
+    head, tail = messages[:3], messages[3:]
+    while tail and _ctx_len(head) + _ctx_len(tail) > MAX_HISTORY_CHARS:
+        del tail[0]                       # l'assistant porteur des tool_calls…
+        while tail and tail[0].get("role") == "tool":
+            del tail[0]                   # …et ses résultats d'outils
+    messages[:] = head + tail
+
+
 TOOLS = [
     {"type": "function", "function": {
         "name": "list_guests",
@@ -118,8 +149,15 @@ class Assistant(commands.Cog):
 
     # ------------------------------------------------------------ implémentation outils
 
+    # ⚠️ `_resolve`, `_tool_list_guests` et `_tool_guest_status` restent SYNCHRONES
+    # (proxmoxer l'est) : ils enchaînent plusieurs appels PVE — `server_of_name()`
+    # rappelle `guest_map()` de son côté, une fois par invité pour la liste. On les
+    # exécute donc EN BLOC dans un thread depuis `_call_tool` (2026-08-11) plutôt que
+    # d'envelopper chaque appel : un seul aller-retour de thread, et plus aucune
+    # requête HTTP (15 s de timeout R820, 30 s Aveyron) sur la boucle d'événements.
     def _resolve(self, name):
-        """(vmid, gtype, server) ou (None, None, None) si introuvable."""
+        """(vmid, gtype, server) ou (None, None, None) si introuvable.
+        À N'APPELER QUE depuis un thread (asyncio.to_thread) : bloquant."""
         pve = self.bot.pve
         g = pve.guest_map().get(name)
         if not g:
@@ -127,6 +165,7 @@ class Assistant(commands.Cog):
         return g.get("vmid"), g.get("type"), pve.server_of_name(name)
 
     def _tool_list_guests(self):
+        """Bloquant : à n'appeler que depuis un thread (cf. note ci-dessus)."""
         gm = self.bot.pve.guest_map()
         rows = [{"name": n, "type": i.get("type"), "status": i.get("status"),
                  "server": self.bot.pve.server_of_name(n) or "R820"}
@@ -134,6 +173,7 @@ class Assistant(commands.Cog):
         return json.dumps(rows, ensure_ascii=False)
 
     def _tool_guest_status(self, name):
+        """Bloquant : à n'appeler que depuis un thread (cf. note ci-dessus)."""
         vmid, gtype, _ = self._resolve(name)
         if vmid is None:
             return json.dumps({"error": f"VM/LXC « {name} » introuvable"})
@@ -154,7 +194,7 @@ class Assistant(commands.Cog):
         avant d'agir, journalise, renvoie un résultat structuré pour le modèle.
         `ctx` = Interaction OU _MsgCtx, peu importe (même forme .user/.guild)."""
         bot = self.bot
-        vmid, gtype, server = self._resolve(name)
+        vmid, gtype, server = await asyncio.to_thread(self._resolve, name)
         if vmid is None:
             return json.dumps({"error": f"VM/LXC « {name} » introuvable"})
         if not is_admin(bot.cfg, ctx, server=server):
@@ -187,9 +227,9 @@ class Assistant(commands.Cog):
             args = {}
         name = args.get("name", "")
         if fn == "list_guests":
-            return self._tool_list_guests()
+            return await asyncio.to_thread(self._tool_list_guests)
         if fn == "guest_status":
-            return self._tool_guest_status(name)
+            return await asyncio.to_thread(self._tool_guest_status, name)
         if fn == "start_guest":
             return await self._tool_action(ctx, name, "start", "démarré")
         if fn == "stop_guest":
@@ -203,7 +243,11 @@ class Assistant(commands.Cog):
     async def converse(self, ctx, message_text):
         """Boucle tool-calling complète. Renvoie (texte, [lignes d'actions]).
         Lève LlmExecError si l'assistant est indisponible — à l'appelant d'afficher
-        l'erreur (le rendu diffère entre /assistant et le salon de chat)."""
+        l'erreur (le rendu diffère entre /assistant et le salon de chat).
+
+        ⚠️ EXCEPTION à cette règle : la rédaction finale (après MAX_ROUNDS) rattrape
+        SES erreurs et retombe sur le message canné, parce que des actions ont peut-être
+        déjà été soumises et qu'il faut pouvoir les afficher (2026-08-11)."""
         # pseudo Discord EXACT de qui parle CETTE fois (jamais supposé « Nico » par
         # défaut : plusieurs personnes utilisent le bot/l'assistant, demande Nico
         # 2026-07-18) — message système séparé, à chaque appel, pas mémorisé plus loin.
@@ -215,7 +259,10 @@ class Assistant(commands.Cog):
                     {"role": "user", "content": message_text}]
         actions = []
         for _ in range(MAX_ROUNDS):
-            reply = await asyncio.to_thread(self.bot.pve.llm_chat, messages, TOOLS)
+            # pool de threads DÉDIÉ (pve.allm_chat) et non le pool partagé d'asyncio :
+            # un appel IA dure jusqu'à 90 s et affamerait sinon les lectures PVE/Influx
+            # des boucles de fond (2026-08-11).
+            reply = await self.bot.pve.allm_chat(messages, TOOLS)
             tool_calls = reply.get("tool_calls") or []
             if not tool_calls:
                 text = (reply.get("content") or "").strip() or "(réponse vide)"
@@ -224,19 +271,42 @@ class Assistant(commands.Cog):
                              "tool_calls": tool_calls})
             for tc in tool_calls:
                 result = await self._call_tool(ctx, tc)
+                rd = None
                 try:
                     rd = json.loads(result)
+                except json.JSONDecodeError:  # tous les outils renvoient du JSON :
+                    # un résultat illisible est une anomalie du CODE, elle ne doit pas
+                    # disparaître en silence (2026-08-11).
+                    log.warning("assistant: résultat d'outil illisible: %.150s", result)
+                # ⚠️ `list_guests` renvoie une LISTE, pas un objet : la tester avec
+                # `.get()` lève AttributeError. Un `except Exception` qui journalise
+                # transformerait donc CHAQUE appel normal de list_guests en
+                # avertissement (bruit permanent dans Loki et `/logs`) — d'où le test
+                # de type explicite ici plutôt qu'un filet attrape-tout (2026-08-11).
+                if isinstance(rd, dict):
                     if rd.get("ok"):
-                        actions.append(f"✅ {rd['action']} **{rd['name']}** ({rd['server']})")
+                        actions.append(f"✅ {rd.get('action', '?')} "
+                                       f"**{rd.get('name', '?')}** ({rd.get('server', '?')})")
                     elif rd.get("error"):
                         actions.append(f"⚠️ {rd['error']}")
-                except Exception:
-                    pass
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
                                  "content": result})
-            # garde-fou : contexte borné avant le prochain aller-retour
-            if sum(len(m.get("content") or "") for m in messages) > MAX_HISTORY_CHARS:
-                break
+            # garde-fou : contexte borné avant le prochain aller-retour. On ÉLAGUE les
+            # tours les plus anciens au lieu d'abandonner : avant le 2026-08-11 un
+            # simple `break` renvoyait « trop d'étapes » alors que le modèle n'avait
+            # jamais eu l'occasion de rédiger, et les lectures déjà faites étaient jetées.
+            _trim_history(messages)
+        # MAX_ROUNDS épuisé : un dernier aller-retour SANS outils, pour que le modèle
+        # rédige à partir de ce qu'il a déjà obtenu. C'est ce qu'annonçait le commentaire
+        # de MAX_ROUNDS (« avant de forcer une réponse ») — aucun chemin ne le faisait.
+        try:
+            final = await self.bot.pve.allm_chat(messages, None)
+            text = (final.get("content") or "").strip()
+        except Exception:  # noqa: BLE001 — des actions ont peut-être déjà été soumises :
+            log.warning("assistant: rédaction finale sans outils en échec", exc_info=True)
+            text = ""      # …mieux vaut les afficher que de tout perdre sur cette erreur
+        if text:
+            return _scrub_guest_wording(text), actions
         return "(trop d'étapes, réponse interrompue — précise ta demande)", actions
 
     # ------------------------------------------------------------------- commande

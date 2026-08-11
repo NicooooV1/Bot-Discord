@@ -9,11 +9,16 @@ Deux volets :
      stockage) sont épinglés et édités sur place (pas de spam).
   2) Un salon par guest (LXC/VM), réconcilié dynamiquement contre l'API Proxmox :
        - nouveau guest        -> nouveau salon créé automatiquement,
-       - guest supprimé       -> salon DÉPLACÉ dans « 🗄️ Archive » (jamais supprimé),
+       - guest disparu de PVE -> le salon RESTE EXACTEMENT où il est (l'archivage
+         automatique a été retiré le 2026-07-18 à la demande de Nico ; ce docstring
+         décrivait encore l'ancien comportement, corrigé 2026-08-11). Après trois
+         cycles d'absence, seul le SUIVI est relâché (cf. _purge_ghosts) : le salon
+         cesse d'être renommé et re-sondé, il n'est jamais déplacé ni supprimé,
        - ordre des salons      = ordre des VMID (l'ID donne la position).
 
 Idempotent : les IDs résolus sont persistés dans bot.state["prov"]. Au redémarrage le
-bot ré-adopte les salons existants (par ID persisté, puis par nom) au lieu d'en recréer.
+bot ré-adopte les salons existants (par ID persisté, puis par nom — avec ou sans son
+emoji de statut) au lieu d'en recréer.
 Après réconciliation, le routage temps réel est recâblé vers les salons résolus :
   - cfg.alert_channel_id / report_channel_id  (lus en direct par Alerts/Reports),
   - cfg.ct_channels                           (lu en direct par le routeur de logs),
@@ -26,7 +31,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.permissions import admin_button_ok
+from ..core.gates import GatedView
 
 log = logging.getLogger("discord-bot.provision")
 
@@ -113,6 +118,10 @@ class Provision(commands.Cog):
         self.CAT_SYNO_LOCK = f"🔒 Lock {self.syno_key}"
         self.is_primary = getattr(bot.cfg, "is_primary", True)
         self._done_once = False
+        # #chat-ia n'est publié à Assistant.on_message que si ses overwrites « O AVY-LLM »
+        # ont bien pu être posés (2026-08-11) : sans ça un salon resté PUBLIC faute de
+        # rôle résolu rendait le listener actif pour tout le guild.
+        self._assistant_chat_ok = False
         self._lock = asyncio.Lock()
         # état persistant : { categories:{}, super:{key:id}, ct:{name:id},
         #                     archived:{name:id}, order:[names] }
@@ -139,8 +148,15 @@ class Provision(commands.Cog):
     def _guild(self):
         return self.bot.get_guild(self.cfg.guild_id)
 
-    async def _ensure_category(self, guild, name, key):
-        """Adopte (par id persisté puis par nom) ou crée une catégorie. Renvoie l'objet."""
+    async def _ensure_category(self, guild, name, key, overwrites=None):
+        """Adopte (par id persisté puis par nom) ou crée une catégorie. Renvoie l'objet.
+
+        `overwrites` n'est utilisé QU'À LA CRÉATION, et uniquement par les catégories
+        privées (Supervision/Gestion/Lock/Assistant) : une catégorie créée sans
+        overwrites naît PUBLIQUE et ses salons héritent de cette visibilité, le temps
+        que `_enforce_perms` passe — ou pour toujours si les rôles ne se résolvent pas
+        (correction 2026-08-11). Une catégorie ADOPTÉE n'est jamais touchée ici : elle
+        appartient à l'utilisateur, et `edit(overwrites=)` REMPLACE l'ensemble."""
         cid = self.prov["categories"].get(key)
         cat = guild.get_channel(cid) if cid else None
         if isinstance(cat, discord.CategoryChannel):
@@ -153,10 +169,30 @@ class Provision(commands.Cog):
             target = norm(name)
             cat = next((c for c in guild.categories if norm(c.name) == target), None)
         if cat is None:
-            cat = await guild.create_category(name=name, reason="auto-provision bot")
+            kw = {}
+            if overwrites is not None:
+                kw["overwrites"] = overwrites
+            cat = await guild.create_category(name=name, reason="auto-provision bot", **kw)
             log.info("catégorie créée: %s", name)
         self.prov["categories"][key] = cat.id
         return cat
+
+    def _private_seed_overwrites(self, guild):
+        """Overwrites minimaux FAIL-CLOSED pour une catégorie/un salon que le bot CRÉE
+        alors que les rôles voulus ne se résolvent pas encore : @everyone ne voit rien,
+        seul le bot écrit (le propriétaire du guild voit tout de toute façon, Discord ne
+        permet pas de le lui cacher — donc aucun risque de lockout).
+
+        Poser ça vaut mieux que de créer public « en attendant » : `_enforce_perms`
+        posera le vrai schéma dès que les rôles M/O existeront (2026-08-11)."""
+        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        me = guild.me
+        if me is not None:
+            ow[me] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, embed_links=True,
+                manage_messages=True, manage_channels=True, read_message_history=True,
+                send_messages_in_threads=True)
+        return ow
 
     # ------------------------------------------------- catégorie « 🔒 Lock » (nœud)
 
@@ -402,10 +438,17 @@ class Provision(commands.Cog):
         corrigé) et à un propriétaire RETIRÉ de la config (son overwrite survivait → accès
         jamais révoqué). Comparaison par id : sans l'intent GUILD_MEMBERS les cibles sont
         des `discord.Object`, dont l'identité d'objet n'est pas stable."""
+        want_ow = self._lock_overwrites(guild)
+        if want_ow is None:
+            # garde anti-lockout : aucun rôle M/O résolu -> il n'y a RIEN à comparer.
+            # Avant (2026-08-11), le None.items() levait, l'except renvoyait True, et un
+            # `edit(overwrites=None)` — PATCH vide côté Discord — partait toutes les
+            # 5 min sur chaque salon Lock sans jamais rien corriger.
+            return False
         try:
-            want = {t.id: p for t, p in self._lock_overwrites(guild).items()}
+            want = {t.id: p for t, p in want_ow.items()}
             have = {t.id: p for t, p in ch.overwrites.items()}
-        except Exception:
+        except Exception:  # noqa: BLE001 — comparaison impossible -> on réapplique
             return True
         return want != have
 
@@ -417,14 +460,22 @@ class Provision(commands.Cog):
         propres salons (ici : back/ratio/help/demandes) avec ses propres règles — et
         `edit(overwrites=...)` REMPLACE l'ensemble : le bot effacerait silencieusement des
         accès qu'il n'a pas posés. La confidentialité qui compte est de toute façon portée
-        par le salon du nœud lui-même, dont les overwrites, eux, sont maintenus."""
+        par le salon du nœud lui-même, dont les overwrites, eux, sont maintenus.
+
+        ⚠️ Les overwrites sont posés DÈS `create_category` (2026-08-11) : avant, la
+        catégorie naissait publique puis était refermée par un `edit()` — fenêtre
+        d'exposition, et exposition DÉFINITIVE quand `_lock_overwrites` renvoyait None
+        (rôles M/O non résolus) puisque `edit(overwrites=None)` est un PATCH vide."""
         key_before = self.prov["categories"].get("lock")
         existed = key_before is not None or discord.utils.get(
             guild.categories, name=self.CAT_LOCK) is not None
-        cat = await self._ensure_category(guild, self.CAT_LOCK, "lock")
-        if not existed:
+        want = self._lock_overwrites(guild)
+        cat = await self._ensure_category(
+            guild, self.CAT_LOCK, "lock",
+            overwrites=want if want is not None else self._private_seed_overwrites(guild))
+        if not existed and want is not None:
             try:
-                await cat.edit(overwrites=self._lock_overwrites(guild),
+                await cat.edit(overwrites=want,
                                reason="catégorie Lock créée par le bot : propriétaire seul")
                 log.info("catégorie Lock : permissions initiales appliquées")
             except discord.HTTPException:
@@ -434,6 +485,14 @@ class Provision(commands.Cog):
     async def _provision_node_channel(self, guild):
         """Salon du nœud PVE dans « 🔒 Lock » (dashboard live + console root)."""
         if not getattr(self.cfg, "node_channel_enabled", True):
+            return
+        # `_lock_overwrites` renvoie None par conception (garde anti-lockout). Le passer
+        # tel quel à create_text_channel lève un TypeError — PAS une HTTPException — qui
+        # remontait jusqu'au try de l'étape 4 et emportait AUSSI #jellyfin-logs et
+        # `_enforce_perms` de toute la catégorie Lock (corrigé 2026-08-11).
+        ow = self._lock_overwrites(guild)
+        if ow is None:
+            log.warning("rôles M/O non résolus — salon du nœud NON provisionné ce cycle")
             return
         cat = await self._ensure_lock_category(guild)
         cid = self.prov.get("node")
@@ -445,8 +504,7 @@ class Provision(commands.Cog):
                        if fmt.strip_status_emoji(c.name) == base), None)
         if not isinstance(ch, discord.TextChannel):
             ch = await guild.create_text_channel(
-                name=f"🟢-{fmt.slug(self.cfg.pve_node)}", category=cat,
-                overwrites=self._lock_overwrites(guild),
+                name=f"🟢-{fmt.slug(self.cfg.pve_node)}", category=cat, overwrites=ow,
                 topic=f"Hyperviseur Proxmox « {self.cfg.pve_node} » — "
                       f"état live + console root. Propriétaire uniquement.",
                 reason="auto-provision : salon de l'hyperviseur")
@@ -454,12 +512,13 @@ class Provision(commands.Cog):
         else:
             if ch.category_id != cat.id:
                 try:
-                    await ch.edit(category=cat, reason="auto-provision: rangement dans Lock")
+                    await ch.edit(category=cat, sync_permissions=True,
+                                  reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
-                    pass
+                    log.warning("salon du nœud : rangement dans Lock impossible")
             if self._lock_perms_drifted(ch, guild):
                 try:
-                    await ch.edit(overwrites=self._lock_overwrites(guild),
+                    await ch.edit(overwrites=ow,
                                   reason="salon du nœud : propriétaire uniquement")
                     log.info("salon du nœud : permissions (ré)appliquées")
                 except discord.HTTPException:
@@ -474,6 +533,11 @@ class Provision(commands.Cog):
         if not (getattr(self.cfg, "jellyfin_logs_enabled", True) and self.cfg.jellyfin_url
                 and self.cfg.jellyfin_api_key):
             return
+        # même piège que _provision_node_channel : overwrites=None => TypeError (2026-08-11)
+        ow = self._lock_overwrites(guild)
+        if ow is None:
+            log.warning("rôles M/O non résolus — #jellyfin-logs NON provisionné ce cycle")
+            return
         cat = await self._ensure_lock_category(guild)
         name = "jellyfin-logs"
         cid = self.prov.get("jellyfin_logs")
@@ -482,7 +546,7 @@ class Provision(commands.Cog):
             ch = discord.utils.get(cat.text_channels, name=name)
         if not isinstance(ch, discord.TextChannel):
             ch = await guild.create_text_channel(
-                name=name, category=cat, overwrites=self._lock_overwrites(guild),
+                name=name, category=cat, overwrites=ow,
                 topic="Journal d'activité Jellyfin (lectures, comptes, connexions) — "
                       "propriétaire uniquement.",
                 reason="auto-provision : journal Jellyfin")
@@ -490,12 +554,13 @@ class Provision(commands.Cog):
         else:
             if ch.category_id != cat.id:
                 try:
-                    await ch.edit(category=cat, reason="auto-provision: rangement dans Lock")
+                    await ch.edit(category=cat, sync_permissions=True,
+                                  reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
-                    pass
+                    log.warning("#jellyfin-logs : rangement dans Lock impossible")
             if self._lock_perms_drifted(ch, guild):
                 try:
-                    await ch.edit(overwrites=self._lock_overwrites(guild),
+                    await ch.edit(overwrites=ow,
                                   reason="salon jellyfin-logs : propriétaire uniquement")
                 except discord.HTTPException:
                     log.exception("application des permissions de jellyfin-logs")
@@ -503,30 +568,61 @@ class Provision(commands.Cog):
         return ch
 
     async def _ensure_text(self, guild, name, category, key_store, key, topic=None,
-                           global_fallback=True):
+                           global_fallback=True, overwrites=None):
         """Adopte (id persisté -> nom dans la catégorie) ou crée un salon texte.
 
         global_fallback=False : n'adopte PAS un salon homonyme d'une autre catégorie
-        (utilisé pour les salons de guests, dont le nom peut être générique)."""
+        (utilisé pour les salons de guests, dont le nom peut être générique).
+
+        `overwrites` : posé DÈS la création (salons privés). Renvoie None si la création
+        a échoué — les appelants qui se servent du salon doivent le tester."""
         cid = key_store.get(key)
         ch = guild.get_channel(cid) if cid else None
         if isinstance(ch, discord.TextChannel):
             if category and ch.category_id != category.id:
                 try:
-                    await ch.edit(category=category, reason="auto-provision: rangement")
+                    # sync_permissions : un salon d'invité MIGRÉ d'un serveur à l'autre
+                    # gardait sinon les overwrites EXPLICITES de son ancienne catégorie
+                    # jusqu'au prochain _enforce_perms — donc visible des rôles de
+                    # l'ancien nœud, invisible de ceux du nouveau (corrigé 2026-08-11).
+                    await ch.edit(category=category, sync_permissions=True,
+                                  reason="auto-provision: rangement")
                 except discord.HTTPException:
-                    pass
+                    log.warning("salon #%s : rangement dans « %s » impossible",
+                                getattr(ch, "name", "?"), getattr(category, "name", "?"))
             return ch
         # match par nom dans la catégorie cible (adoption d'un salon créé à la main)
         ch = None
         if category:
             ch = discord.utils.get(category.text_channels, name=name)
+            if ch is None:
+                # RÉ-adoption d'un salon que le bot a lui-même déjà renommé « 🟢-<nom> »
+                # (CtChannels y colle l'emoji de statut) : sans ça, un state.json perdu
+                # faisait recréer un salon EN DOUBLE pour chaque invité (2026-08-11).
+                # Volontairement limité à la catégorie cible : sur le repli GLOBAL, des
+                # noms génériques (« nas », « services ») adopteraient un salon d'invité.
+                ch = next((c for c in category.text_channels
+                           if fmt.strip_status_emoji(c.name) == name), None)
         if ch is None and global_fallback:
             ch = discord.utils.get(guild.text_channels, name=name)
         if ch is None:
-            ch = await guild.create_text_channel(
-                name=name, category=category, topic=topic,
-                reason="auto-provision bot")
+            if category is not None and len(category.channels) >= 50:
+                # limite Discord : 50 salons par catégorie. Sans ce garde-fou, l'échec
+                # remontait en HTTPException opaque à chaque cycle (2026-08-11).
+                log.error("catégorie « %s » pleine (50 salons) — salon #%s NON créé ; "
+                          "déplacer des salons ou scinder la catégorie",
+                          category.name, name)
+                return None
+            try:
+                kw = {"overwrites": overwrites} if overwrites is not None else {}
+                ch = await guild.create_text_channel(
+                    name=name, category=category, topic=topic,
+                    reason="auto-provision bot", **kw)
+            except discord.HTTPException:
+                # ne PAS laisser remonter : l'appelant est au milieu d'un cycle de
+                # provisioning dont la fin (_rewire/_save) doit avoir lieu quand même.
+                log.exception("création du salon #%s impossible", name)
+                return None
             log.info("salon créé: #%s", name)
         key_store[key] = ch.id
         return ch
@@ -545,33 +641,74 @@ class Provision(commands.Cog):
             return
 
         async with self._lock:
-            # 1) Catégorie + salons de supervision
-            sup_cat = await self._ensure_category(guild, self.CAT_SUPERVISION, "supervision")
-            for key, cname, topic in SUPER_CHANNELS:
-                await self._ensure_text(guild, cname, sup_cat, self.prov["super"], key, topic)
-            # accès : @everyone rien, rôle A vision, rôle Gestion boutons (tous les salons)
-            await self._enforce_perms(guild, sup_cat, self._managed_overwrites)
+            cont_cat = None
+            try:
+                # 1) Catégorie + salons de supervision
+                #    Overwrites posés dès la CRÉATION : une catégorie créée nue est
+                #    publique, et ses salons héritent de cette visibilité jusqu'au
+                #    passage de _enforce_perms — voire pour toujours si les rôles ne se
+                #    résolvent pas (2026-08-11).
+                sup_want = self._managed_overwrites(guild)
+                sup_cat = await self._ensure_category(
+                    guild, self.CAT_SUPERVISION, "supervision",
+                    overwrites=sup_want or self._private_seed_overwrites(guild))
+                for key, cname, topic in SUPER_CHANNELS:
+                    await self._ensure_text(guild, cname, sup_cat, self.prov["super"],
+                                            key, topic)
+                # accès : @everyone rien, rôle A vision, rôle Gestion boutons (tous les salons)
+                await self._enforce_perms(guild, sup_cat, self._managed_overwrites)
 
-            # 1b) ressources PARTAGÉES (#général, #logs-2fa) : primaire uniquement — une
-            #     instance secondaire n'y touche pas (elles sont communes à tout le guild).
-            if self.is_primary:
-                await self._ensure_general_perms(guild)
-                await self._ensure_twofa_channel(guild)
+                # 1b) ressources PARTAGÉES (#général, #logs-2fa) : primaire uniquement — une
+                #     instance secondaire n'y touche pas (elles sont communes à tout le guild).
+                if self.is_primary:
+                    await self._ensure_general_perms(guild)
+                    await self._ensure_twofa_channel(guild)
 
-            # 2) Catégorie conteneurs : réutiliser celle des salons CT existants si possible
-            cont_cat = await self._resolve_containers_category(guild)
+                # 2) Catégorie conteneurs : réutiliser celle des salons CT existants si possible
+                cont_cat = await self._resolve_containers_category(guild)
+            except Exception:
+                # étape isolée (2026-08-11) : un échec ici ne doit pas emporter la
+                # réconciliation des salons d'invités NI le recâblage final.
+                log.exception("provisioning de la supervision %s",
+                              getattr(self.cfg, "server_key", "R820"))
+
             # 2b) serveurs Aveyron : Supervision + Gestion PAR NŒUD (AVY-PVE/NAS/LLM)
             avy_cats = {}          # clé serveur -> catégorie Gestion
             if getattr(self.bot.pve, "avy_enabled", False):
-                for node in self.bot.pve.avy_nodes():
+                # acall : sans AVY_NODES statique, avy_nodes() part interroger l'API du
+                # cluster distant — un appel proxmoxer SYNCHRONE qui bloquerait toute la
+                # boucle asyncio le temps du timeout WireGuard (2026-08-11).
+                try:
+                    avy_nodes = await self.bot.pve.acall(self.bot.pve.avy_nodes)
+                except Exception:
+                    log.exception("liste des nœuds Aveyron illisible ce cycle")
+                    avy_nodes = []
+                for node in avy_nodes:
                     key = self.bot.pve.avy_server_key(node)
+                    # Même garde que _syno_enabled : sans les rôles G/M/O de la clé dans
+                    # GESTION_SERVERS, _srv_overwrites_fn refuse de poser les overwrites
+                    # et on créerait « 📊 Supervision / Gestion / 🔒 Lock AVY-X » +
+                    # #hyperviseur-x PUBLICS, à vie (2026-08-11). Ne rien créer du tout
+                    # est le seul comportement fail-closed. Déclencheur non théorique :
+                    # avy_nodes() découvre dynamiquement les nœuds en ligne.
+                    if key not in (getattr(self.cfg, "gestion_servers", {}) or {}):
+                        log.warning("serveur %s absent de GESTION_SERVERS — salons NON "
+                                    "créés (déclarer « %s:G:M:O » pour l'activer)",
+                                    key, key)
+                        continue
                     try:
+                        ow_fn = self._srv_overwrites_fn(key)
+                        lock_fn = self._lock_overwrites_fn(key)
+                        seed = self._private_seed_overwrites(guild)
                         sup = await self._ensure_category(
-                            guild, f"📊 Supervision {key}", f"avy_sup_{node}")
+                            guild, f"📊 Supervision {key}", f"avy_sup_{node}",
+                            overwrites=ow_fn(guild) or seed)
                         gest = await self._ensure_category(
-                            guild, f"Gestion {key}", f"avy_gest_{node}")
+                            guild, f"Gestion {key}", f"avy_gest_{node}",
+                            overwrites=ow_fn(guild) or seed)
                         lock = await self._ensure_category(
-                            guild, f"🔒 Lock {key}", f"avy_lock_{node}")
+                            guild, f"🔒 Lock {key}", f"avy_lock_{node}",
+                            overwrites=lock_fn(guild) or seed)
                         await self._ensure_avy_sup_channels(guild, node, sup)
                         await self._ensure_avy_lock_hyperviseur(guild, node, lock)
                         # salon dédié au stack IA locale (GPU/services/santé) — UN SEUL
@@ -584,10 +721,9 @@ class Provision(commands.Cog):
                                 topic="Assistant IA local : GPU, modèle, services, santé.",
                                 global_fallback=False)
                         avy_cats[key] = gest
-                        ow_fn = self._srv_overwrites_fn(key)
                         await self._enforce_perms(guild, sup, ow_fn)
                         await self._enforce_perms(guild, gest, ow_fn)
-                        await self._enforce_perms(guild, lock, self._lock_overwrites_fn(key))
+                        await self._enforce_perms(guild, lock, lock_fn)
                     except Exception:
                         log.exception("provisioning serveur %s", key)
 
@@ -600,8 +736,13 @@ class Provision(commands.Cog):
                     log.exception("provisioning serveur %s", self.syno_key)
 
             # 3) Réconciliation des salons par guest
-            await self._reconcile_containers(guild, cont_cat, avy_cats)
-            await self._enforce_perms(guild, cont_cat, self._managed_overwrites)
+            #    Isolée elle aussi : c'est ici que se créent les salons, donc c'est ici
+            #    que peut lever la limite Discord des 50 salons par catégorie.
+            try:
+                await self._reconcile_containers(guild, cont_cat, avy_cats)
+                await self._enforce_perms(guild, cont_cat, self._managed_overwrites)
+            except Exception:
+                log.exception("réconciliation des salons d'invités")
 
             # 4) Catégorie « 🔒 Lock » + salon de l'hyperviseur (propriétaire uniquement).
             #    Isolé du reste : un échec ici (permissions Discord) ne doit pas empêcher
@@ -624,9 +765,21 @@ class Provision(commands.Cog):
                 except Exception:
                     log.exception("provisioning du salon de chat IA")
 
-            # 5) Recâblage du routage temps réel vers les salons résolus
-            self._rewire()
-            self._save()
+            # 5) Recâblage du routage temps réel vers les salons résolus.
+            #    ⚠️ Hors de tout `try` d'étape, et TOUJOURS exécuté : c'est _rewire() qui
+            #    DÉMARRE les boucles CtChannels.refresh / NodeChannel.refresh /
+            #    JellyfinActivity.poll. Une exception d'étape le sautait, et au premier
+            #    cycle ces boucles ne démarraient jamais (2026-08-11). Il s'exécute donc
+            #    sur un état éventuellement PARTIEL — acceptable : il ne fait que publier
+            #    des ids déjà résolus.
+            try:
+                self._rewire()
+            except Exception:
+                log.exception("recâblage du routage temps réel")
+            try:
+                self._save()
+            except Exception:
+                log.exception("persistance de l'état de provisioning")
 
     def _assistant_chat_overwrites(self, guild):
         """@everyone deny ; SEUL le rôle O AVY-LLM (+ le bot) voit/écrit ce salon —
@@ -649,21 +802,39 @@ class Provision(commands.Cog):
         return ow
 
     async def _ensure_assistant_chat(self, guild):
-        cat = await self._ensure_category(guild, "🤖 Assistant IA", "assistant_ia")
+        """⚠️ FAIL-CLOSED (2026-08-11) : rien n'est créé tant que le rôle O AVY-LLM ne
+        se résout pas. Avant, la catégorie et #chat-ia naissaient PUBLICS (créés sans
+        overwrites) et n'étaient JAMAIS refermés dans ce cas — aucun `_enforce_perms` ne
+        balaie ce salon — pendant que `_rewire` publiait quand même son id, rendant
+        `Assistant.on_message` actif dans un salon ouvert à tout le guild."""
+        want = self._assistant_chat_overwrites(guild)
+        if want is None:
+            self._assistant_chat_ok = False
+            log.error("rôle O AVY-LLM non résolu — #chat-ia NON provisionné "
+                      "(déclarer « AVY-LLM:G:M:O » dans GESTION_SERVERS)")
+            return
+        cat = await self._ensure_category(guild, "🤖 Assistant IA", "assistant_ia",
+                                          overwrites=want)
         ch = await self._ensure_text(
             guild, "chat-ia", cat, self.prov, "assistant_chat",
             topic="Discute directement avec l'assistant IA locale — pas besoin de "
                   "/assistant, écris simplement ton message.",
-            global_fallback=False)
-        want = self._assistant_chat_overwrites(guild)
-        if want is not None:
-            for target in (cat, ch):
-                if self._ovw_drifted(target, want):
-                    try:
-                        await target.edit(overwrites=want, reason="salon assistant IA : O AVY-LLM uniquement")
-                    except discord.HTTPException:
-                        log.warning("permissions #chat-ia non appliquées: %s",
-                                   getattr(target, "name", "?"))
+            global_fallback=False, overwrites=want)
+        if ch is None:
+            self._assistant_chat_ok = False
+            return
+        ok = True
+        for target in (cat, ch):
+            if self._ovw_drifted(target, want):
+                try:
+                    await target.edit(overwrites=want, reason="salon assistant IA : O AVY-LLM uniquement")
+                except discord.HTTPException:
+                    log.warning("permissions #chat-ia non appliquées: %s",
+                               getattr(target, "name", "?"))
+                    ok = False
+        # tant que les droits ne sont pas RÉELLEMENT posés, le salon n'est pas publié
+        # au listener de l'assistant (cf. _rewire).
+        self._assistant_chat_ok = ok
 
     async def _resolve_containers_category(self, guild):
         # a) catégorie persistée
@@ -678,8 +849,14 @@ class Provision(commands.Cog):
             if isinstance(ch, discord.TextChannel) and ch.category is not None:
                 self.prov["categories"]["containers"] = ch.category.id
                 return ch.category
-        # c) sinon créer une catégorie dédiée
-        return await self._ensure_category(guild, self.CAT_CONTAINERS, "containers")
+        # c) sinon créer une catégorie dédiée — overwrites dès la création (2026-08-11) :
+        #    créée nue, elle est publique et les salons d'invités qu'on y range en
+        #    héritent le temps que _enforce_perms passe (voire toujours si les rôles
+        #    M/O ne se résolvent pas).
+        return await self._ensure_category(
+            guild, self.CAT_CONTAINERS, "containers",
+            overwrites=(self._managed_overwrites(guild)
+                        or self._private_seed_overwrites(guild)))
 
     async def _ensure_avy_sup_channels(self, guild, node, sup_cat):
         """Salons de supervision d'un nœud Aveyron (alertes/hyperviseur/stockage/
@@ -695,7 +872,10 @@ class Provision(commands.Cog):
                 try:
                     await ch.edit(name=wanted, reason="supervision Aveyron: nom suffixé par nœud")
                 except discord.HTTPException:
-                    pass
+                    # Discord limite à 2 renommages / 10 min / salon : re-tenté au cycle
+                    # suivant. Journalisé quand même, sinon un refus permanent (403) est
+                    # invisible en exploitation.
+                    log.warning("salon #%s : renommage en « %s » refusé", ch.name, wanted)
 
     async def _ensure_avy_lock_hyperviseur(self, guild, node, lock_cat):
         """Salon #hyperviseur-<nœud> Aveyron, rangé dans SA catégorie « 🔒 Lock <clé> »
@@ -715,7 +895,7 @@ class Provision(commands.Cog):
             try:
                 await ch.edit(name=wanted, reason="hyperviseur Aveyron: nom suffixé par nœud")
             except discord.HTTPException:
-                pass
+                log.warning("salon #%s : renommage en « %s » refusé", ch.name, wanted)
         return ch
 
     def _syno_enabled(self):
@@ -735,8 +915,15 @@ class Provision(commands.Cog):
         mélangeraient visuellement avec les salons homonymes des autres serveurs
         (même reproche que Nico avait fait pour les quatre #alertes d'Aveyron)."""
         store = self.prov.setdefault("syno", {})
-        sup = await self._ensure_category(guild, self.CAT_SYNO_SUP, "syno_sup")
-        lock = await self._ensure_category(guild, self.CAT_SYNO_LOCK, "syno_lock")
+        # overwrites dès la création (2026-08-11) : une catégorie créée nue est publique
+        # et ses salons héritent de cette visibilité (fiche NAS = n° de série, SMART).
+        srv_fn = self._srv_overwrites_fn(self.syno_key)
+        lock_fn = self._lock_overwrites_fn(self.syno_key)
+        seed = self._private_seed_overwrites(guild)
+        sup = await self._ensure_category(guild, self.CAT_SYNO_SUP, "syno_sup",
+                                          overwrites=srv_fn(guild) or seed)
+        lock = await self._ensure_category(guild, self.CAT_SYNO_LOCK, "syno_lock",
+                                           overwrites=lock_fn(guild) or seed)
         for key, cname, topic in SYNO_SUP_CHANNELS:
             wanted = f"{cname}-nas"
             ch = await self._ensure_text(guild, wanted, sup, store, key, topic,
@@ -745,13 +932,13 @@ class Provision(commands.Cog):
                 try:
                     await ch.edit(name=wanted, reason="supervision NAS : nom suffixé")
                 except discord.HTTPException:
-                    pass
+                    log.warning("salon #%s : renommage en « %s » refusé", ch.name, wanted)
         await self._ensure_text(
             guild, "synology", lock, store, "fiche",
             topic="NAS Synology — fiche détaillée (série, DSM, SMART). M/O uniquement.",
             global_fallback=False)
-        await self._enforce_perms(guild, sup, self._srv_overwrites_fn(self.syno_key))
-        await self._enforce_perms(guild, lock, self._lock_overwrites_fn(self.syno_key))
+        await self._enforce_perms(guild, sup, srv_fn)
+        await self._enforce_perms(guild, lock, lock_fn)
 
     def _srv_overwrites_fn(self, key):
         """want_fn des catégories d'un serveur Aveyron : même schéma 3 tiers que
@@ -800,6 +987,11 @@ class Provision(commands.Cog):
         automatique, retiré à la demande de Nico 2026-07-18 : un salon ne doit pas
         bouger juste parce que la VM/le conteneur est éteint ou temporairement
         injoignable)."""
+        if cont_cat is None:
+            log.warning("catégorie « %s » non résolue — réconciliation reportée "
+                        "(ne PAS créer les salons d'invités hors catégorie)",
+                        self.CAT_CONTAINERS)
+            return
         # seed initial du mapping name->channel depuis la config (adoption)
         if not self.prov["ct"] and self.cfg.ct_channels:
             self.prov["ct"] = dict(self.cfg.ct_channels)
@@ -808,15 +1000,29 @@ class Provision(commands.Cog):
         if guests is None:
             log.info("PVE indisponible — salons CT conservés tels quels, pas de réconciliation")
             return
+        self._purge_ghosts(guests)
 
         def _gcat(name):
             key = guests[name][1]
-            return (avy_cats or {}).get(key) or cont_cat
+            if key is not None:
+                # Serveur Aveyron dont la catégorie « Gestion <clé> » n'a PAS été
+                # provisionnée ce cycle (clé absente de GESTION_SERVERS -> `continue` de
+                # l'étape 2b, ou étape 2b en échec). NE PAS se rabattre sur `cont_cat` :
+                # ce serait remettre exactement le bug que _guests() documente — des
+                # salons « -avy » atterrissant dans « Gestion R820 », donc visibles et
+                # actionnables par les rôles du R820. Renvoyer None = « on ne conclut
+                # rien ce cycle », le salon reste où il est (2026-08-11).
+                return (avy_cats or {}).get(key)
+            return cont_cat
 
         # a) guests présents -> création (ou recalage de catégorie) ; les guests qui ne
         #    sont plus dans `guests` sont simplement ignorés ici, leur salon ne bouge pas
         for name in guests:
             cat = _gcat(name)
+            if cat is None:
+                log.debug("invité %s : catégorie de son serveur non provisionnée — "
+                          "salon inchangé ce cycle", name)
+                continue
             if name in self.prov["ct"]:
                 await self._ensure_text(guild, _slug(name), cat,
                                         self.prov["ct"], name,
@@ -828,9 +1034,10 @@ class Provision(commands.Cog):
                 ch = guild.get_channel(cid)
                 if isinstance(ch, discord.TextChannel):
                     try:
-                        await ch.edit(category=cat, reason=f"guest {name} recréé")
+                        await ch.edit(category=cat, sync_permissions=True,
+                                      reason=f"guest {name} recréé")
                     except discord.HTTPException:
-                        pass
+                        log.warning("salon #%s : sortie d'Archive impossible", ch.name)
                     self.prov["ct"][name] = cid
                     continue
             await self._ensure_text(guild, _slug(name), cat,
@@ -846,24 +1053,81 @@ class Provision(commands.Cog):
                 groups.setdefault(guests[n][1], []).append(n)
         prim = sorted(groups.get(None, []), key=lambda n: guests[n][0])
         if prim != self.prov.get("order"):
-            await self._apply_order(guild, prim, cont_cat)
-            self.prov["order"] = prim
+            # l'ordre n'est mémorisé QUE s'il a réellement été appliqué (2026-08-11) :
+            # sinon un seul move() en échec figeait le tri pour de bon, la comparaison
+            # `prim == prov["order"]` court-circuitant toutes les tentatives suivantes.
+            if await self._apply_order(guild, prim, cont_cat):
+                self.prov["order"] = prim
         for key, cat in (avy_cats or {}).items():
             lst = sorted(groups.get(key, []), key=lambda n: guests[n][0])
             if lst != self.prov.get(f"order_{key}"):
-                await self._apply_order(guild, lst, cat)
-                self.prov[f"order_{key}"] = lst
+                if await self._apply_order(guild, lst, cat):
+                    self.prov[f"order_{key}"] = lst
+
+    def _purge_ghosts(self, guests):
+        """Retire de prov['ct'] les invités DISPARUS de PVE (supprimés ou renommés).
+
+        Sans ça (depuis le retrait de l'archivage automatique 2026-07-18), `_rewire`
+        réinjecte l'entrée fantôme dans `CtChannels.map` à chaque cycle : le salon est
+        renommé « 🔴-<ancien-nom> » puis re-sondé à vie (3-4 requêtes Flux / 2 min, ou un
+        fetch_channel en 404 si le salon a été supprimé à la main), et le `map.pop()`
+        défensif de ct_channels ne survit jamais au cycle suivant. Corrigé 2026-08-11.
+
+        Le salon Discord n'est PAS supprimé (choix de Nico) : il cesse simplement d'être
+        suivi. S'il réapparaît côté PVE, `_ensure_text` le ré-adopte par son nom
+        débarrassé de l'emoji de statut.
+
+        ⚠️ DEUX garde-fous, parce qu'une absence n'est pas une disparition :
+          - hystérésis de 3 cycles : une réponse PVE partielle ne purge rien ;
+          - les invités « -avy » sont épargnés tant qu'AUCUN invité Aveyron n'est vu —
+            `Pve._avy_resources()` renvoie [] sur coupure WireGuard prolongée, ce qui
+            ferait sinon décrocher d'un coup TOUS les salons d'Aveyron.
+        """
+        misses = self.prov.setdefault("ct_missing", {})
+        avy_seen = any(key is not None for _, key in guests.values())
+        for name in list(self.prov["ct"]):
+            if name in guests:
+                misses.pop(name, None)
+                continue
+            if self.bot.pve.is_avy_name(name) and not avy_seen:
+                continue           # Aveyron injoignable : on ne conclut rien
+            n = misses.get(name, 0) + 1
+            if n < 3:
+                misses[name] = n
+                continue
+            misses.pop(name, None)
+            cid = self.prov["ct"].pop(name, None)
+            log.info("invité %s absent de PVE depuis 3 cycles — salon %s détaché du "
+                     "suivi (salon CONSERVÉ, non supprimé)", name, cid)
+        # entrées de compteur devenues sans objet (invité déjà purgé/renommé)
+        for name in [n for n in misses if n not in self.prov["ct"]]:
+            misses.pop(name, None)
 
     async def _apply_order(self, guild, order, cont_cat):
+        """Trie les salons d'une catégorie par VMID. Renvoie True si TOUS les
+        déplacements ont réussi — l'appelant ne mémorise l'ordre que dans ce cas."""
+        ok = True
         # move() gère les positions INTRA-catégorie (edit(position=) est global au guild)
         for i, name in enumerate(order):
             ch = guild.get_channel(self.prov["ct"][name])
             if isinstance(ch, discord.TextChannel):
                 try:
+                    # sync_permissions UNIQUEMENT si le salon change réellement de
+                    # catégorie : dans ce cas il doit hériter des overwrites de la
+                    # nouvelle (sinon fuite de visibilité jusqu'au prochain
+                    # _enforce_perms). Le poser sur TOUS les salons du tri écraserait à
+                    # chaque réordonnancement leurs overwrites par ceux — potentiellement
+                    # vides — du CACHE de la catégorie ; quand _managed_overwrites renvoie
+                    # None (rôles M/O non résolus), _enforce_perms ne repasse pas derrière
+                    # et le salon resterait ouvert. (2026-08-11)
+                    moving = ch.category_id != getattr(cont_cat, "id", None)
                     await ch.move(category=cont_cat, beginning=True, offset=i,
-                                  reason="tri par VMID")
+                                  sync_permissions=moving, reason="tri par VMID")
                 except discord.HTTPException:
-                    pass
+                    log.warning("tri : salon #%s non déplacé dans « %s »",
+                                ch.name, getattr(cont_cat, "name", "?"))
+                    ok = False
+        return ok
 
     async def _guests(self):
         """{name: (vmid, clé serveur)} pour tous les LXC/VM, ou None si PVE indisponible.
@@ -871,7 +1135,8 @@ class Provision(commands.Cog):
         if not self.bot.pve.enabled:
             return None
         try:
-            res = await asyncio.to_thread(self.bot.pve.resources)
+            # enveloppe async obligatoire : proxmoxer est SYNCHRONE (2026-08-11)
+            res = await self.bot.pve.aresources()
         except Exception:
             log.exception("lecture des ressources PVE échouée")
             return None
@@ -898,8 +1163,12 @@ class Provision(commands.Cog):
     # ------------------------------------------------------------------ rewiring
 
     def _rewire(self):
-        if self.prov.get("assistant_chat"):
-            self.cfg.assistant_chat_channel_id = self.prov["assistant_chat"]
+        # #chat-ia n'est publié que si ses overwrites « O AVY-LLM » ont pu être posés
+        # (2026-08-11) : sinon Assistant.on_message répondrait à tout le monde dans un
+        # salon resté public. 0 = listener inerte, il rendra la main au cycle suivant.
+        self.cfg.assistant_chat_channel_id = (
+            self.prov["assistant_chat"]
+            if (self.prov.get("assistant_chat") and self._assistant_chat_ok) else 0)
         s = self.prov["super"]
         if s.get("alertes"):
             self.cfg.alert_channel_id = s["alertes"]
@@ -950,7 +1219,14 @@ class Provision(commands.Cog):
         if ch is None:
             try:
                 ch = await self.bot.fetch_channel(channel_id)
-            except Exception:
+            except discord.NotFound:
+                # salon supprimé à la main : le signaler, sinon l'embed disparaît en
+                # silence et personne ne comprend pourquoi (2026-08-11).
+                log.warning("salon %s introuvable — embed épinglé non rafraîchi", channel_id)
+                return
+            except Exception:  # noqa: BLE001
+                log.warning("salon %s injoignable ce cycle — embed non rafraîchi",
+                            channel_id)
                 return
         pins = self.prov.setdefault("pins", {})
         mid = pins.get(str(channel_id))
@@ -961,6 +1237,8 @@ class Provision(commands.Cog):
             except discord.NotFound:
                 msg = None
             except discord.HTTPException:
+                log.warning("message épinglé %s de #%s illisible ce cycle",
+                            mid, getattr(ch, "name", "?"))
                 return
         view = TopicalRefreshView(self)
         ok = False
@@ -970,7 +1248,8 @@ class Provision(commands.Cog):
                 try:
                     await msg.pin()
                 except discord.HTTPException:
-                    pass
+                    log.warning("#%s : épinglage impossible (50 messages épinglés ?)",
+                                getattr(ch, "name", "?"))
                 pins[str(channel_id)] = msg.id
                 self._save()
                 ok = True
@@ -978,7 +1257,8 @@ class Provision(commands.Cog):
                 await msg.edit(embed=embed, view=view)
                 ok = True
         except discord.HTTPException:
-            pass
+            log.warning("#%s : embed épinglé non écrit (permissions ? embed trop long ?)",
+                        getattr(ch, "name", "?"))
         # baselines de delta avancées seulement après une écriture confirmée (#21)
         if ok and pending:
             for k, v in pending.items():
@@ -1037,8 +1317,8 @@ class Provision(commands.Cog):
         if health:
             bad = [d for d, h in health if not bool(h)]
             emb.add_field(name="SMART",
-                          value=f"{len(health) - len(bad)}/{len(health)} sains"
-                                + (f" · ❌ {bad}" if bad else " ✅"))
+                          value=(f"{len(health) - len(bad)}/{len(health)} sains"
+                                 + (f" · ❌ {bad}" if bad else " ✅"))[:1024])
             if bad:
                 emb.color = fmt.RED
         emb.set_footer(text="rafraîchi")
@@ -1247,12 +1527,15 @@ class Provision(commands.Cog):
         emb.set_footer(text="rafraîchi")
         return emb, pending
 
-    async def _emb_nas(self):
-        """NAS Synology DS216se : capacité (via l'API PVE) + santé SNMP (si activé)."""
+    async def _emb_nas(self, h=None):
+        """NAS Synology DS216se : capacité (via l'API PVE) + santé SNMP (si activé).
+
+        `h` = relevé nas_health() déjà en main (refresh_topical le partage entre les
+        5 embeds du cycle) ; None = on le récupère nous-mêmes (bouton Rafraîchir)."""
         pending = {}
         inf = self.bot.influx
         cap = await inf.nas_capacity()
-        h = await inf.nas_health()
+        h = await self._nas_health(h)
         sysd = (h or {}).get("system") or {}
         color = fmt.GREEN
         emb = discord.Embed(title="🗄️ NAS Synology — DS216se", color=color)
@@ -1274,32 +1557,33 @@ class Provision(commands.Cog):
             emb.add_field(name="Capacité", value="— (collecteur muet ?)", inline=False)
         # --- santé (SNMP) ---
         if sysd:
-            t = sysd.get("system_temp_c")
-            st = int(float(sysd.get("system_status", 0) or 0))
-            fan = int(float(sysd.get("system_fan_status", 0) or 0))
+            # _syno_i partout (2026-08-11) : ces conversions étaient les SEULES du cog à
+            # ne pas passer par le helper — un champ SNMP textuel levait un ValueError
+            # qui, avant l'isolation par salon de refresh_topical, emportait aussi
+            # #reseau et #services.
+            t = self._syno_i(sysd, "system_temp_c")
+            st = self._syno_i(sysd, "system_status")
+            fan = self._syno_i(sysd, "system_fan_status")
             emb.add_field(name="Système",
                           value=f"{'🟢' if st == 1 else '🔴'} état · {t}°C · "
                                 f"ventilo {'🟢' if fan == 1 else '🔴'}")
             dlines = []
-            for d in (h.get("disks") or []):
-                ds = int(float(d.get("status", 0) or 0))
+            for d in ((h or {}).get("disks") or []):
+                ds = self._syno_i(d, "status")
                 dlines.append(f"{'🟢' if ds == 1 else '🔴'} {d.get('disk_id', '?')} — {d.get('temp_c', '?')}°C")
                 if ds != 1:
                     color = fmt.RED
             if dlines:
-                emb.add_field(name="Disques", value="\n".join(dlines), inline=False)
+                emb.add_field(name="Disques", value="\n".join(dlines)[:1024], inline=False)
             bad = 0
-            for r in (h.get("smart") or []):
-                try:
-                    bad += int(float(r.get("raw", 0) or 0))
-                except (TypeError, ValueError):
-                    pass
+            for r in ((h or {}).get("smart") or []):
+                bad += self._syno_i(r, "raw")
             if bad:
                 emb.add_field(name="⚠️ Secteurs défectueux (SMART)",
                               value=f"**{bad}** — `sda` à surveiller / remplacer", inline=False)
                 color = fmt.RED
-            for rd in (h.get("raid") or []):
-                rs = int(float(rd.get("status", 0) or 0))
+            for rd in ((h or {}).get("raid") or []):
+                rs = self._syno_i(rd, "status")
                 emb.add_field(name="RAID",
                               value=f"{'🟢 Normal' if rs == 1 else ('🟠 Dégradé' if rs == 11 else '🔴 Critique')}"
                                     f" ({rd.get('raid_name', '?')})")
@@ -1319,6 +1603,16 @@ class Provision(commands.Cog):
     # Toutes les valeurs viennent des mesures synology* d'InfluxDB, alimentées par
     # l'input SNMP de Telegraf sur l'hyperviseur. Le bot ne parle jamais au NAS
     # directement, et n'a aucun moyen d'agir dessus : supervision en lecture seule.
+    async def _nas_health(self, h=None):
+        """Relevé SNMP du NAS, mutualisé sur un cycle (2026-08-11).
+
+        `influx.nas_health()` enchaîne 4 requêtes Flux et n'a AUCUN cache ; les
+        5 embeds du NAS (#nas + les 4 salons SYNO) l'appelaient chacun le leur, soit
+        20 requêtes identiques par cycle de 2 min. `refresh_topical` en fait UN et le
+        passe aux builders — ça borne aussi la cohérence : les 5 embeds d'un même cycle
+        décrivent le même instantané."""
+        return h if h is not None else await self.bot.influx.nas_health()
+
     @staticmethod
     def _syno_i(d, key, default=0):
         """Champ SNMP -> entier (Influx renvoie des flottants, parfois des chaînes)."""
@@ -1340,8 +1634,8 @@ class Provision(commands.Cog):
         emb.timestamp = discord.utils.utcnow()
         return emb, {}
 
-    async def _emb_syno_sante(self):
-        h = await self.bot.influx.nas_health()
+    async def _emb_syno_sante(self, h=None):
+        h = await self._nas_health(h)
         sysd = (h or {}).get("system") or {}
         if not sysd:
             return self._syno_muet()
@@ -1388,8 +1682,8 @@ class Provision(commands.Cog):
         emb.set_footer(text=f"{sysd.get('dsm_version') or 'DSM ?'} · SNMP · lecture seule")
         return emb, {}
 
-    async def _emb_syno_disques(self):
-        h = await self.bot.influx.nas_health()
+    async def _emb_syno_disques(self, h=None):
+        h = await self._nas_health(h)
         disks = (h or {}).get("disks") or []
         if not disks:
             return self._syno_muet()
@@ -1428,8 +1722,8 @@ class Provision(commands.Cog):
                             "c'est sa progression qui compte")
         return emb, {}
 
-    async def _emb_syno_volumes(self):
-        h = await self.bot.influx.nas_health()
+    async def _emb_syno_volumes(self, h=None):
+        h = await self._nas_health(h)
         raids = (h or {}).get("raid") or []
         if not raids:
             return self._syno_muet()
@@ -1468,9 +1762,9 @@ class Provision(commands.Cog):
                             "« Volume » = l'espace utilisable dessus")
         return emb, {}
 
-    async def _emb_syno_fiche(self):
+    async def _emb_syno_fiche(self, h=None):
         """Fiche détaillée, catégorie Lock : identité de la machine + SMART complet."""
-        h = await self.bot.influx.nas_health()
+        h = await self._nas_health(h)
         sysd = (h or {}).get("system") or {}
         if not sysd:
             return self._syno_muet()
@@ -1557,7 +1851,9 @@ class Provision(commands.Cog):
             if downs:
                 val += "\n🔴 DOWN : " + ", ".join(d for d in downs if d)
                 color = fmt.RED
-            emb.add_field(name="🔗 Services publics (HTTPS)", value=val, inline=False)
+            # 1024 = limite Discord d'un champ d'embed : sans la coupe, une panne
+            # généralisée (tous les vhosts DOWN) faisait rejeter l'embed entier.
+            emb.add_field(name="🔗 Services publics (HTTPS)", value=val[:1024], inline=False)
         emb.color = color
         emb.set_footer(text="routeur SNMP · WAN ping/speedtest · uptime synthétique · rafraîchi")
         return emb, pending
@@ -1642,7 +1938,13 @@ class Provision(commands.Cog):
         cid = self.prov.get("super", {}).get("seedbox")
         if not cid:
             return
-        emb, pending = await self._emb_seedbox()
+        try:
+            emb, pending = await self._emb_seedbox()
+        except Exception:
+            # appelé depuis /setratio (cog Servarr) : une erreur d'embed ne doit pas
+            # faire échouer la commande de l'utilisateur (2026-08-11).
+            log.exception("rafraîchissement immédiat de #seedbox échoué")
+            return
         await self._pinned_edit(cid, emb, pending)
 
     @tasks.loop(minutes=2)
@@ -1650,67 +1952,81 @@ class Provision(commands.Cog):
         if not self.enabled or not self.bot.influx.enabled:
             return
         s = self.prov.get("super", {})
-        try:
-            if s.get("materiel"):
-                emb, pending = await self._emb_materiel()
-                await self._pinned_edit(s["materiel"], emb, pending)
-            if s.get("sauvegardes"):
-                emb, pending = await self._emb_sauvegardes()
-                await self._pinned_edit(s["sauvegardes"], emb, pending)
-            if s.get("stockage"):
-                emb, pending = await self._emb_stockage()
-                await self._pinned_edit(s["stockage"], emb, pending)
-            if s.get("seedbox"):
-                emb, pending = await self._emb_seedbox()
-                await self._pinned_edit(s["seedbox"], emb, pending)
-            if s.get("nas"):
-                emb, pending = await self._emb_nas()
-                await self._pinned_edit(s["nas"], emb, pending)
-            if s.get("reseau"):
-                emb, pending = await self._emb_reseau()
-                await self._pinned_edit(s["reseau"], emb, pending)
-            if s.get("services"):
-                emb, pending = await self._emb_services()
-                await self._pinned_edit(s["services"], emb, pending)
-        except Exception:
-            log.exception("rafraîchissement des salons thématiques échoué")
+        sy = self.prov.get("syno", {}) if self._syno_enabled() else {}
+        syno_todo = [(k, b) for k, b in (("sante", self._emb_syno_sante),
+                                         ("disques", self._emb_syno_disques),
+                                         ("volumes", self._emb_syno_volumes),
+                                         ("fiche", self._emb_syno_fiche))
+                     if sy.get(k)]
+        # UN SEUL relevé SNMP par cycle (2026-08-11) : nas_health() enchaîne 4 requêtes
+        # Flux sans aucun cache et il était appelé par les 5 embeds du NAS — 20 requêtes
+        # identiques toutes les 2 min. Bonus : les 5 embeds décrivent le même instantané.
+        nas_h = None
+        if s.get("nas") or syno_todo:
+            try:
+                nas_h = await self._nas_health()
+            except Exception:
+                log.exception("relevé SNMP du NAS illisible ce cycle")
+
+        # un try PAR salon (2026-08-11) : les 7 salons partageaient un seul try, donc la
+        # première exception sautait tous les suivants — #reseau et #services muets à
+        # cause d'une donnée SNMP du NAS. Le bloc SYNO ci-dessous faisait déjà l'inverse.
+        # Table construite ici (et pas au niveau classe) : ce sont des méthodes LIÉES.
+        for key, builder in (("materiel", self._emb_materiel),
+                             ("sauvegardes", self._emb_sauvegardes),
+                             ("stockage", self._emb_stockage),
+                             ("seedbox", self._emb_seedbox),
+                             ("nas", self._emb_nas),
+                             ("reseau", self._emb_reseau),
+                             ("services", self._emb_services)):
+            if not s.get(key):
+                continue
+            try:
+                emb, pending = (await builder(nas_h) if key == "nas"
+                                else await builder())
+                await self._pinned_edit(s[key], emb, pending)
+            except Exception:
+                log.exception("rafraîchissement du salon « %s » échoué", key)
 
         # Salons du serveur SYNO — dans leur propre try : le NAS ne doit pas pouvoir
         # empêcher le rafraîchissement des salons R820 ci-dessus (ni l'inverse).
-        if self._syno_enabled():
-            sy = self.prov.get("syno", {})
-            for key, builder in (("sante", self._emb_syno_sante),
-                                 ("disques", self._emb_syno_disques),
-                                 ("volumes", self._emb_syno_volumes),
-                                 ("fiche", self._emb_syno_fiche)):
-                if not sy.get(key):
-                    continue
-                try:
-                    emb, pending = await builder()
-                    await self._pinned_edit(sy[key], emb, pending)
-                except Exception:
-                    log.exception("rafraîchissement du salon NAS « %s » échoué", key)
+        for key, builder in syno_todo:
+            try:
+                emb, pending = await builder(nas_h)
+                await self._pinned_edit(sy[key], emb, pending)
+            except Exception:
+                log.exception("rafraîchissement du salon NAS « %s » échoué", key)
 
     @refresh_topical.before_loop
     async def _before_topical(self):
         await self.bot.wait_until_ready()
 
 
-class TopicalRefreshView(discord.ui.View):
-    """Bouton Rafraîchir pour les embeds épinglés (matériel/sauvegardes/stockage/seedbox).
-    Reconstruit le bon embed selon le salon où se trouve le message."""
+class TopicalRefreshView(GatedView):
+    """Bouton Rafraîchir des embeds épinglés (R820 : matériel/sauvegardes/stockage/
+    seedbox/nas/reseau/services — et NAS : sante/disques/volumes/fiche).
+    Reconstruit le bon embed selon le salon où se trouve le message.
+
+    Porte « mod » = rôle Gestion + session 2FA (pas le rôle A, qui voit sans agir),
+    BORNÉE PAR SERVEUR : dans les 4 salons du NAS, ce sont les rôles M/O SYNO qui
+    ouvrent le bouton, pas ceux du R820 (cf. resolve_server)."""
+
+    gate = "mod"
+
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(label="Rafraîchir", emoji="🔄",
-                       style=discord.ButtonStyle.primary, custom_id="prov:topical:refresh")
-    async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
-        if not await admin_button_ok(itx):     # rôle Gestion + session 2FA (pas le rôle A)
-            return
-        await itx.response.defer()
-        s = self.cog.prov.get("super", {})
-        builders = {
+    def _syno_ids(self):
+        return {cid for cid in (self.cog.prov.get("syno", {}) or {}).values() if cid}
+
+    def _builders(self):
+        """{id de salon: constructeur d'embed}. Les 4 salons du NAS y étaient ABSENTS
+        (2026-08-11) alors que `_pinned_edit` attache cette vue à TOUS les embeds
+        épinglés : le bouton y acquittait sans rien faire ni rien dire."""
+        s = self.cog.prov.get("super", {}) or {}
+        sy = self.cog.prov.get("syno", {}) or {}
+        out = {
             s.get("materiel"): self.cog._emb_materiel,
             s.get("sauvegardes"): self.cog._emb_sauvegardes,
             s.get("stockage"): self.cog._emb_stockage,
@@ -1718,14 +2034,43 @@ class TopicalRefreshView(discord.ui.View):
             s.get("nas"): self.cog._emb_nas,
             s.get("reseau"): self.cog._emb_reseau,
             s.get("services"): self.cog._emb_services,
+            sy.get("sante"): self.cog._emb_syno_sante,
+            sy.get("disques"): self.cog._emb_syno_disques,
+            sy.get("volumes"): self.cog._emb_syno_volumes,
+            sy.get("fiche"): self.cog._emb_syno_fiche,
         }
-        fn = builders.get(itx.channel_id)
+        out.pop(None, None)          # salon non provisionné -> clé None parasite
+        return out
+
+    async def resolve_server(self, interaction):
+        """Les salons du NAS sont gardés par les rôles M/O SYNO (ils sont provisionnés
+        avec _srv_overwrites_fn(syno_key)) ; ailleurs, tier R820 comme avant."""
+        if interaction.channel_id in self._syno_ids():
+            return self.cog.syno_key
+        return None
+
+    @discord.ui.button(label="Rafraîchir", emoji="🔄",
+                       style=discord.ButtonStyle.primary, custom_id="prov:topical:refresh")
+    async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
+        fn = self._builders().get(itx.channel_id)
         if fn is None:
+            # ne JAMAIS acquitter en silence : un clic sans réponse ressemble à une panne
+            await itx.response.send_message(
+                "Aucun embed rafraîchissable n'est rattaché à ce salon.", ephemeral=True)
             return
+        await itx.response.defer()
         try:
             emb, pending = await fn()
+        except Exception:
+            log.exception("bouton Rafraîchir : construction de l'embed échouée (salon %s)",
+                          itx.channel_id)
+            await itx.followup.send("❌ Rafraîchissement impossible — voir les logs.",
+                                    ephemeral=True)
+            return
+        try:
             await itx.message.edit(embed=emb, view=self)
         except discord.HTTPException:
+            log.warning("bouton Rafraîchir : édition du message %s refusée", itx.message.id)
             return
         # baselines de delta avancées seulement après une édition confirmée (#21)
         for k, v in (pending or {}).items():

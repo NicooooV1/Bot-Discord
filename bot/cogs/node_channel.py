@@ -2,16 +2,23 @@
 
 Même principe que les salons d'invités : un message épinglé, réécrit sur place toutes les
 `DASHBOARD_INTERVAL_MIN` minutes, avec des boutons persistants. Le salon vit dans la
-catégorie « 🔒 Lock » provisionnée par provision.py (propriétaire uniquement).
+catégorie « 🔒 Lock » provisionnée par provision.py, visible des tiers **M** et **O** du
+nœud et des `node_terminal_owner_ids` (cf. provision._lock_overwrites) — pas du seul
+propriétaire.
 
 Différences volontaires avec un salon d'invité :
   - PAS de Start/Stop/Reboot : on ne coupe pas la machine qui héberge tout le reste
     depuis un bouton Discord (demande explicite) ;
   - 💾 Sauvegarder = vzdump de TOUS les invités (le pendant nœud du bouton par invité) ;
   - 🖥️ Terminal = shell root SSH sur l'hôte (cf. core/nodeshell.py) ;
-  - les trois boutons sont réservés au PROPRIÉTAIRE (`node_terminal_owner_ids`) : un
-    membre « Administrateur » de Discord voit le salon malgré les overwrites, la porte
-    est donc ici et pas dans les permissions du salon.
+  - portes des boutons (règle du 2026-07-16, en-tête corrigée le 2026-08-11 : elle
+    annonçait « propriétaire uniquement » pour les trois, ce que le code n'a jamais
+    fait) : 🔄 et 💾 = tier **M** ou **O** du serveur du nœud + session 2FA, via la
+    porte « owner » de GatedView (= `may_lock`) ; 🖥️ Terminal ajoute par-dessus une
+    vérification propre à Terminal._may_open_node, qui exclut M et n'accepte que
+    `node_terminal_owner_ids` ou le rôle O. La porte est ici et pas seulement dans les
+    permissions du salon : un membre « Administrateur » de Discord voit le salon malgré
+    les overwrites.
 
 Les valeurs vitales (uptime/CPU/charge/RAM/swap/rootfs) viennent de l'API PVE, seule
 source qui les ait pour le nœud : dans InfluxDB, `object=="nodes"` ne porte que `uptime`
@@ -27,7 +34,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.permissions import lock_button_ok
+from ..core.gates import GatedView
 from ..views.confirm import ConfirmView
 
 log = logging.getLogger("discord-bot.nodechannel")
@@ -53,6 +60,12 @@ class NodeChannel(commands.Cog):
         self.bot = bot
         self.cfg = bot.cfg
         self._last_rename = 0.0
+        # Non-réentrance du bouton 💾 : la garde `_backup_running()` était évaluée AVANT
+        # une confirmation qui dure jusqu'à 30 s, et rien ne resérialisait ensuite —
+        # deux M pouvaient soumettre deux vzdump complets (le second attend le lockfile
+        # de vzdump puis REJOUE tout). Le verrou ne borne que ce processus : le vrai
+        # garde-fou reste côté PVE (2026-08-11).
+        self._backup_lock = asyncio.Lock()
         # renseigné par provision._rewire() dès que le salon est résolu/créé
         self.channel_id = (bot.state.get("prov", {}) or {}).get("node")
         if self.channel_id and self.enabled:
@@ -87,8 +100,9 @@ class NodeChannel(commands.Cog):
 
     async def _guests(self):
         try:
-            res = await asyncio.to_thread(self.bot.pve.resources)
+            res = await self.bot.pve.aresources()
         except Exception:
+            log.debug("liste des invités indisponible", exc_info=True)
             return None
         run = sum(1 for r in res if r.get("status") == "running")
         lxc = sum(1 for r in res if r.get("type") == "lxc")
@@ -101,8 +115,9 @@ class NodeChannel(commands.Cog):
         à la casse ('RUNNING'). Sans ça, la garde anti-double-sauvegarde et l'emoji 🟠
         étaient toujours inactifs."""
         try:
-            return bool(await asyncio.to_thread(self.bot.pve.running_vzdump_vmids))
+            return bool(await self.bot.pve.acall(self.bot.pve.running_vzdump_vmids))
         except Exception:
+            log.debug("état vzdump indisponible", exc_info=True)
             return False
 
     # ------------------------------------------------------------------ embed
@@ -116,7 +131,7 @@ class NodeChannel(commands.Cog):
         st = None
         if self.bot.pve.enabled:
             try:
-                st = await asyncio.to_thread(self.bot.pve.host_status)
+                st = await self.bot.pve.acall(self.bot.pve.host_status)
             except Exception:
                 log.warning("host_status indisponible", exc_info=True)
         if not st:
@@ -258,12 +273,18 @@ class NodeChannel(commands.Cog):
         # bien trop large à accorder pour un simple compteur. Le shell root l'affiche.
         emb.add_field(
             name="Système",
-            value=(f"noyau `{st.get('kversion', '?').split('#')[0].strip()[:60]}` · "
+            # `kversion` peut exister ET valoir None : le défaut de .get() ne suffit pas
+            value=(f"noyau `{(st.get('kversion') or '?').split('#')[0].strip()[:60]}` · "
                    f"démarrage {(st.get('boot-info') or {}).get('mode', '?')}")[:1024],
             inline=False)
 
         emb.color = fmt.health_color(worst)
-        emb.set_footer(text="rafraîchi · propriétaire uniquement")
+        # Le pied de page répétait « propriétaire uniquement » — la même phrase périmée que
+        # celle corrigée dans l'en-tête du module, sauf que celle-ci est LUE par les
+        # utilisateurs. 🔄/💾 acceptent le tier M ; seul 🖥️ est O/node_terminal_owner_ids
+        # (relecture 2026-08-11).
+        emb.set_footer(text="rafraîchi · boutons réservés aux rôles M/O du nœud "
+                            "(🖥️ : O / propriétaire)")
         return emb
 
     # ------------------------------------------------------------ boucle live
@@ -284,7 +305,7 @@ class NodeChannel(commands.Cog):
         try:
             await ch.edit(name=desired, reason="sync statut du nœud")
         except discord.HTTPException:
-            pass
+            log.warning("renommage du salon du nœud refusé", exc_info=True)
 
     @tasks.loop(minutes=2)
     async def refresh(self):
@@ -333,48 +354,47 @@ class NodeChannel(commands.Cog):
         await self.bot.wait_until_ready()
 
 
-class NodeControlView(discord.ui.View):
+class NodeControlView(GatedView):
     """Boutons persistants du salon de l'hyperviseur. Rafraîchir / Sauvegarder / Terminal.
-    Volontairement SANS Start/Stop/Reboot."""
+    Volontairement SANS Start/Stop/Reboot.
+
+    Porte « owner » = `may_lock` + session 2FA, exactement ce que faisait l'ancien
+    `lock_button_ok` appelé en tête de chaque bouton : tier M ou O du nœud, ou
+    propriétaire break-glass (2026-07-16)."""
+
+    gate = "owner"
 
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
 
-    async def _blocked(self, itx):
-        """Garde commune aux 3 boutons de la catégorie Lock. `node_channel_enabled` doit
-        être un interrupteur RUNTIME : la vue est persistante, donc les boutons d'un
-        message déjà posté survivent à un redémarrage et resteraient cliquables si le
-        drapeau n'était lu qu'au provisioning.
-
-        Accès = session 2FA + rôles « Gestion » ET « O » du serveur du nœud (ou
-        propriétaire break-glass) — cahier des charges 2026-07-16."""
+    async def interaction_check(self, itx) -> bool:
+        if not await super().interaction_check(itx):     # rôle M/O + 2FA
+            return False
+        # `node_channel_enabled` doit être un interrupteur RUNTIME : la vue est
+        # persistante, donc les boutons d'un message déjà posté survivent à un
+        # redémarrage et resteraient cliquables si le drapeau n'était lu qu'au
+        # provisioning.
         if not self.cog.enabled:
             await itx.response.send_message(
                 "Salon du nœud désactivé (`NODE_CHANNEL_ENABLED=false`).", ephemeral=True)
-            return True
-        if not await lock_button_ok(itx):     # répond lui-même (refus rôle ou 2FA)
-            return True
-        return False
+            return False
+        return True
 
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="nodechannel:refresh")
     async def b_refresh(self, itx: discord.Interaction, button: discord.ui.Button):
-        if await self._blocked(itx):
-            return
         await itx.response.defer()
         try:
             emb = await self.cog.build_node()
             await itx.message.edit(embed=emb, view=self)
         except discord.HTTPException:
-            pass
+            log.warning("rafraîchissement du salon du nœud impossible", exc_info=True)
 
     @discord.ui.button(label="Sauvegarder", emoji="💾",
                        style=discord.ButtonStyle.secondary, custom_id="nodechannel:backup")
     async def b_backup(self, itx: discord.Interaction, button: discord.ui.Button):
         bot = self.cog.bot
-        if await self._blocked(itx):
-            return
         if not getattr(self.cog.cfg, "node_backup_enabled", True):
             await itx.response.send_message(
                 "Sauvegarde désactivée (`NODE_BACKUP_ENABLED=false`).", ephemeral=True)
@@ -386,32 +406,50 @@ class NodeControlView(discord.ui.View):
             return
         # ACK avant toute I/O PVE (3 s max sinon « interaction failed »)
         await itx.response.defer(ephemeral=True)
-        if await self.cog._backup_running():
+        # Non-réentrance : on refuse tout de suite plutôt que de faire patienter un second
+        # opérateur les 30 s du ConfirmView. Le verrou couvre confirmation ET soumission,
+        # sinon la garde `_backup_running()` d'avant la confirmation ne vaut plus rien au
+        # moment du POST (2026-08-11).
+        if self.cog._backup_lock.locked():
             await itx.followup.send(
-                "💾 Une sauvegarde est **déjà en cours** — attends la fin.", ephemeral=True)
+                "💾 Une demande de sauvegarde est **en cours de confirmation** par "
+                "quelqu'un d'autre — réessaie dans une minute.", ephemeral=True)
             return
-        cv = ConfirmView(itx.user.id)
-        emb = discord.Embed(
-            title="⚠️ Confirmation",
-            description=(f"Lancer une sauvegarde de **toutes les VM/conteneurs** vers "
-                         f"`{self.cog.cfg.pve_pbs_storage}` ?\n\nJob long (plusieurs "
-                         f"dizaines de minutes) qui charge le RAID et le réseau."),
-            color=fmt.YELLOW)
-        cv.message = await itx.followup.send(embed=emb, view=cv, ephemeral=True, wait=True)
-        await cv.wait()
-        if not cv.value:
-            await itx.followup.send("Annulé.", ephemeral=True)
-            return
-        who = f"{itx.user}({itx.user.id})"
-        try:
-            upid = await asyncio.to_thread(bot.pve.backup_all)
-        except Exception as e:
+        async with self.cog._backup_lock:
+            if await self.cog._backup_running():
+                await itx.followup.send(
+                    "💾 Une sauvegarde est **déjà en cours** — attends la fin.",
+                    ephemeral=True)
+                return
+            cv = ConfirmView(itx.user.id)
+            emb = discord.Embed(
+                title="⚠️ Confirmation",
+                description=(f"Lancer une sauvegarde de **toutes les VM/conteneurs** vers "
+                             f"`{self.cog.cfg.pve_pbs_storage}` ?\n\nJob long (plusieurs "
+                             f"dizaines de minutes) qui charge le RAID et le réseau."),
+                color=fmt.YELLOW)
+            cv.message = await itx.followup.send(embed=emb, view=cv, ephemeral=True,
+                                                 wait=True)
+            await cv.wait()
+            if not cv.value:
+                await itx.followup.send("Annulé.", ephemeral=True)
+                return
+            # re-test après confirmation : best-effort (le job planifié pbs-daily-cts,
+            # lui, ne passe pas par ce verrou) mais il rattrape le cas courant.
+            if await self.cog._backup_running():
+                await itx.followup.send(
+                    "💾 Une sauvegarde a démarré entre-temps — annulé.", ephemeral=True)
+                return
+            who = f"{itx.user}({itx.user.id})"
+            try:
+                upid = await bot.pve.acall(bot.pve.backup_all)
+            except Exception as e:
+                bot.audit.record(user=who, action="backup",
+                                 target="toutes les VM/conteneurs", result=f"error:{e}")
+                await itx.followup.send(f"❌ Échec : `{e}`", ephemeral=True)
+                return
             bot.audit.record(user=who, action="backup", target="toutes les VM/conteneurs",
-                             result=f"error:{e}")
-            await itx.followup.send(f"❌ Échec : `{e}`", ephemeral=True)
-            return
-        bot.audit.record(user=who, action="backup", target="toutes les VM/conteneurs",
-                         result="submitted", upid=str(upid))
+                             result="submitted", upid=str(upid))
         await itx.followup.send(
             "💾 Sauvegarde de **toutes les VM/conteneurs** lancée (suivi dans les tâches PVE "
             "et #sauvegardes).", ephemeral=True)
@@ -419,8 +457,8 @@ class NodeControlView(discord.ui.View):
     @discord.ui.button(label="Terminal", emoji="🖥️",
                        style=discord.ButtonStyle.danger, custom_id="nodechannel:terminal")
     async def b_terminal(self, itx: discord.Interaction, button: discord.ui.Button):
-        if await self._blocked(itx):
-            return
+        # la porte de la vue laisse passer M ; Terminal._may_open_node referme derrière
+        # (node_terminal_owner_ids ou rôle O uniquement) — c'est voulu.
         cog = self.cog.bot.get_cog("Terminal")
         if cog is None:
             await itx.response.send_message("Terminal non activé.", ephemeral=True)

@@ -24,7 +24,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.permissions import admin_button_ok
+from ..core.gates import GatedView
 from ..core.pve import LlmExecError
 from ..views.confirm import ConfirmView
 
@@ -41,6 +41,10 @@ LAT_ALERT_MS = 800     # tunnel WG dégradé (réarmé < 400)
 LAT_CLEAR_MS = 400
 AUTH_FAIL_MIN = 3      # échecs d'auth PVE par cycle avant alerte
 BACKUP_STALE_DAYS = 7  # ⚠️ invité sans sauvegarde récente
+# Discord refuse un embed de plus de 25 champs (400 Bad Request = embed JAMAIS publié) :
+# les listes « un champ par disque / par stockage » ne sont pas bornées côté Proxmox, on
+# garde une marge pour les champs fixes de l'embed. (2026-08-11)
+MAX_LIST_FIELDS = 20
 
 # --- assistant IA locale (VM ubuntu-llm, RTX 3090) ---
 GPU_TEMP_ALERT = 80    # °C (réarmé < 70)
@@ -69,16 +73,59 @@ def _smart_temp(sm):
     return None
 
 
+def _num(v, unit, scale=1, fmt_spec=".0f"):
+    """Formate une métrique éventuellement ABSENTE : « 42 °C » ou « ? °C ».
+
+    ⚠️ Le script de supervision embarqué dans la VM ubuntu-llm construit toujours toutes
+    ses clés et y met None quand la métrique Prometheus manque : `dict.get(clé, 0)` ne
+    rend PAS le défaut (la clé existe), d'où les `None * 100` / `f"{None:.0f}"` qui
+    levaient un TypeError en plein rendu d'embed. On affiche « ? » et non 0 : une
+    métrique absente ne doit pas se maquiller en valeur nulle réelle (2026-08-11)."""
+    if v is None:
+        return f"? {unit}"
+    try:
+        return f"{v * scale:{fmt_spec}} {unit}"
+    except (TypeError, ValueError):
+        return f"? {unit}"
+
+
 class Avy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.enabled = getattr(bot.cfg, "avy_enabled", False)
         self._cluster = {}    # instantané cluster du cycle (quorum, latence, jobs)
+        self._cycle_guests = None   # carte des invités du cycle (cf. _node_guests)
 
     async def cog_load(self):
         self.bot.add_view(AvyNodeView(self))
         if self.enabled:
+            self._warn_missing_gestion()
             self.refresh.start()
+
+    def _warn_missing_gestion(self):
+        """Un nœud d'AVY_NODES sans ligne « AVY-X:G:M:O » dans GESTION_SERVERS rend ses
+        boutons INUTILISABLES : is_admin est fail-closed sur une clé inconnue (sinon un
+        porteur de « Gestion R820 » piloterait une machine d'Aveyron). Le dire au
+        démarrage plutôt que de laisser un refus incompréhensible au premier clic
+        (2026-08-11).
+
+        On ne lit QUE la liste statique AVY_NODES : la découverte en ligne coûterait un
+        appel réseau (donc un démarrage retardé si Aveyron est injoignable) pour un
+        simple message de journal."""
+        try:
+            known = getattr(self.bot.cfg, "gestion_servers", {}) or {}
+            nodes = getattr(self.bot.cfg, "avy_nodes", None) or []
+            missing = [k for k in (self.bot.pve.avy_server_key(n) for n in nodes)
+                       if k not in known]
+        except Exception:
+            log.warning("supervision Aveyron: vérification GESTION_SERVERS impossible",
+                        exc_info=True)
+            return
+        if missing:
+            log.warning("supervision Aveyron: %s absent(s) de GESTION_SERVERS — les "
+                        "boutons des salons de ce(s) serveur(s) seront REFUSÉS (déclarer "
+                        "« %s:G:M:O » dans config.env)",
+                        ", ".join(missing), missing[0])
 
     def cog_unload(self):
         if self.enabled:
@@ -101,21 +148,43 @@ class Avy(commands.Cog):
         return None, None
 
     def _node_guests(self, node):
-        """[(name, info)] des invités -avy de CE nœud (cf. avertissement d'en-tête)."""
-        gm = self.bot.pve.guest_map()
+        """[(name, info)] des invités -avy de CE nœud (cf. avertissement d'en-tête).
+
+        ⚠️ La carte est celle PRÉ-CHARGÉE par refresh_node (via aguest_map, donc hors
+        boucle d'événements) : `guest_map()` est SYNCHRONE et, dès que son cache de 30 s
+        a expiré, tape /cluster/resources — appelé d'ici (2 embeds + les alertes, tous
+        dans une coroutine) il bloquerait tout le bot le temps de la requête. Pré-chargement
+        en échec = liste vide, jamais de lecture réseau depuis la boucle d'événements ;
+        les appelants savent se dégrader (2026-08-11)."""
+        gm = self._cycle_guests
+        if gm is None:
+            return []
         return sorted(((n, i) for n, i in gm.items()
                        if self.bot.pve.is_avy_name(n) and i.get("node") == node),
                       key=lambda x: x[1].get("vmid") or 0)
 
-    async def _send_alert(self, node, text):
+    async def _send_alert(self, node, text) -> bool:
+        """Envoie une alerte dans #alertes-<nœud>. Renvoie True SEULEMENT si le message
+        est parti.
+
+        ⚠️ Toutes les alertes de ce cog sont à verrou (edge-triggered) : armer le verrou
+        sans savoir si l'envoi a réussi marque la condition « déjà annoncée » et elle
+        n'est plus jamais réannoncée tant qu'elle ne s'est pas résorbée. Les appelants
+        n'arment donc leur verrou que sur True. Et un échec durable (salon supprimé, bot
+        privé de SEND_MESSAGES) doit laisser une trace : sans elle l'alerting Aveyron
+        peut être mort sans que rien ne le dise nulle part (2026-08-11)."""
         cid = self._sup().get(node, {}).get("alertes")
         ch = self.bot.get_channel(cid) if cid else None
         if ch is None:
-            return
+            log.warning("alerte Aveyron perdue (salon #alertes de %s introuvable, id=%s) : %s",
+                        node, cid, text)
+            return False
         try:
             await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
+            return True
         except discord.HTTPException:
-            pass
+            log.warning("alerte Aveyron non envoyée (%s) : %s", node, text, exc_info=True)
+            return False
 
     async def _pin_edit(self, channel_id, emb, view=None):
         """Édite le message épinglé du salon (créé+épinglé au premier passage)."""
@@ -149,24 +218,33 @@ class Avy(commands.Cog):
             else:
                 await msg.edit(**kw)
         except discord.HTTPException:
-            pass
+            # un salon dont les embeds ne se mettent plus à jour (permission retirée,
+            # message supprimé pendant l'édition) ressemble à un salon à jour : le dire
+            # au moins dans les logs (2026-08-11)
+            log.warning("supervision Aveyron: message épinglé non mis à jour (salon %s)",
+                        channel_id, exc_info=True)
 
     # ------------------------------------------------------------------ embeds
 
     def _collect(self, node):
         """Toutes les lectures API d'un nœud (synchrone, appelé via to_thread)."""
         pve = self.bot.pve
-        out = {"status": None, "storages": [], "tasks": [], "rows": [],
+        out = {"status": None, "storages": [], "tasks": [],
                "rrd_last": {}, "disks": []}
         out["status"] = pve.avy_node_status(node)          # lève si nœud injoignable
+        # ⚠️ une lecture ratée ici se lit comme « rien à signaler » dans les embeds ET
+        # neutralise les alertes correspondantes (stockage plein, vzdump en échec) :
+        # elle doit au moins laisser une trace (2026-08-11)
         try:
             out["storages"] = pve.avy_node_storages(node) or []
         except Exception:
-            pass
+            log.warning("supervision Aveyron: stockages du nœud %s illisibles", node,
+                        exc_info=True)
         try:
             out["tasks"] = pve.avy_node_tasks(node, limit=20) or []
         except Exception:
-            pass
+            log.warning("supervision Aveyron: tâches du nœud %s illisibles", node,
+                        exc_info=True)
         # dernier point RRD du nœud : pression PSI CPU/IO (invisible dans status)
         try:
             rows = pve.avy_node_rrd(node, "hour") or []
@@ -184,15 +262,11 @@ class Avy(commands.Cog):
                 out["disks"].append({**d, "temp": temp})
         except Exception:
             pass
-        # lignes /cluster/resources des invités DU nœud (métriques internes : cpu, mem,
-        # disk, compteurs netin/netout, uptime) — cf. avertissement d'en-tête (node=pve
-        # existe des deux côtés, toujours filtrer avec is_avy_name)
-        try:
-            out["rows"] = [r for r in pve.resources()
-                           if r.get("name") and pve.is_avy_name(r["name"])
-                           and r.get("node") == node]
-        except Exception:
-            pass
+        # ⚠️ Il y avait ici une lecture /cluster/resources filtrée par nœud (out["rows"]).
+        # PERSONNE ne la lisait, mais elle coûtait un aller-retour R820 + un aller-retour
+        # Aveyron PAR NŒUD ET PAR CYCLE (et un de plus à chaque clic sur 🔄), sur le lien
+        # le plus fragile de l'infra. Supprimée le 2026-08-11 : les métriques internes des
+        # invités passent par _node_guests(), servi par le cache 30 s de guest_map().
         return out
 
     def _cluster_collect(self):
@@ -213,7 +287,9 @@ class Avy(commands.Cog):
                     out["online"][e.get("name")] = bool(e.get("online"))
             out["ok"] = True
         except Exception:
-            pass
+            # out["ok"] reste False -> _cluster_alerts sort sans rien faire : quorum perdu
+            # et nœud hors ligne ne seraient plus signalés du tout, en silence (2026-08-11)
+            log.warning("supervision Aveyron: statut du cluster illisible", exc_info=True)
         for n in pve.avy_nodes():
             try:
                 certs = pve.avy_certificates(n) or []
@@ -245,7 +321,7 @@ class Avy(commands.Cog):
         pv = (st.get("pveversion") or "").replace("pve-manager/", "").split("/")[0]
         emb = discord.Embed(title=f"🖥️ {node} — hyperviseur (Aveyron)")
         emb.timestamp = discord.utils.utcnow()
-        emb.description = (f"🟢 `online`" + (f" · **{pv}**" if pv else "")
+        emb.description = ("🟢 `online`" + (f" · **{pv}**" if pv else "")
                            + (f" · {ci['model']}" if ci.get("model") else ""))
         emb.add_field(name="Uptime", value=fmt.humanize_duration(st.get("uptime")))
 
@@ -335,17 +411,25 @@ class Avy(commands.Cog):
         emb = discord.Embed(title=f"💽 Stockages — {node} (Aveyron)")
         emb.timestamp = discord.utils.utcnow()
         worst = 0.0
-        for s in sorted(data["storages"], key=lambda x: x.get("storage", "")):
+        stos = sorted(data["storages"], key=lambda x: x.get("storage", ""))
+        for n, s in enumerate(stos):
             tot, used = s.get("total") or 0, s.get("used") or 0
             if not s.get("active"):
                 val = "⚪ inactif"
             elif tot:
                 pct = used / tot * 100
-                worst = max(worst, pct)
+                worst = max(worst, pct)   # la couleur tient compte de TOUS les stockages
                 val = (f"{fmt.pct_bar(pct)}\n{fmt.pct_of(used, tot)}")
             else:
                 val = "—"
-            emb.add_field(name=f"{s.get('storage')} ({s.get('type')})", value=val, inline=True)
+            # au-delà de MAX_LIST_FIELDS champs Discord rejette l'embed entier (400) :
+            # mieux vaut une liste tronquée qu'un salon figé (2026-08-11)
+            if n < MAX_LIST_FIELDS:
+                emb.add_field(name=f"{s.get('storage')} ({s.get('type')})", value=val,
+                              inline=True)
+        if len(stos) > MAX_LIST_FIELDS:
+            emb.add_field(name="…", value=f"+ {len(stos) - MAX_LIST_FIELDS} autre(s) "
+                                          f"stockage(s) non affiché(s)", inline=False)
         emb.color = fmt.health_color(worst, warn=STO_CLEAR_PCT, crit=STO_ALERT_PCT)
         emb.set_footer(text="rafraîchi")
         return emb
@@ -442,7 +526,10 @@ class Avy(commands.Cog):
             worst = 95
         elif worn:
             worst = 85
-        for d in disks:
+        # un champ par disque : un nœud à 24 baies ferait sauter la limite des 25 champs
+        # d'un embed (400 Bad Request = embed jamais publié). Le résumé ci-dessus, lui,
+        # compte TOUS les disques. (2026-08-11)
+        for d in disks[:MAX_LIST_FIELDS]:
             health = str(d.get("health") or "?")
             ok = health.upper() in ("PASSED", "OK")
             bits = [("🟢" if ok else "🔴") + f" {health}"]
@@ -456,6 +543,9 @@ class Avy(commands.Cog):
                 bits.append(fmt.humanize_bytes(d["size"]))
             emb.add_field(name=f"{d.get('devpath')} · {(d.get('model') or '?')[:40]}",
                           value=" · ".join(bits), inline=False)
+        if len(disks) > MAX_LIST_FIELDS:
+            emb.add_field(name="…", value=f"+ {len(disks) - MAX_LIST_FIELDS} disque(s) "
+                                          f"non affiché(s)", inline=False)
         emb.color = fmt.health_color(worst)
         emb.set_footer(text="rafraîchi")
         return emb
@@ -498,12 +588,21 @@ class Avy(commands.Cog):
         return emb
 
     def _content_by_node(self):
-        """Contenu nas-backup réparti par nœud (une lecture CIFS ~16 s par cycle)."""
+        """Contenu nas-backup réparti par nœud (une lecture CIFS ~16 s par cycle).
+
+        ⚠️ guest_map() DOIT rester dans le try : c'était le seul appel non gardé du corps
+        de refresh(), et il tape /cluster/resources sur le R820. Un jeton PVEAuditor
+        révoqué (401 -> ResourceException, qui n'est PAS un OSError et ne déclenche donc
+        pas le backoff de discord.py) faisait remonter l'exception jusqu'à la tasks.loop
+        et TUAIT la supervision Aveyron pour de bon — plus un seul embed, plus une seule
+        alerte, jusqu'au redémarrage du bot (2026-08-11)."""
         try:
             items = self.bot.pve.avy_pbs_content() or []
+            gm = self.bot.pve.guest_map()
         except Exception:
+            log.warning("supervision Aveyron: contenu nas-backup indisponible ce cycle",
+                        exc_info=True)
             return {}
-        gm = self.bot.pve.guest_map()
         vmid_node = {str((i.get("vmid") or 0) % 1_000_000): i.get("node")
                      for n, i in gm.items() if self.bot.pve.is_avy_name(n)}
         out = {}
@@ -516,19 +615,30 @@ class Avy(commands.Cog):
     # ------------------------------------------------------------------ alertes
 
     async def _alerts(self, node, data, state):
-        """Alertes edge-triggered d'un nœud. `state` = sous-dict persistant du nœud."""
+        """Alertes edge-triggered d'un nœud. `state` = sous-dict persistant du nœud.
+
+        ⚠️ Règle de tout ce bloc (2026-08-11) : un verrou (ou un curseur) ne s'arme QUE si
+        `_send_alert` a confirmé l'envoi. Armé d'avance, un message perdu (salon supprimé,
+        bot privé de SEND_MESSAGES, 429) marquait la condition « déjà annoncée » et la
+        panne n'était PLUS JAMAIS signalée tant qu'elle ne s'était pas d'abord résorbée."""
         s = state.setdefault(node, {"down": 0, "down_alerted": False,
-                                    "sto": {}, "guests": {}, "seen_err": 0})
+                                    "sto": {}, "guests": {}})
         if data is None:                                   # nœud injoignable
             s["down"] += 1
-            if s["down"] == 2 and not s["down_alerted"]:
-                s["down_alerted"] = True
-                await self._send_alert(node, f"🔴 **{node}** (Aveyron) : nœud injoignable")
+            # `>= 2` et non `== 2` : si l'envoi échoue au 2e cycle, le compteur continue
+            # de grimper et la condition ne se représenterait jamais.
+            if s["down"] >= 2 and not s["down_alerted"]:
+                if await self._send_alert(
+                        node, f"🔴 **{node}** (Aveyron) : nœud injoignable"):
+                    s["down_alerted"] = True
             return
-        if s.pop("down_alerted", False) and s.get("down", 0) >= 2:
-            await self._send_alert(node, f"🟢 **{node}** (Aveyron) : nœud rétabli")
-        s["down"] = 0
-        s["down_alerted"] = False
+        if s.get("down_alerted"):
+            # on garde le verrou ET le compteur tant que le « rétabli » n'est pas parti
+            if await self._send_alert(node, f"🟢 **{node}** (Aveyron) : nœud rétabli"):
+                s["down_alerted"] = False
+                s["down"] = 0
+        else:
+            s["down"] = 0
 
         for st in data["storages"]:
             name, tot = st.get("storage"), st.get("total") or 0
@@ -537,39 +647,71 @@ class Avy(commands.Cog):
             pct = (st.get("used") or 0) / tot * 100
             was = s["sto"].get(name, False)
             if pct >= STO_ALERT_PCT and not was:
-                s["sto"][name] = True
-                await self._send_alert(
-                    node, f"🔴 **{node}** : stockage `{name}` à **{pct:.0f} %**")
+                if await self._send_alert(
+                        node, f"🔴 **{node}** : stockage `{name}` à **{pct:.0f} %**"):
+                    s["sto"][name] = True
             elif pct < STO_CLEAR_PCT and was:
-                s["sto"][name] = False
-                await self._send_alert(
-                    node, f"🟢 **{node}** : stockage `{name}` redescendu ({pct:.0f} %)")
+                if await self._send_alert(
+                        node, f"🟢 **{node}** : stockage `{name}` redescendu ({pct:.0f} %)"):
+                    s["sto"][name] = False
 
         cur = {n: (i.get("status") or "?") for n, i in self._node_guests(node)}
         prev = s.get("guests") or {}
         sfx = "-" + self.bot.cfg.avy_suffix
-        for n, status in cur.items():
-            old = prev.get(n)
-            if old is None:            # 1er passage : on apprend sans alerter
-                continue
-            if old == "running" and status != "running":
-                await self._send_alert(node, f"🔴 **{n.removesuffix(sfx)}** ({node}) "
-                                             f"est passé `{old}` → `{status}`")
-            elif old != "running" and status == "running":
-                await self._send_alert(node, f"🟢 **{n.removesuffix(sfx)}** ({node}) "
-                                             f"est de nouveau `running`")
-        s["guests"] = cur
+        if not cur and prev:
+            # carte des invités illisible ce cycle : ne PAS écraser le curseur, sinon la
+            # transition running -> stopped survenue pendant la panne serait apprise comme
+            # état initial et jamais annoncée.
+            log.warning("supervision Aveyron: aucun invité lu pour %s, curseur conservé",
+                        node)
+        else:
+            newg = {}
+            for n, status in cur.items():
+                old = prev.get(n)
+                if old is None:            # 1er passage : on apprend sans alerter
+                    newg[n] = status
+                    continue
+                ok = True
+                if old == "running" and status != "running":
+                    ok = await self._send_alert(
+                        node, f"🔴 **{n.removesuffix(sfx)}** ({node}) "
+                              f"est passé `{old}` → `{status}`")
+                elif old != "running" and status == "running":
+                    ok = await self._send_alert(
+                        node, f"🟢 **{n.removesuffix(sfx)}** ({node}) "
+                              f"est de nouveau `running`")
+                # curseur figé sur l'ancien état si l'annonce n'est pas partie : elle
+                # repartira au cycle suivant
+                newg[n] = status if ok else old
+            s["guests"] = newg
 
-        last = s.get("seen_err", 0)
-        newest = last
-        for t in data["tasks"] or []:
-            if (t.get("type") == "vzdump" and t.get("endtime")
-                    and str(t.get("status", "")) != "OK" and t["endtime"] > last):
-                newest = max(newest, t["endtime"])
-                await self._send_alert(
-                    node, f"🔴 **{node}** : sauvegarde vzdump (vmid {t.get('id') or '?'}) "
-                          f"en **échec** : `{str(t.get('status'))[:120]}`")
-        s["seen_err"] = newest
+        # ⚠️ Pas de "seen_err": 0 par défaut : au tout premier passage (state.json vide,
+        # nouveau nœud), TOUTE tâche vzdump non-OK du tampon PVE — jusqu'à 20 tâches
+        # archivées, parfois vieilles de plusieurs jours — satisfait `endtime > 0` et
+        # partait d'un coup dans #alertes. On apprend d'abord, et SEULEMENT sur une
+        # lecture réussie : `tasks` vide peut aussi vouloir dire « lecture en échec »
+        # (_collect avale l'exception), et armer à 0 relancerait la salve. (2026-08-11)
+        if "seen_err" not in s:
+            if data["tasks"]:
+                s["seen_err"] = max((t.get("endtime") or 0) for t in data["tasks"])
+        else:
+            last = s.get("seen_err", 0)
+            newest = last
+            for t in data["tasks"] or []:
+                st_txt = str(t.get("status") or "")
+                # un statut VIDE n'est pas une preuve d'échec (tâche encore en cours de
+                # publication côté PVE) : ne pas l'annoncer comme telle
+                if (t.get("type") == "vzdump" and t.get("endtime")
+                        and st_txt and st_txt != "OK" and t["endtime"] > last):
+                    if await self._send_alert(
+                            node,
+                            f"🔴 **{node}** : sauvegarde vzdump (vmid {t.get('id') or '?'}) "
+                            f"en **échec** : `{st_txt[:120]}`"):
+                        # curseur avancé seulement sur envoi confirmé : un échec vzdump
+                        # perdu n'apparaît dans AUCUN embed persistant, l'information
+                        # disparaîtrait pour de bon
+                        newest = max(newest, t["endtime"])
+            s["seen_err"] = newest
 
         # disques physiques : santé SMART, usure, température (edge + hystérésis temp)
         dk = s.setdefault("disks", {})
@@ -578,46 +720,55 @@ class Avy(commands.Cog):
             ds = dk.setdefault(dev, {})
             healthy = str(d.get("health") or "").upper() in ("PASSED", "OK", "UNKNOWN", "?")
             if not healthy and not ds.get("health"):
-                ds["health"] = True
-                await self._send_alert(
-                    node, f"🔴 **{node}** : disque `{dev}` santé SMART **{d.get('health')}**")
+                if await self._send_alert(
+                        node,
+                        f"🔴 **{node}** : disque `{dev}` santé SMART **{d.get('health')}**"):
+                    ds["health"] = True
             elif healthy and ds.get("health"):
-                ds["health"] = False
-                await self._send_alert(node, f"🟢 **{node}** : disque `{dev}` santé rétablie")
+                if await self._send_alert(
+                        node, f"🟢 **{node}** : disque `{dev}` santé rétablie"):
+                    ds["health"] = False
             w = d.get("wearout")
             if w is not None and str(w).isdigit() and int(w) <= WEAROUT_ALERT \
                     and not ds.get("wear"):
-                ds["wear"] = True
-                await self._send_alert(
-                    node, f"🔴 **{node}** : disque `{dev}` usé à {100 - int(w)} % "
-                          f"(**{w} %** de vie restante)")
+                if await self._send_alert(
+                        node, f"🔴 **{node}** : disque `{dev}` usé à {100 - int(w)} % "
+                              f"(**{w} %** de vie restante)"):
+                    ds["wear"] = True
             t = d.get("temp")
             if t is not None:
                 if t >= DISK_TEMP_ALERT and not ds.get("temp"):
-                    ds["temp"] = True
-                    await self._send_alert(
-                        node, f"🔴 **{node}** : disque `{dev}` à **{t} °C**")
+                    if await self._send_alert(
+                            node, f"🔴 **{node}** : disque `{dev}` à **{t} °C**"):
+                        ds["temp"] = True
                 elif t < DISK_TEMP_CLEAR and ds.get("temp"):
-                    ds["temp"] = False
-                    await self._send_alert(
-                        node, f"🟢 **{node}** : disque `{dev}` redescendu à {t} °C")
+                    if await self._send_alert(
+                            node, f"🟢 **{node}** : disque `{dev}` redescendu à {t} °C"):
+                        ds["temp"] = False
 
     async def _cluster_alerts(self, cl, state):
         """Alertes de niveau CLUSTER (quorum, nœuds vus par leurs pairs, certificats,
         échecs d'auth sur l'UI PVE, latence tunnel) — routées vers le #alertes du
         premier nœud (pas de salon global Aveyron)."""
-        first = self.bot.pve.avy_nodes()[0] if self.bot.pve.avy_nodes() else None
+        # ⚠️ avy_nodes() est SYNCHRONE et peut retomber sur nodes_online() (réseau) quand
+        # AVY_NODES n'est pas configuré : hors boucle d'événements, et une seule fois
+        # (l'appel était fait deux fois) — 2026-08-11
+        nodes = await asyncio.to_thread(self.bot.pve.avy_nodes)
+        first = nodes[0] if nodes else None
         if first is None:
             return
         s = state.setdefault("_cluster", {})
         if not cl.get("ok"):
             return                                      # API muette : géré par nœud
 
+        # même règle que _alerts : le curseur/verrou ne bouge que si l'annonce est partie
         q, prev_q = cl.get("quorate"), s.get("quorate")
         if prev_q is not None and q is not None and q != prev_q:
-            await self._send_alert(first, "🔴 **cluster Aveyron : QUORUM PERDU**" if not q
-                                   else "🟢 **cluster Aveyron : quorum rétabli**")
-        if q is not None:
+            if await self._send_alert(
+                    first, "🔴 **cluster Aveyron : QUORUM PERDU**" if not q
+                    else "🟢 **cluster Aveyron : quorum rétabli**"):
+                s["quorate"] = q
+        elif q is not None:
             s["quorate"] = q
 
         off = s.setdefault("offline", {})
@@ -627,18 +778,20 @@ class Avy(commands.Cog):
                 off[n] = not online
                 continue
             if not online and not was_off:
-                off[n] = True
-                await self._send_alert(first, f"🔴 **{n}** : vu HORS LIGNE par ses pairs")
+                if await self._send_alert(
+                        first, f"🔴 **{n}** : vu HORS LIGNE par ses pairs"):
+                    off[n] = True
             elif online and was_off:
-                off[n] = False
-                await self._send_alert(first, f"🟢 **{n}** : de retour dans le cluster")
+                if await self._send_alert(
+                        first, f"🟢 **{n}** : de retour dans le cluster"):
+                    off[n] = False
 
         certs = s.setdefault("certs", {})
         for n, days in (cl.get("certs") or {}).items():
             if days < CERT_ALERT_DAYS and not certs.get(n):
-                certs[n] = True
-                await self._send_alert(
-                    first, f"🔴 **{n}** : certificat TLS expire dans **{days:.0f} j**")
+                if await self._send_alert(
+                        first, f"🔴 **{n}** : certificat TLS expire dans **{days:.0f} j**"):
+                    certs[n] = True
             elif days > CERT_CLEAR_DAYS and certs.get(n):
                 certs[n] = False
 
@@ -651,24 +804,27 @@ class Avy(commands.Cog):
                                default=0)
         else:
             new = [e for e in fails if (e.get("time") or 0) > last_ts]
+            sent = True
             if len(new) >= AUTH_FAIL_MIN:
                 users = {str(e.get("user") or "?") for e in new}
-                await self._send_alert(
+                sent = await self._send_alert(
                     first, f"🔴 **cluster Aveyron** : **{len(new)}** échecs "
                            f"d'authentification PVE ce cycle ({', '.join(sorted(users)[:4])})")
-            if new:
+            # curseur avancé seulement si rien n'était à annoncer ou si l'annonce est
+            # partie : sinon une salve de brute-force passerait à la trappe
+            if new and sent:
                 s["auth_ts"] = max(e.get("time") or 0 for e in new)
 
         ms = cl.get("ping_ms")
         if ms is not None:
             if ms >= LAT_ALERT_MS and not s.get("lat"):
-                s["lat"] = True
-                await self._send_alert(
-                    first, f"🔴 **tunnel WG Aveyron dégradé** : API à **{ms:.0f} ms**")
+                if await self._send_alert(
+                        first, f"🔴 **tunnel WG Aveyron dégradé** : API à **{ms:.0f} ms**"):
+                    s["lat"] = True
             elif ms < LAT_CLEAR_MS and s.get("lat"):
-                s["lat"] = False
-                await self._send_alert(
-                    first, f"🟢 **tunnel WG Aveyron rétabli** ({ms:.0f} ms)")
+                if await self._send_alert(
+                        first, f"🟢 **tunnel WG Aveyron rétabli** ({ms:.0f} ms)"):
+                    s["lat"] = False
 
     # ------------------------------------------------------- /health, rapport
 
@@ -680,9 +836,12 @@ class Avy(commands.Cog):
             return []
         rows = []
         cl = self._cluster or {}
+        # avy_nodes() est synchrone (et peut faire un appel réseau si AVY_NODES est vide) :
+        # une seule lecture, hors boucle d'événements (2026-08-11)
+        nodes = await asyncio.to_thread(self.bot.pve.avy_nodes)
         if cl.get("ping_ms") is not None:
             on = sum(1 for v in (cl.get("online") or {}).values() if v)
-            tot = len(cl.get("online") or {}) or len(self.bot.pve.avy_nodes())
+            tot = len(cl.get("online") or {}) or len(nodes)
             q = cl.get("quorate")
             lvl = "crit" if q is False else ("warn" if cl["ping_ms"] >= LAT_ALERT_MS else "ok")
             rows.append((lvl, "Aveyron (cluster)",
@@ -690,7 +849,7 @@ class Avy(commands.Cog):
                         f"tunnel {cl['ping_ms']:.0f} ms"))
         else:
             rows.append(("na", "Aveyron (cluster)", "API injoignable"))
-        for node in self.bot.pve.avy_nodes():
+        for node in nodes:
             try:
                 st = await asyncio.to_thread(self.bot.pve.avy_node_status, node)
             except Exception:
@@ -730,12 +889,15 @@ class Avy(commands.Cog):
             vram_pct = (gpu.get("mem_used") or 0) / gpu["mem_total"] * 100
             temp = gpu.get("temp")
             tflag = "🔥 " if (temp or 0) >= GPU_TEMP_ALERT else ""
+            # ⚠️ cf. _num : ces six clés existent TOUJOURS mais valent None quand la
+            # métrique Prometheus manque (2026-08-11)
             emb.add_field(
                 name="GPU — RTX 3090",
-                value=(f"{tflag}{temp:.0f} °C · util {gpu.get('util', 0) * 100:.0f} % · "
+                value=(f"{tflag}{_num(temp, '°C')} · util {_num(gpu.get('util'), '%', 100)} · "
                        f"{fmt.humanize_bytes(gpu.get('mem_used') or 0)} / "
                        f"{fmt.humanize_bytes(gpu['mem_total'])} VRAM ({vram_pct:.0f} %)\n"
-                       f"{gpu.get('power', 0):.0f} W · ventilo {gpu.get('fan', 0) * 100:.0f} %"),
+                       f"{_num(gpu.get('power'), 'W')} · "
+                       f"ventilo {_num(gpu.get('fan'), '%', 100)}"),
                 inline=False)
 
         svc = mon.get("services") or {}
@@ -795,67 +957,95 @@ class Avy(commands.Cog):
             log.exception("supervision IA locale")
             await self._pin_edit(cid, self._emb_ia_locale_down())
             return None
-        await self._pin_edit(cid, self._emb_ia_locale(mon))
+        # ⚠️ Le rendu de l'embed ne doit pas emporter les ALERTES avec lui : une métrique
+        # inattendue (clé à None, format surprise) faisait remonter l'exception jusqu'au
+        # try du cycle et sautait _llm_alerts — service arrêté, GPU brûlant ou disque
+        # plein n'étaient plus signalés du tout (2026-08-11).
+        try:
+            await self._pin_edit(cid, self._emb_ia_locale(mon))
+        except Exception:
+            log.exception("supervision IA locale: rendu de l'embed #ia-locale")
         return mon
 
     async def _llm_alerts(self, mon, state):
+        # même règle que _alerts : verrou/curseur armés seulement sur envoi confirmé
         node = self.bot.cfg.avy_llm_node
         s = state.setdefault("_llm", {})
         if mon is None:
             if not s.get("down"):
-                s["down"] = True
-                await self._send_alert(node, "🔴 **assistant IA locale** : VM ou "
-                                             "services injoignables")
+                if await self._send_alert(node, "🔴 **assistant IA locale** : VM ou "
+                                                "services injoignables"):
+                    s["down"] = True
             return
-        if s.pop("down", False):
-            await self._send_alert(node, "🟢 **assistant IA locale** : de nouveau joignable")
+        if s.get("down"):
+            if await self._send_alert(
+                    node, "🟢 **assistant IA locale** : de nouveau joignable"):
+                s["down"] = False
 
         svc = mon.get("services") or {}
         down_now = {n for n in LLM_CORE_SERVICES if svc.get(n) != "active"}
         prev_down = set(s.get("svc_down") or [])
+        announced = set(prev_down)      # état réellement annoncé dans Discord
         for n in down_now - prev_down:
-            await self._send_alert(node, f"🔴 **assistant IA locale** : service "
-                                         f"`{n}` arrêté")
+            if await self._send_alert(node, f"🔴 **assistant IA locale** : service "
+                                            f"`{n}` arrêté"):
+                announced.add(n)
         for n in prev_down - down_now:
-            await self._send_alert(node, f"🟢 **assistant IA locale** : service "
-                                         f"`{n}` de nouveau actif")
-        s["svc_down"] = list(down_now)
+            if await self._send_alert(node, f"🟢 **assistant IA locale** : service "
+                                            f"`{n}` de nouveau actif"):
+                announced.discard(n)
+        s["svc_down"] = sorted(announced)
 
         gpu = mon.get("gpu") or {}
         temp = gpu.get("temp")
         if temp is not None:
             if temp >= GPU_TEMP_ALERT and not s.get("temp"):
-                s["temp"] = True
-                await self._send_alert(node, f"🔴 **GPU RTX 3090** à **{temp:.0f} °C**")
+                if await self._send_alert(
+                        node, f"🔴 **GPU RTX 3090** à **{temp:.0f} °C**"):
+                    s["temp"] = True
             elif temp < GPU_TEMP_CLEAR and s.get("temp"):
-                s["temp"] = False
-                await self._send_alert(node, f"🟢 **GPU RTX 3090** redescendue à {temp:.0f} °C")
+                if await self._send_alert(
+                        node, f"🟢 **GPU RTX 3090** redescendue à {temp:.0f} °C"):
+                    s["temp"] = False
 
         if gpu.get("mem_total"):
             free = gpu["mem_total"] - (gpu.get("mem_used") or 0)
             if free < GPU_VRAM_FREE_ALERT and not s.get("vram"):
-                s["vram"] = True
-                await self._send_alert(
-                    node, f"🔴 **VRAM RTX 3090** quasi pleine : {fmt.humanize_bytes(free)} libres")
+                if await self._send_alert(
+                        node, f"🔴 **VRAM RTX 3090** quasi pleine : "
+                              f"{fmt.humanize_bytes(free)} libres"):
+                    s["vram"] = True
             elif free > GPU_VRAM_FREE_CLEAR and s.get("vram"):
-                s["vram"] = False
-                await self._send_alert(node, "🟢 **VRAM RTX 3090** de nouveau disponible")
+                if await self._send_alert(
+                        node, "🟢 **VRAM RTX 3090** de nouveau disponible"):
+                    s["vram"] = False
 
         disk = mon.get("disk") or {}
         if disk.get("free") is not None:
             if disk["free"] < LLM_DISK_FREE_ALERT and not s.get("disk"):
-                s["disk"] = True
-                await self._send_alert(
-                    node, f"🔴 **disque ubuntu-llm** : {fmt.humanize_bytes(disk['free'])} "
-                          f"libres seulement")
+                if await self._send_alert(
+                        node, f"🔴 **disque ubuntu-llm** : "
+                              f"{fmt.humanize_bytes(disk['free'])} libres seulement"):
+                    s["disk"] = True
             elif disk["free"] > LLM_DISK_FREE_CLEAR and s.get("disk"):
-                s["disk"] = False
-                await self._send_alert(node, "🟢 **disque ubuntu-llm** : espace redevenu confortable")
+                if await self._send_alert(
+                        node, "🟢 **disque ubuntu-llm** : espace redevenu confortable"):
+                    s["disk"] = False
 
     # ------------------------------------------------------------------ boucle
 
     async def refresh_node(self, node):
         """Reconstruit les 3 embeds d'un nœud (+ alertes). Renvoie data ou None."""
+        # La carte des invités est lue UNE fois, hors boucle d'événements : _node_guests()
+        # (2 embeds + les alertes) passait sinon par guest_map() SYNCHRONE, qui tape
+        # /cluster/resources dès que son cache de 30 s a expiré et bloque tout le bot le
+        # temps de la requête (2026-08-11).
+        try:
+            self._cycle_guests = await self.bot.pve.aguest_map()
+        except Exception:
+            log.warning("supervision Aveyron: carte des invités indisponible (%s)",
+                        node, exc_info=True)
+            self._cycle_guests = None
         try:
             data = await asyncio.to_thread(self._collect, node)
         except Exception:
@@ -884,8 +1074,10 @@ class Avy(commands.Cog):
         # cycle, avant les nœuds — _emb_hyperviseur les lit via self._cluster
         self._cluster = await asyncio.to_thread(self._cluster_collect)
         # une seule énumération CIFS (lente) par cycle, partagée entre les nœuds
+        # (_content_by_node ne lève plus : toutes ses lectures sont gardées)
         self._cycle_content = await asyncio.to_thread(self._content_by_node)
-        for node in self.bot.pve.avy_nodes():
+        # avy_nodes() est synchrone : hors boucle d'événements comme le reste
+        for node in await asyncio.to_thread(self.bot.pve.avy_nodes):
             try:
                 data = await self.refresh_node(node)
                 await self._alerts(node, data, state)
@@ -908,23 +1100,62 @@ class Avy(commands.Cog):
         await self.bot.wait_until_ready()
 
 
-class AvyNodeView(discord.ui.View):
+class AvyNodeView(GatedView):
     """Boutons persistants de l'embed #hyperviseur d'un nœud Aveyron : Rafraîchir +
-    💾 Backup (vzdump all=1 du nœud vers nas-backup). Gardés par les rôles M/O du
-    serveur (AVY-<nœud>) + session 2FA — cf. admin_button_ok(server=)."""
+    📈 Graph + 💾 Backup (vzdump all=1 du nœud vers nas-backup).
+
+    Porte : tier "mod" borné au SERVEUR DU SALON — chaque nœud d'Aveyron est un serveur
+    à part entière (rôles G/M/O propres), donc la clé dépend de l'interaction et se
+    résout dans `resolve_server`, pas dans un `gate_server` figé. Le 2FA de session est
+    appliqué par GatedView (les clics de boutons ne passent pas par GatedTree).
+    Migré de `admin_button_ok(server=)` vers GatedView le 2026-08-11 : même tier, même
+    clé, mais la porte ne peut plus être oubliée sur un bouton ajouté plus tard."""
+
+    gate = "mod"
 
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
 
+    async def interaction_check(self, interaction) -> bool:
+        """Salon inconnu = REFUS AVANT la porte.
+
+        ⚠️ `resolve_server` renvoie None quand `node_of_channel` ne reconnaît pas le salon
+        (prov['avy_sup'] vide au démarrage, salon recréé à la main, message épinglé
+        survivant à une reprovision). Or None ne veut pas dire « clé inconnue » pour
+        `is_admin` : il veut dire « serveur PRIMAIRE », donc repli sur le rôle
+        « Gestion R820 » — exactement le repli silencieux que la migration devait fermer
+        (le fail-closed d'is_admin ne s'applique qu'à une clé PRÉSENTE et inconnue).
+        On tranche donc ici, avant `super()`, ce qui n'ouvre rien : cela ne fait que
+        refuser plus tôt, avec le même message que les handlers (2026-08-11)."""
+        try:
+            node, key = self.cog.node_of_channel(interaction.channel_id)
+        except Exception:  # noqa: BLE001 — une erreur d'évaluation = refus, jamais accès
+            log.exception("AvyNodeView: salon %s non résolu — refus",
+                          interaction.channel_id)
+            node = key = None
+        if node is None or not key:
+            try:
+                await interaction.response.send_message("Salon non reconnu.",
+                                                        ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return False
+        return await super().interaction_check(interaction)
+
+    async def resolve_server(self, interaction):
+        """Clé GESTION_SERVERS du nœud auquel appartient le salon cliqué (« AVY-PVE »…).
+        Jamais None quand la porte s'exécute : `interaction_check` a déjà refusé les
+        salons non reconnus."""
+        _node, key = self.cog.node_of_channel(interaction.channel_id)
+        return key
+
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="avy:refresh")
     async def b_refresh(self, itx: discord.Interaction, button: discord.ui.Button):
-        node, key = self.cog.node_of_channel(itx.channel_id)
+        node, _key = self.cog.node_of_channel(itx.channel_id)  # porte : resolve_server
         if node is None:
             await itx.response.send_message("Salon non reconnu.", ephemeral=True)
-            return
-        if not await admin_button_ok(itx, server=key):
             return
         await itx.response.defer()
         await self.cog.refresh_node(node)
@@ -932,11 +1163,9 @@ class AvyNodeView(discord.ui.View):
     @discord.ui.button(label="Graph", emoji="📈",
                        style=discord.ButtonStyle.secondary, custom_id="avy:graph")
     async def b_graph(self, itx: discord.Interaction, button: discord.ui.Button):
-        node, key = self.cog.node_of_channel(itx.channel_id)
+        node, _key = self.cog.node_of_channel(itx.channel_id)  # porte : resolve_server
         if node is None:
             await itx.response.send_message("Salon non reconnu.", ephemeral=True)
-            return
-        if not await admin_button_ok(itx, server=key):
             return
         await itx.response.defer(ephemeral=True)
         cog = self.cog.bot.get_cog("Graphs")
@@ -956,11 +1185,9 @@ class AvyNodeView(discord.ui.View):
     @discord.ui.button(label="Sauvegarder", emoji="💾",
                        style=discord.ButtonStyle.secondary, custom_id="avy:backup")
     async def b_backup(self, itx: discord.Interaction, button: discord.ui.Button):
-        node, key = self.cog.node_of_channel(itx.channel_id)
+        node, _key = self.cog.node_of_channel(itx.channel_id)  # porte : resolve_server
         if node is None:
             await itx.response.send_message("Salon non reconnu.", ephemeral=True)
-            return
-        if not await admin_button_ok(itx, server=key):
             return
         bot = self.cog.bot
         if not bot.pve.actions_enabled:

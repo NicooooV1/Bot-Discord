@@ -1,14 +1,37 @@
 # Pinned deps for the Discord monitoring bot (installed into /opt/discord-bot/venv).
 # discord.py 2.5.x supports Python 3.13; audioop was removed from the 3.13 stdlib so
 # the audioop-lts backport is required for discord.py's (unused) voice import to load.
+#
+# 2026-08-11 : 4 lignes n'étaient PAS épinglées (audioop-lts, pyte, pyotp, qrcode) malgré
+# l'en-tête « Pinned ». Un venv EXISTANT ne dérivait pas pour autant (install.sh n'utilise
+# pas --upgrade) : le risque réel est la RECONSTRUCTION from-scratch (CT neuf, restauration
+# après sinistre) qui tirait la dernière version amont — au moment précis où l'on veut zéro
+# surprise, et sur les paquets qui portent le 2FA (pyotp), le QR d'inscription (qrcode) et
+# l'écran de la console root (pyte). Versions choisies = dernières amont à l'installation de
+# CT106, donc a priori celles déjà en place. ⚠️ AVANT un redéploiement, confronter au réel :
+#   /opt/discord-bot/venv/bin/pip freeze | grep -iE 'audioop|pyte|pyotp|qrcode'
+# et corriger ici en cas d'écart — sinon le prochain `pip install -r` REMPLACE le paquet
+# installé (y compris en le rétrogradant).
+#
+# ⚠️ Relecture 2026-08-11 — POURQUOI cet alignement se fait AVANT le déploiement et pas
+# après : un pin qui diffère de l'installé oblige pip à SORTIR SUR LE RÉSEAU. Or 106.fw
+# est posé APRÈS l'install, justement « so apt/pip can reach the mirrors »
+# (provision_ct106.sh:31/53) : sur un CT106 déjà pare-feuté, le téléchargement échoue,
+# `set -euo pipefail` fait avorter install.sh dès sa ligne 15 — donc AVANT les lignes
+# 30-35 qui réinstallent l'unité systemd et redémarrent le service — alors que
+# provision_ct106.sh:46 a DÉJÀ déposé les nouvelles sources dans /opt. État résultant :
+# code neuf sur le disque, ancien processus toujours en vie, unité systemd non mise à
+# jour. Le plus exposé des 4 est audioop-lts (0.2.2 = 2025-08-05) : il n'est « déjà
+# installé » que si le venv est postérieur — ce que suggère le template Debian 13 de
+# provision_ct106.sh:13, sans le prouver.
 discord.py==2.5.2
-audioop-lts; python_version >= "3.13"
+audioop-lts==0.2.2; python_version >= "3.13"
 influxdb-client==1.45.0
 proxmoxer==2.2.0
 requests==2.32.3
 matplotlib==3.9.2
 Pillow==10.4.0
-pyte
+pyte==0.8.2
 asyncssh==2.24.0
-pyotp
-qrcode
+pyotp==2.10.0
+qrcode==8.2

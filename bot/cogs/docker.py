@@ -32,7 +32,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..core.permissions import admin_check, is_admin
+from ..core.gates import GatedView
+from ..core.permissions import admin_check
 
 log = logging.getLogger("discord-bot.docker")
 
@@ -63,14 +64,27 @@ def _emoji(item):
     return e
 
 
-class DockerPanelView(discord.ui.View):
-    """Sélecteur de conteneur + boutons d'action. Verrouillé sur l'invocateur (admin)."""
+class DockerPanelView(GatedView):
+    """Sélecteur de conteneur + boutons d'action. Verrouillé sur l'invocateur (admin).
+
+    Porte « mod » : rôle Gestion ET session 2FA revalidée à CHAQUE clic (2026-08-11).
+    Avant, seul `is_admin()` était vérifié — un panneau ouvert restait pleinement
+    opérationnel jusqu'à son expiration (900 s) après un `/2fa lock` ou une expiration
+    de session, alors que le verrouillage est censé retirer ces pouvoirs tout de
+    suite. Les identités break-glass (propriétaire du guild, ADMIN_IDS), que la
+    réconciliation des rôles ne peut pas dépouiller, étaient les seules réellement
+    concernées — c'est précisément celles qui pilotent gluetun."""
+
+    gate = "mod"
 
     def __init__(self, cog, items, owner_id):
         super().__init__(timeout=900)
         self.cog = cog
         self.items = items
         self.owner_id = owner_id
+        # la sélection est un état PARTAGÉ du message : deux admins sur le même
+        # panneau pourraient agir sur le mauvais conteneur. Chacun le sien.
+        self.gate_user_id = owner_id
         self.selected = None
         self.message = None
         self.notice = None      # bandeau d'erreur transitoire (liste non rafraîchie…)
@@ -114,19 +128,19 @@ class DockerPanelView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if not is_admin(itx.client.cfg, itx):
-            await itx.response.send_message("⛔ Réservé aux administrateurs du bot.",
-                                            ephemeral=True)
-            return False
-        if itx.user.id != self.owner_id:
-            # la sélection est un état PARTAGÉ du message : deux admins sur le même
-            # panneau pourraient agir sur le mauvais conteneur. Chacun le sien.
-            await itx.response.send_message(
-                "⛔ Ce panneau appartient à un autre admin — ouvre le tien avec `/docker`.",
-                ephemeral=True)
-            return False
-        return True
+    async def on_denied(self, itx: discord.Interaction, why):
+        """Message dédié au verrou d'invocateur (le refus de rôle/2FA reste standard)."""
+        if why != "user":
+            await super().on_denied(itx, why)
+            return
+        msg = "⛔ Ce panneau appartient à un autre admin — ouvre le tien avec `/docker`."
+        try:
+            if itx.response.is_done():
+                await itx.followup.send(msg, ephemeral=True)
+            else:
+                await itx.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     # -------------------------------------------------------------- rendu
     def build_embed(self):
@@ -220,17 +234,22 @@ class DockerPanelView(discord.ui.View):
         await self.refresh()
 
 
-class ConfirmActionView(discord.ui.View):
-    """Confirmation éphémère, verrouillée sur le cliqueur, grisée à l'expiration."""
+class ConfirmActionView(GatedView):
+    """Confirmation éphémère, verrouillée sur le cliqueur, grisée à l'expiration.
+
+    Porte « mod » comme le panneau : c'est CE clic qui déclenche réellement le
+    `docker stop`, il doit revalider rôle + session 2FA (2026-08-11). Une session
+    verrouillée entre l'ouverture du panneau et la confirmation laisse donc la
+    confirmation expirer (value reste None = action annulée)."""
+
+    gate = "mod"
 
     def __init__(self, user_id, timeout=60):
         super().__init__(timeout=timeout)
         self.user_id = user_id
+        self.gate_user_id = user_id
         self.value = None
         self.message = None   # posé par l'appelant (original_response) pour on_timeout
-
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        return itx.user.id == self.user_id
 
     def _disable(self):
         for c in self.children:

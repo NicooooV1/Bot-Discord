@@ -9,10 +9,11 @@ cross-window repeat cooldown, overflow digest, send retry queue, per-CT routing
 (mirror/move), pause flag, stats counters, graceful async close with final flush.
 
 Thread-safety: the UDP thread touches ONLY self.agg (internally locked), the
-counters (via _bump, lock-protected) and reads self.paused / self.min_sev /
-filter structures (read-only after __init__ except min_sev, an atomic int swap
-from /logstream severity). Everything else (pending, recent, channel cache)
-lives on the event loop only.
+counters (via _bump, lock-protected), self.listen_error / self._bound (une chaîne
+et un Event, écrits par le thread et lus par la boucle) et reads self.paused /
+self.min_sev / filter structures (read-only after __init__ except min_sev, an
+atomic int swap from /logstream severity). Everything else (pending, recent,
+channel cache) lives on the event loop only.
 """
 import asyncio
 import logging
@@ -24,8 +25,8 @@ from collections import OrderedDict, deque
 
 import discord
 
-from .syslog_lib import (Aggregator, SEVERITY_NAMES, SEVERITY_NUM,
-                         format_group, parse_packet, sev_fr)
+from .syslog_lib import (Aggregator, MAX_HOST, SEVERITY_NUM,
+                         format_group, parse_packet, sanitize_field, sev_fr)
 
 log = logging.getLogger("discord-bot.logstream")
 
@@ -50,6 +51,12 @@ class LiveLogStream:
         self._task = None
         self._closed = False
         self._started = False
+        # État réel de l'écoute UDP. Sans lui, un bind raté restait invisible :
+        # start() renvoyait True, /logstream stats affichait « ▶️ actif » et le
+        # salon annonçait « 📡 Flux de logs démarré » alors que RIEN n'écoutait —
+        # un silence total se lisait comme une infra calme. (2026-08-11)
+        self.listen_error = None
+        self._bound = threading.Event()   # posé par le thread : bind tranché (OK ou non)
 
         # --- filters (built once; read-only from the UDP thread afterwards) ---
         self.ignore_res = []
@@ -96,10 +103,20 @@ class LiveLogStream:
         with self._ctr_lock:
             self.counters[name] = self.counters.get(name, 0) + n
 
+    def listening(self):
+        """L'écoute UDP est-elle réellement vivante ? (bind OK ET thread en vie)"""
+        return bool(self._thread and self._thread.is_alive() and not self.listen_error)
+
     def stats(self):
         with self._ctr_lock:
             d = dict(self.counters)
         d["since_ts"] = self.since_ts
+        # Groupes jetés par le plafond de l'agrégateur (rafale de clés distinctes).
+        d["agg_dropped"] = self.agg.dropped
+        # Vérité sur l'écoute, pour que /logstream stats cesse d'afficher « actif »
+        # quand le socket n'a jamais pu être lié. (2026-08-11)
+        d["listening"] = self.listening()
+        d["listen_error"] = self.listen_error
         return d
 
     # ------------------------------------------------------------- lifecycle
@@ -117,11 +134,13 @@ class LiveLogStream:
         self._thread = threading.Thread(target=self._recv, daemon=True)
         self._thread.start()
         self._task = self.bot.loop.create_task(self._flusher())
+        # « démarrage » et non « listening » : le bind n'est pas encore tranché ici,
+        # c'est le thread qui journalise le succès ou l'échec réel. (2026-08-11)
         if self.channel_id:
-            log.info("live log stream listening on udp %s:%s -> salon %s (severity <= %s)",
+            log.info("démarrage du flux de logs udp %s:%s -> salon %s (severity <= %s)",
                      self.bind[0], self.bind[1], self.channel_id, self.min_sev)
         else:
-            log.info("live log stream listening on udp %s:%s (aucun salon cible pour "
+            log.info("démarrage du flux de logs udp %s:%s (aucun salon cible pour "
                      "l'instant — envoi en attente d'un channel_id)",
                      self.bind[0], self.bind[1])
         return True
@@ -159,7 +178,18 @@ class LiveLogStream:
         if not groups:
             return
         items = sorted(groups.values(), key=lambda g: (g["sev"], -g["count"]))
+        # « bounded » l'était dans le docstring, pas dans le code : on publiait TOUS les
+        # groupes restants, soit potentiellement des centaines de messages à l'arrêt (et
+        # autant de format_group sur la boucle). Même règle que le flush normal : les
+        # max_groups plus graves, le reste en résumé. (2026-08-11)
+        digest = None
+        if len(items) > self.max_groups:
+            folded = items[self.max_groups:]
+            items = items[:self.max_groups]
+            digest = self._overflow_digest([(g, None) for g in folded])
         lines = [format_group(g) for g in items]
+        if digest:
+            lines.append(digest)
         prefix = "⏹️ arrêt du flux — "
         buf, size, first = [], len(prefix), True
         for line in lines:
@@ -189,35 +219,57 @@ class LiveLogStream:
             s.bind(self.bind)
             s.settimeout(1.0)
         except OSError as e:
+            # Port 514 déjà pris, ou CAP_NET_BIND_SERVICE perdue après une retouche de
+            # l'unité systemd : on mémorise la panne (le flusher et /logstream stats la
+            # relaieront) au lieu de mourir en silence. (2026-08-11)
+            self.listen_error = f"bind udp {self.bind[0]}:{self.bind[1]} impossible ({e})"
             log.error("cannot bind udp %s:%s: %s", self.bind[0], self.bind[1], e)
+            self._bound.set()      # débloque le flusher, qui lira listen_error
             return
-        while not self.stop.is_set():
-            try:
-                data, addr = s.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not data:
-                continue
-            sev, host, app, text = parse_packet(data, addr[0])
-            self._bump("received")
-            if self.paused:
-                self._bump("filtered")
-                continue
-            if sev > self.sev_overrides.get(host, self.min_sev):
-                self._bump("filtered")
-                continue
-            if app and app.lower() in self.mute_programs:
-                self._bump("filtered")
-                continue
-            if self.ignore_res:
-                probe = f"{host} {app}: {text}"
-                if any(r.search(probe) for r in self.ignore_res):
-                    self._bump("filtered")
+        log.info("écoute udp %s:%s active", self.bind[0], self.bind[1])
+        self._bound.set()
+        try:
+            while not self.stop.is_set():
+                try:
+                    data, addr = s.recvfrom(65535)
+                except socket.timeout:
                     continue
-            self.agg.add(sev, host, app, text)
-        s.close()
+                except OSError as e:
+                    if not self.stop.is_set():
+                        self.listen_error = f"réception UDP interrompue ({e})"
+                        log.error("réception udp interrompue: %s", e)
+                    break
+                if not data:
+                    continue
+                try:
+                    sev, host, app, text = parse_packet(data, addr[0])
+                    self._bump("received")
+                    if self.paused:
+                        self._bump("filtered")
+                        continue
+                    if sev > self.sev_overrides.get(host, self.min_sev):
+                        self._bump("filtered")
+                        continue
+                    if app and app.lower() in self.mute_programs:
+                        self._bump("filtered")
+                        continue
+                    if self.ignore_res:
+                        probe = f"{host} {app}: {text}"
+                        if any(r.search(probe) for r in self.ignore_res):
+                            self._bump("filtered")
+                            continue
+                    self.agg.add(sev, host, app, text)
+                except Exception:
+                    # Un seul paquet pathologique ne doit pas emporter le collecteur :
+                    # sans ce filet le thread meurt, plus rien ne remonte, et le seul
+                    # signe est une trace sur stderr. (2026-08-11)
+                    log.exception("paquet syslog ignoré (traitement en erreur)")
+        finally:
+            # close() était placé après la boucle : toute sortie par exception laissait
+            # le socket ouvert (et le port 514 occupé jusqu'au redémarrage).
+            s.close()
+            if not self.stop.is_set() and not self.listen_error:
+                self.listen_error = "thread d'écoute arrêté"
 
     # ------------------------------------------------------------ event loop
 
@@ -277,10 +329,21 @@ class LiveLogStream:
         # auto-provisioning il ne l'est pas encore : on garde la boucle vivante
         # et l'envoi démarrera dès que provision._rewire aura posé channel_id.
         if self.channel_id and self.cfg.log_startup_notice:
+            # On attend le verdict du bind avant d'annoncer quoi que ce soit : annoncer
+            # « flux démarré » alors que le socket n'a pas pu être lié est le signal le
+            # plus trompeur du bot (l'exploitant lit ensuite le silence comme une infra
+            # calme). Le thread tranche en quelques µs ; 2 s est une marge. (2026-08-11)
+            await asyncio.to_thread(self._bound.wait, 2.0)
             sevname = sev_fr(self.min_sev)
-            await self._send(self.channel_id,
-                             f"📡 Flux de logs démarré (sévérité ≤ {sevname}, "
-                             f"flush {self.flush:g}s).")
+            if self.listen_error:
+                await self._send(self.channel_id,
+                                 f"⛔ Flux de logs : **écoute UDP hors service** — "
+                                 f"{self.listen_error}. Aucun log ne remontera ici tant "
+                                 f"que ce n'est pas corrigé.")
+            else:
+                await self._send(self.channel_id,
+                                 f"📡 Flux de logs démarré (sévérité ≤ {sevname}, "
+                                 f"flush {self.flush:g}s).")
         while not self.stop.is_set():
             try:
                 await asyncio.sleep(self.flush)
@@ -381,7 +444,10 @@ class LiveLogStream:
         segs = []
         for hostname, info in hosts:
             sevname = sev_fr(info["sev"])
-            seg = f"**{hostname}** x{info['count']} (pire: {sevname})"
+            # hostname vient du datagramme : même assainissement que format_group.
+            # L'échappement seul ne suffisait pas — un hôte RFC5424 peut contenir un
+            # saut de ligne et forgeait une ligne de plus dans le résumé. (2026-08-11)
+            seg = f"**{sanitize_field(hostname, MAX_HOST)}** x{info['count']} (pire: {sevname})"
             if segs and len(" · ".join(segs + [seg])) > 300:
                 break
             segs.append(seg)

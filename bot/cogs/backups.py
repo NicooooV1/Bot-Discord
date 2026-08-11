@@ -1,5 +1,5 @@
 """Backup freshness command: /backups."""
-import asyncio
+import logging
 
 import discord
 from discord import app_commands
@@ -7,6 +7,47 @@ from discord.ext import commands
 
 from ..core import format as fmt
 from ..core.permissions import read_check
+
+log = logging.getLogger("discord-bot.backups")
+
+# Rang de criticité d'une ligne « Par conteneur ». ⚠️ se compare avec la MÊME séquence
+# que celle produite plus bas : « ⚠️ » fait deux points de code (U+26A0 U+FE0F).
+_CRIT, _WARN = "❌", "⚠️"
+
+
+def _rank(line):
+    if line.startswith(_CRIT):
+        return 0
+    if line.startswith(_WARN):
+        return 1
+    return 2
+
+
+def _fit_field(lines, budget=1024):
+    """Assemble des lignes dans un champ d'embed sans dépasser la limite DURE de Discord,
+    en annonçant ce qui déborde.
+
+    2026-08-11 : `backup_ages()` trie par âge décroissant, or un invité SANS sauvegarde
+    porte la sentinelle `age_seconds = -1` (écrite par avy_metrics) : il finissait donc
+    systématiquement dans la partie coupée par l'ancien `[:1024]`. L'embed passait au
+    ROUGE sans qu'aucune ligne rouge ne soit visible, et la troncature muette coupait au
+    milieu d'une ligne."""
+    lines = sorted(lines, key=_rank)          # tri STABLE : l'ordre par âge est conservé
+    reserve = 40                              # place pour le « … +N non affichés »
+    shown, used = [], 0
+    for ln in lines:
+        add = len(ln) + (1 if shown else 0)
+        if used + add > budget - reserve:
+            break
+        shown.append(ln)
+        used += add
+    if not shown and lines:                   # une seule ligne géante : on la tronque
+        shown = [lines[0][:budget - reserve]]
+    left = len(lines) - len(shown)
+    value = "\n".join(shown)
+    if left:
+        value += f"\n… +{left} invité(s) non affiché(s)"
+    return value[:budget]
 
 
 class Backups(commands.Cog):
@@ -24,7 +65,7 @@ class Backups(commands.Cog):
             if summ:
                 emb.add_field(name="Plus ancienne",
                               value=fmt.humanize_duration(summ.get("oldest_age_seconds")), inline=True)
-                nob = int(summ.get("guests_without_backup", 0))
+                nob = int(summ.get("guests_without_backup") or 0)
                 emb.add_field(name="Sans sauvegarde", value=str(nob), inline=True)
                 if nob > 0:
                     emb.color = fmt.YELLOW
@@ -44,23 +85,26 @@ class Backups(commands.Cog):
                 sz = r.get("size_bytes")
                 szs = f" · {fmt.humanize_bytes(sz)}" if sz else ""
                 if age is None or age < 0 or not r.get("has_backup"):
-                    lines.append(f"❌ **{name}** — aucune sauvegarde")
+                    lines.append(f"{_CRIT} **{name}** — aucune sauvegarde")
                     emb.color = fmt.RED
                 else:
-                    flag = "⚠️" if age > 108000 else "✅"  # > 30 h
+                    flag = _WARN if age > 108000 else "✅"  # > 30 h
                     lines.append(f"{flag} **{name}** — il y a {fmt.humanize_duration(age)}{szs}")
             if lines:
-                emb.add_field(name="Par conteneur", value="\n".join(lines)[:1024], inline=False)
+                # tri par CRITICITÉ avant la coupe : sinon les ❌ (les seules lignes qui
+                # justifient l'embed rouge) sont les premières à disparaître.
+                emb.add_field(name="Par conteneur", value=_fit_field(lines), inline=False)
         else:
             emb.description = "⚠️ InfluxDB non configuré (`INFLUX_TOKEN`)."
         if bot.pve.enabled:
             try:
-                content = await asyncio.to_thread(bot.pve.pbs_content)
+                content = await bot.pve.apbs_content()
                 total = sum(int(i.get("size", 0) or 0) for i in content)
                 emb.set_footer(text=f"PBS « {bot.cfg.pve_pbs_storage} » : {len(content)} snapshots "
                                     f"· {fmt.humanize_bytes(total)}")
             except Exception:
-                pass
+                # le pied de page est optionnel, mais un PBS injoignable mérite une trace
+                log.warning("PBS : contenu du datastore illisible", exc_info=True)
         await itx.followup.send(embed=emb)
 
 

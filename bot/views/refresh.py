@@ -3,21 +3,23 @@ import logging
 
 import discord
 
-from ..core.permissions import admin_button_ok
+from ..core.gates import GatedView
 
 log = logging.getLogger("discord-bot.refresh")
 
 
-class RefreshView(discord.ui.View):
-    def __init__(self, bot=None):
-        super().__init__(timeout=None)  # persistent
-        self.bot = bot
+class RefreshView(GatedView):
+    """Bouton « Rafraîchir » persistant du tableau de bord.
 
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        # /dashboard est @admin_check() ; sans ceci le bouton offrait la meme
-        # charge (6 requetes Flux + rendu matplotlib) a n'importe qui, en rafale.
-        # admin_button_ok = rôle Gestion + session 2FA (répond lui-même sur refus).
-        return await admin_button_ok(itx)
+    Tier **mod** : /dashboard est @admin_check(), et le bouton offre la MÊME charge
+    (6 requêtes Flux + un rendu matplotlib) — sans porte, n'importe qui pouvait la
+    déclencher en rafale."""
+
+    gate = "mod"
+
+    def __init__(self, bot=None):
+        super().__init__(timeout=None)  # persistante
+        self.bot = bot
 
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="dash:refresh")
@@ -34,6 +36,8 @@ class RefreshView(discord.ui.View):
             await itx.followup.send("Échec du rafraîchissement.", ephemeral=True)
             return
         kwargs = {"embed": embed, "view": self}
-        if file is not None:
-            kwargs["attachments"] = [file]
+        # Les DEUX sites doivent poser attachments : sans la liste VIDE quand le rendu
+        # a échoué, Discord CONSERVE l'ancien dash.png et le bouton 🔄 réaffiche un
+        # graphe périmé sous des champs à « — » (2026-08-11).
+        kwargs["attachments"] = [file] if file is not None else []
         await itx.message.edit(**kwargs)

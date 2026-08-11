@@ -4,9 +4,14 @@ Deux sources selon la cible :
   - R820 (hôte + invités)      -> InfluxDB/telegraf (historique) ;
   - Aveyron (invités -avy et nœuds `avy:<nom>`) -> RRD de l'API PVE distante
     (cpu/mem/disk en fraction·octets, netin/netout déjà en octets/s moyens).
-Le bouton 📈 des salons appelle quick_file() : CPU+RAM 24 h en un seul PNG."""
+Le bouton 📈 des salons appelle quick_file() : CPU+RAM 24 h en un seul PNG.
+
+Les deux sources n'horodatent PAS pareil (Influx = aware UTC, RRD = naïf local) :
+`to_local()` les ramène toutes dans cfg.tz juste avant le rendu — cf. son docstring."""
 import asyncio
 import datetime as dt
+import logging
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -16,6 +21,8 @@ from ..core import format as fmt
 from ..core import render
 from ..core.permissions import read_check
 from ..core.ui import target_autocomplete
+
+log = logging.getLogger("discord-bot.graphs")
 
 RANGES = [app_commands.Choice(name=r, value=r) for r in ("1h", "6h", "24h", "7d", "30d")]
 METRICS = [app_commands.Choice(name=n, value=v) for n, v in
@@ -29,6 +36,48 @@ RRD_TF = {"1h": ("hour", 3600), "6h": ("day", 6 * 3600), "24h": ("day", 86400),
 def _scale(series, factor):
     ts, vals = series
     return ts, [(v or 0) * factor for v in vals]
+
+
+_TZ = {}
+
+
+def _tz(name):
+    """ZoneInfo mémoïsée (None si le fuseau est inconnu : on retombe sur l'heure système)."""
+    if name not in _TZ:
+        try:
+            _TZ[name] = ZoneInfo(name)
+        except Exception:            # noqa: BLE001 — tzdata absent : heure système
+            log.warning("fuseau « %s » inconnu — étiquetage des graphes en heure système", name)
+            _TZ[name] = None
+    return _TZ[name]
+
+
+def to_local(series, tzname):
+    """{label: (ts, vals)} avec des datetime NAÏFS dans le fuseau d'affichage (cfg.tz).
+
+    PIÈGE (corrigé 2026-08-11) : les deux sources n'étaient pas dans le même repère de
+    temps. InfluxDB rend des datetime AWARE en UTC, le RRD PVE des datetime NAÏFS en
+    heure locale (`fromtimestamp`), et `render.timeseries` formate l'axe avec un
+    `DateFormatter` sans `tz` — donc `rcParams['timezone']` = UTC : les aware étaient
+    convertis en UTC, les naïfs affichés tels quels. Un pic de 16 h à Paris s'étiquetait
+    « 14:00 » sur un graphe R820 et « 16:00 » sur un graphe Aveyron, impossible à
+    corréler avec un log ou une alerte Discord.
+
+    On normalise donc TOUT sur la convention majoritaire du projet (naïf, heure locale,
+    comme `fromtimestamp` ailleurs) juste avant le rendu. Idempotent : une série déjà
+    naïve (RRD) traverse sans changement, on peut l'appliquer partout sans réfléchir.
+    """
+    tz = _tz(tzname)
+    out = {}
+    for label, (ts, vals) in series.items():
+        out[label] = ([_naive_local(t, tz) for t in (ts or [])], vals)
+    return out
+
+
+def _naive_local(t, tz):
+    if isinstance(t, dt.datetime) and t.tzinfo is not None:
+        return (t.astimezone(tz) if tz else t.astimezone()).replace(tzinfo=None)
+    return t
 
 
 def _rrd_series(rows, cutoff, fn):
@@ -53,18 +102,23 @@ class Graphs(commands.Cog):
 
     # ------------------------------------------------------------- source RRD
 
-    def _avy_target(self, tgt):
+    async def _avy_target(self, tgt):
         """(kind, ident, label) si la cible est côté Aveyron, sinon None.
-        kind = 'node' (tgt « avy:<nœud> ») ou 'guest' (invité -avy)."""
+        kind = 'node' (tgt « avy:<nœud> ») ou 'guest' (invité -avy).
+
+        ASYNC parce que `guest_map()` (et `avy_nodes()` quand AVY_NODES est vide) sont
+        des appels proxmoxer SYNCHRONES : cache froid = un GET requests qui gelait la
+        boucle d'événements jusqu'à 15 s (R820) — plus aucune interaction acquittée ni
+        heartbeat gateway pendant ce temps (corrigé 2026-08-11)."""
         pve = self.bot.pve
         if not getattr(pve, "avy_enabled", False):
             return None
         if tgt.startswith("avy:"):
             node = tgt[4:]
-            if node in pve.avy_nodes():
+            if node in await pve.acall(pve.avy_nodes):
                 return ("node", node, f"{node} (Aveyron)")
         if pve.is_avy_name(tgt):
-            g = pve.guest_map().get(tgt)
+            g = (await pve.aguest_map()).get(tgt)
             if g:
                 return ("guest", g, tgt.removesuffix("-" + self.bot.cfg.avy_suffix)
                         + " (Aveyron)")
@@ -121,7 +175,7 @@ class Graphs(commands.Cog):
         tgt = target or bot.cfg.pve_node
         m = metric.value
 
-        avy = self._avy_target(tgt)
+        avy = await self._avy_target(tgt)
         if avy is not None:
             kind, ident, label = avy
             title = f"{metric.name} — {label} ({rng})"
@@ -132,7 +186,7 @@ class Graphs(commands.Cog):
                 return
             series, ylabel, pct = self._avy_build(kind, m, rows, rng)
             file = await asyncio.to_thread(render.timeseries, title, ylabel,
-                                           series, "graph.png", pct)
+                                           to_local(series, bot.cfg.tz), "graph.png", pct)
             if not file:
                 await itx.followup.send(f"Aucune donnée pour {metric.name} / {label} sur {rng}.")
                 return
@@ -166,7 +220,8 @@ class Graphs(commands.Cog):
             (rxt, rxv), (txt, txv) = await bot.influx.host_net_series("vmbr0", rng)
             series = {"RX": (rxt, rxv), "TX": (txt, txv)}
 
-        file = await asyncio.to_thread(render.timeseries, title, ylabel, series, "graph.png", pct)
+        file = await asyncio.to_thread(render.timeseries, title, ylabel,
+                                       to_local(series, bot.cfg.tz), "graph.png", pct)
         if not file:
             await itx.followup.send(f"Aucune donnée pour {metric.name} / {tgt} sur {rng}.")
             return
@@ -180,7 +235,7 @@ class Graphs(commands.Cog):
         """CPU + RAM 24 h en un PNG pour n'importe quelle cible (invité R820 via
         Influx, invité -avy ou nœud « avy:X » via RRD). (embed, file) ou (None, None)."""
         bot = self.bot
-        avy = self._avy_target(target)
+        avy = await self._avy_target(target)
         if avy is not None:
             kind, ident, label = avy
             rows = await asyncio.to_thread(self._avy_rows, kind, ident, "24h")
@@ -189,17 +244,22 @@ class Graphs(commands.Cog):
             series = {**cpu, **ram}
             title = f"CPU & RAM — {label} (24h)"
         elif bot.influx.enabled:
+            # Les deux séries sont indépendantes : une seule attente au lieu de deux
+            # (le bouton 📈 est un chemin interactif, borné à 3 s pour l'accusé).
             if target == bot.cfg.pve_node:
-                series = {"CPU": await bot.influx.host_cpu_series("24h"),
-                          "RAM": await bot.influx.host_mem_series("24h")}
+                cpu_s, ram_s = await asyncio.gather(
+                    bot.influx.host_cpu_series("24h"), bot.influx.host_mem_series("24h"))
             else:
-                series = {"CPU": _scale(await bot.influx.ct_series(target, "cpu", "24h"), 100),
-                          "RAM": await bot.influx.ct_pct_series(target, "mem", "maxmem", "24h")}
+                cpu_s, ram_s = await asyncio.gather(
+                    bot.influx.ct_series(target, "cpu", "24h"),
+                    bot.influx.ct_pct_series(target, "mem", "maxmem", "24h"))
+                cpu_s = _scale(cpu_s, 100)
+            series = {"CPU": cpu_s, "RAM": ram_s}
             title = f"CPU & RAM — {target} (24h)"
         else:
             return None, None
-        file = await asyncio.to_thread(render.timeseries, title, "%", series,
-                                       "graph.png", True)
+        file = await asyncio.to_thread(render.timeseries, title, "%",
+                                       to_local(series, bot.cfg.tz), "graph.png", True)
         if not file:
             return None, None
         emb = discord.Embed(title=title, color=fmt.BLURPLE)

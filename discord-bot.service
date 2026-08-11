@@ -12,6 +12,13 @@ User=discordbot
 Group=discordbot
 WorkingDirectory=/opt/discord-bot
 EnvironmentFile=/opt/discord-bot/config.env
+# 2026-08-11 : filet pour le cache matplotlib, à n'utiliser QUE le jour où config.env
+# perdra sa ligne MPLCONFIGDIR. ⚠️ Vérifié sur systemd 257 (Debian 13, même version que
+# CT106) : EnvironmentFile= l'emporte TOUJOURS sur Environment=, quel que soit l'ordre
+# des lignes (man systemd.exec : « Settings from these files override settings made with
+# Environment= »). Tant que config.env pose MPLCONFIGDIR=/opt/discord-bot/.mplcache,
+# c'est LUI qui gagne — d'où le ReadWritePaths ciblé plus bas. %S = /var/lib.
+Environment=MPLCONFIGDIR=%S/discord-bot/mplcache
 ExecStart=/opt/discord-bot/venv/bin/python -m bot
 Restart=always
 RestartSec=5
@@ -21,12 +28,38 @@ NoNewPrivileges=yes
 # Live log stream binds UDP/514 (privileged port):
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# ⚠️ Ne PAS ajouter PrivateUsers=yes : il annule CAP_NET_BIND_SERVICE ci-dessus, donc
+# le bind UDP/514 de bot/core/logstream.py — et la panne est SILENCIEUSE côté usage
+# (un simple log.error au démarrage, le flux de logs live meurt sans alerte).
 ProtectSystem=strict
 ProtectHome=yes
-# venv cache + mplcache + config.env + audit.log live here; state in StateDirectory:
-ReadWritePaths=/opt/discord-bot
+# 2026-08-11 : ReadWritePaths=/opt/discord-bot (tout le répertoire) RESSERRÉ au seul
+# cache matplotlib. Il rendait inscriptibles les sources bot/**.py, le venv (= l'ExecStart
+# lui-même) et config.env (tous les jetons Discord/PVE/Influx) : n'importe quelle
+# primitive d'écriture obtenue dans le bot devenait une persistance survivant aux
+# redémarrages. Plus rien d'autre n'a besoin d'écrire dans /opt — l'état vit dans
+# StateDirectory (state.json, 2fa.json, 2fa-sessions.json, audit.log — core/config.py)
+# et les graphes sont rendus en mémoire (core/render.py, BytesIO). /opt reste LISIBLE
+# (config.env, servarr-apis.json). Le commentaire précédent était périmé : audit.log
+# n'est plus là depuis le passage à StateDirectory.
+# ⚠️ TWOFA_PATH (config.env) est le SEUL chemin d'état paramétrable : s'il est un jour
+# déplacé, il doit rester sous /var/lib/discord-bot. Sinon 2fa.json ET 2fa-sessions.json
+# (dérivé de son DOSSIER, core/twofa.py:70) deviennent non écrivables : plus aucune
+# inscription 2FA possible, donc plus aucune commande utilisable. (Relecture 2026-08-11.)
+# Le « - » rend le chemin facultatif : sans lui, un .mplcache absent (CT neuf avant
+# install.sh, ou nettoyage) ferait ÉCHOUER le démarrage du service ; là, matplotlib
+# retombe simplement sur un dossier temporaire.
+# Effet de bord assumé : plus de __pycache__ (l'écriture rend EROFS, pas EACCES — Python
+# l'ignore de la même façon), .pyc recompilés à chaque démarrage.
+ReadWritePaths=-/opt/discord-bot/.mplcache
 StateDirectory=discord-bot
 StateDirectoryMode=0750
+# Les fichiers écrits par le bot dans StateDirectory contiennent les secrets TOTP :
+# 0600 par défaut plutôt que 0644 (audit.log était le seul créé en lisible-par-tous).
+UMask=0077
+# Le bot n'inspecte jamais un autre processus (le seul subprocess du code s'exécute
+# DANS la VM LLM via guest-agent) : masquer /proc des autres utilisateurs est gratuit.
+ProtectProc=invisible
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

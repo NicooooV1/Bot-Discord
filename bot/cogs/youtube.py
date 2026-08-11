@@ -32,6 +32,10 @@ Boutons réservés à celui qui a lancé le job + aux admins.
 
 Sécurité suppression : ne supprime QUE des items dont le chemin commence par
 /mnt/media/YouTube (double garde en plus du parentId de la biblio).
+Sécurité lancement (2026-08-11) : l'URL est filtrée par _valid_url() AVANT de partir
+vers ytgrab — le tier LECTURE pouvait sinon faire émettre à CT120 une requête vers
+n'importe quel hôte (SSRF quasi aveugle vers le LAN) ou faire écrire n'importe quoi
+dans /mnt/media. Défense en profondeur : ytgrab valide de son côté.
 Réseau : bot CT106 -> ytgrab CT120:8770 (pare-feu 120.fw) et Jellyfin CT105:8096.
 """
 import asyncio
@@ -49,6 +53,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from ..core import bg
+from ..core.gates import GatedView
 from ..core.permissions import admin_check, is_admin, read_check
 
 log = logging.getLogger("discord-bot.youtube")
@@ -151,6 +157,58 @@ def _playlist_intent(url):
     return bool(qs.get("list"))
 
 
+# Domaines acceptés par /yt, /tw et /musique (2026-08-11). L'URL est relayée telle
+# quelle à ytgrab, qui la donne à yt-dlp : sans liste blanche ICI, n'importe quel
+# porteur du rôle LECTURE pouvait faire émettre à CT120 une requête sortante vers un
+# hôte arbitraire — y compris interne (SSRF quasi aveugle, l'erreur revenant dans
+# l'embed) — ou faire écrire du contenu quelconque dans /mnt/media.
+# Test par SUFFIXE de domaine : un `in {...}` strict casserait les sous-domaines
+# réellement utilisés (m., music., clips., player.).
+_ALLOWED_SUFFIXES = ("youtube.com", "youtu.be", "youtube-nocookie.com", "twitch.tv")
+
+# Aucune URL YouTube/Twitch légitime n'approche cette longueur ; la borne évite en prime
+# de dépasser les 4096 caractères de description d'embed avec le « [Lien](...) ».
+_MAX_URL = 500
+
+# Caractères qui n'apparaissent JAMAIS dans une URL YouTube/Twitch légitime et qui
+# rendraient la liste blanche INOPÉRANTE (2026-08-11) :
+#  - blancs et caractères de contrôle : urlparse RETIRE lui-même \t \r \n avant
+#    d'analyser (_UNSAFE_URL_BYTES_TO_REMOVE), si bien que « https://www.you<TAB>tube.com/… »
+#    était déclaré valide alors que c'est la chaîne BRUTE, différente, qui part vers
+#    ytgrab : on validait une URL et on en envoyait une autre ;
+#  - parenthèses : l'URL est rendue telle quelle dans « [Lien](url) ». Une « ) » referme
+#    le lien et laisse écrire du markdown arbitraire — un lien de hameçonnage posté par
+#    le BOT dans un salon public, à la portée du seul tier LECTURE.
+_UNSAFE_URL_CHARS = re.compile(r"[\s()<>\x00-\x1f\x7f]")
+
+
+def _valid_url(u):
+    """True si `u` est un lien http(s) vers un domaine YouTube/Twitch autorisé.
+
+    Rejette au passage tout ce qui n'a pas de schéma http(s) : « --exec=… », « file:// »,
+    « http://10.3.20.x », etc. — la validation d'entrée est de notre côté, pas déléguée.
+
+    ⚠️ Le contrôle porte sur la chaîne DÉJÀ normalisée (`.strip()`) : l'appelant doit
+    transmettre cette même chaîne à ytgrab, sinon la garde ne garde rien (cf.
+    _start_download).
+    """
+    if not isinstance(u, str):
+        return False
+    u = u.strip()
+    if not u or len(u) > _MAX_URL:
+        return False
+    if _UNSAFE_URL_CHARS.search(u):
+        return False
+    try:
+        p = urllib.parse.urlparse(u)
+    except ValueError:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").lower().rstrip(".")
+    return any(host == s or host.endswith("." + s) for s in _ALLOWED_SUFFIXES)
+
+
 def _strip_playlist(url):
     """« watch?v=X&list=Y » -> URL de la vidéo SEULE (None si pas de vidéo isolable)."""
     try:
@@ -169,8 +227,19 @@ def _delay_label(hours):
     return _fmt_delay(hours)
 
 
-class DownloadView(discord.ui.View):
-    """⏸️/▶️ + ⏹️ sous la barre de progression. Réservé au lanceur et aux admins."""
+class DownloadView(GatedView):
+    """⏸️/▶️ + ⏹️ sous la barre de progression. Réservé au lanceur et aux admins.
+
+    Porte « read » (2026-08-11) : /yt est ouvert au tier LECTURE, donc l'auteur d'un job
+    peut n'avoir que ce rôle — exiger « mod » lui retirerait le pilotage de SON propre
+    téléchargement. La porte apporte surtout la session 2FA : la vue a timeout=None et
+    restait cliquable bien après l'expiration de la session (le 2FA a été généralisé aux
+    BOUTONS le 2026-07-16, cette vue était restée à l'écart).
+    ⚠️ `gate_user_id` n'est PAS posé : il verrouillerait la vue sur le seul lanceur, alors
+    que le modèle documenté ouvre aussi le pilotage aux admins (voir interaction_check).
+    """
+
+    gate = "read"
 
     def __init__(self, cog, jid, owner_id):
         super().__init__(timeout=None)
@@ -179,6 +248,9 @@ class DownloadView(discord.ui.View):
         self.owner_id = owner_id
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
+        # porte commune d'abord (tier lecture + session 2FA), puis la règle propre à la vue
+        if not await super().interaction_check(itx):
+            return False
         if itx.user.id == self.owner_id or is_admin(itx.client.cfg, itx):
             return True
         await itx.response.send_message(
@@ -215,19 +287,30 @@ class DownloadView(discord.ui.View):
         actor = itx.user.display_name
         r = await self.cog._yt("POST", f"/jobs/{self.jid}/cancel",
                                {"actor": actor, "delete_partial": True})
-        if not r or r.get("error"):
-            await itx.followup.send(
-                f"⚠️ {(r or {}).get('error', 'ytgrab injoignable')}", ephemeral=True)
+        err = r.get("error") if r else "ytgrab injoignable"
+        # l'arrêt supprime les résidus partiels : il mérite la même trace append-only que
+        # le lancement (2026-08-11 — `actor` seul est un display_name, pas une identité).
+        self.cog.bot.audit.record(
+            user=f"{itx.user} ({itx.user.id})", action="yt-cancel",
+            target=f"job {self.jid}", result=f"error: {str(err)[:120]}" if err else "ok")
+        if err:
+            await itx.followup.send(f"⚠️ {err}", ephemeral=True)
         else:
             log.info("téléchargement %s arrêté par %s", self.jid, actor)
 
 
-class PlaylistConfirmView(discord.ui.View):
+class PlaylistConfirmView(GatedView):
     """Confirmation APRÈS annonce de la taille totale d'une playlist.
 
     choice : "full" (toute la playlist) / "single" (l'élément isolé, si l'URL était
     watch?v=…&list=…) / None (annulé ou expiré). Réservée au demandeur + admins.
+
+    Porte « read » (2026-08-11), même raisonnement que DownloadView : le demandeur peut
+    n'avoir que le tier LECTURE, et le bouton « Toute la playlist » lance plusieurs Gio
+    de téléchargement — il mérite la session 2FA comme le reste du bot.
     """
+
+    gate = "read"
 
     def __init__(self, owner_id, single_url=None, timeout=300):
         super().__init__(timeout=timeout)
@@ -239,6 +322,8 @@ class PlaylistConfirmView(discord.ui.View):
             self.remove_item(self.single_btn)
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
+        if not await super().interaction_check(itx):
+            return False
         if itx.user.id == self.owner_id or is_admin(itx.client.cfg, itx):
             return True
         await itx.response.send_message("⛔ Ce n'est pas ta demande.", ephemeral=True)
@@ -285,8 +370,18 @@ class YouTube(commands.Cog):
         self.autodelete.start()
         # filet anti-restart : si le bot est tombé pendant un download lancé avec un
         # délai spécifique, le job ytgrab (qui porte `del_hours`) a fini sans _track ->
-        # on rejoue l'enregistrement des délais manquants au démarrage.
-        asyncio.create_task(self._reconcile_delays())
+        # on rejoue l'enregistrement des délais manquants au démarrage. La réconciliation
+        # est REJOUÉE à chaque cycle d'autodelete (2026-08-11) : au démarrage seul, un job
+        # encore actif n'était jamais rattrapé.
+        # bg.spawn et non create_task : sans référence forte le GC peut ramasser la tâche.
+        bg.spawn(self._reconcile_at_start(), name="youtube:reconcile", logger=log)
+
+    async def _reconcile_at_start(self):
+        """Réconciliation du démarrage. L'attente du READY reste ICI et PAS dans
+        _reconcile_delays : appelée depuis autodelete, elle bloquerait le cycle de
+        suppression pendant une reconnexion Discord (2026-08-11)."""
+        await self.bot.wait_until_ready()
+        await self._reconcile_delays()
 
     def _migrate_delays_to_hours(self):
         """Migre l'ancienne unité JOURS -> HEURES (2026-07-16). Idempotent."""
@@ -400,28 +495,52 @@ class YouTube(commands.Cog):
         return f"auto-suppression dans {_fmt_delay(h)} si non regardé{suffix}"
 
     async def _reconcile_delays(self):
-        """Au démarrage : ré-enregistre les délais des jobs terminés pendant que le
-        bot était éteint (couvre le cas « /yt … suppression:jamais » + redéploiement).
+        """Ré-enregistre les délais des fichiers livrés par des jobs qu'aucun _track ne
+        suit plus (bot redémarré pendant le téléchargement).
+
+        Appelée au démarrage ET à chaque cycle d'autodelete (2026-08-11) : au démarrage
+        seul, un job ENCORE ACTIF à cet instant n'était jamais rattrapé — il finissait
+        sans _track, son `del_hours` n'était jamais écrit, et « suppression:jamais »
+        retombait en silence sur le réglage global (donc suppression au bout de 4 j).
+        Les jobs actifs ne sont plus filtrés : leurs fichiers DÉJÀ terminés sont exposés
+        dans `files` (comme le montre l'affichage « n terminé(s) » du suivi) et peuvent
+        être clés dès maintenant.
         Limite connue : si ytgrab a AUSSI redémarré, ses jobs en RAM sont perdus."""
-        await self.bot.wait_until_ready()
         jobs = await self._yt("GET", "/jobs")
         if not isinstance(jobs, list):
             return
-        d = self._delays()
-        dirty = False
+        found = {}
         for j in jobs:
-            if j.get("kind") == "audio" or j.get("del_hours") is None:
+            if not isinstance(j, dict) or j.get("kind") == "audio":
                 continue
-            if j.get("state") not in ("done", "error", "cancelled"):
-                continue
+            try:
+                hours = int(j["del_hours"])
+            except (TypeError, KeyError, ValueError):
+                continue          # pas de délai spécifique (ou champ hors contrat)
+            # `ts` DOIT rester un flottant epoch, comme celui de _store_delays : la purge
+            # des délais orphelins d'autodelete le compare à `time.time() - 7 j`. Un
+            # `finished` sérialisé en ISO-8601 par ytgrab (format jamais spécifié de notre
+            # côté) y lèverait « str < float » et tuerait la boucle d'auto-suppression —
+            # d'autant plus probable que la réconciliation tourne désormais tous les
+            # cycles et non plus une seule fois au démarrage. (2026-08-11)
+            try:
+                ts = float(j.get("finished"))
+            except (TypeError, ValueError):
+                ts = time.time()
             for rel in j.get("files") or []:
-                if rel not in d:
-                    d[rel] = {"hours": int(j["del_hours"]), "ts": j.get("finished") or time.time()}
-                    dirty = True
-        if dirty:
+                found[rel] = {"hours": hours, "ts": ts}
+        # lecture FRAÎCHE avant écriture : le GET ci-dessus contient un await pendant
+        # lequel un _store_delays (fin de download) a pu écrire — repartir de la photo
+        # d'avant effacerait son entrée (lost update).
+        d = self._delays()
+        added = 0
+        for rel, entry in found.items():
+            if rel not in d:
+                d[rel] = entry
+                added += 1
+        if added:
             self.bot.state.set("yt_delays", d)
-            log.info("délais /yt réconciliés après redémarrage (%d job(s))",
-                     sum(1 for j in jobs if j.get("del_hours") is not None))
+            log.info("délais /yt réconciliés : %d fichier(s) rattrapé(s)", added)
 
     # ---------------------------------------------------------------- commandes
     @app_commands.command(name="yt", description="Télécharger une vidéo, rediff ou playlist YouTube/Twitch dans Jellyfin")
@@ -510,9 +629,10 @@ class YouTube(commands.Cog):
                 msg = await itx.channel.send(embed=emb, view=view)   # vrai Message = pas de péremption
             except discord.HTTPException:
                 continue
-            asyncio.create_task(self._track(msg, jid, url, view, j.get("actor", "?"),
-                                            hours=j.get("del_hours"), audio=audio,
-                                            playlist=bool(j.get("playlist"))))
+            bg.spawn(self._track(msg, jid, url, view, j.get("actor", "?"),
+                                 hours=j.get("del_hours"), audio=audio,
+                                 playlist=bool(j.get("playlist"))),
+                     name=f"youtube:track:{jid}", logger=log)
 
     # ---------------------------------------------------------------- lancement
     @staticmethod
@@ -521,6 +641,17 @@ class YouTube(commands.Cog):
 
     async def _start_download(self, itx: discord.Interaction, url: str, *,
                               audio=False, hours=None):
+        # `url` est normalisée UNE fois, puis c'est CETTE chaîne qui circule partout :
+        # valider une copie (.strip()) et relayer l'originale rouvrait l'écart entre la
+        # valeur contrôlée et celle envoyée à ytgrab (2026-08-11).
+        url = url.strip() if isinstance(url, str) else ""
+        # Liste blanche AVANT tout effet de bord — et avant le defer, pour répondre en
+        # éphémère sans laisser un « le bot réfléchit… » public en suspens (2026-08-11).
+        if not _valid_url(url):
+            await itx.response.send_message(
+                "⛔ Seuls les liens **YouTube** et **Twitch** en http(s) sont acceptés "
+                "(et de moins de 500 caractères).", ephemeral=True)
+            return
         await itx.response.defer()
         if _playlist_intent(url):
             await self._flow_playlist(itx, url, audio=audio, hours=hours)
@@ -535,19 +666,42 @@ class YouTube(commands.Cog):
     async def _launch(self, msg, url, user, *, audio, playlist, hours):
         """POST /download puis transforme `msg` en panneau de progression suivi."""
         actor = user.display_name
+        action = "yt-musique" if audio else "yt-download"
+        # Défense en profondeur (2026-08-11) : _launch et _probe sont les deux SEULS
+        # points qui parlent vraiment à ytgrab. La garde est répétée ici parce que
+        # _flow_playlist rejoue une URL (« cet élément seul ») bien après le contrôle
+        # d'entrée de _start_download.
+        if not _valid_url(url):
+            emb = discord.Embed(title=self._title(audio), color=0xE74C3C)
+            emb.add_field(name="⛔ Lien refusé",
+                          value="Seuls les liens YouTube et Twitch en http(s) sont acceptés.",
+                          inline=False)
+            self.bot.audit.record(user=f"{user} ({user.id})", action=action,
+                                  target=str(url)[:200], result="refusé: lien non autorisé")
+            await self._safe_edit(msg, emb, None)
+            return
         # `del_hours` voyage avec le JOB ytgrab : il survit ainsi à un restart du bot
         # (relu par /dl et par la réconciliation du démarrage).
         r = await self._yt("POST", "/download",
                            {"url": url, "actor": actor, "audio": audio,
                             "playlist": playlist, "del_hours": hours})
         if not r or r.get("error") or "id" not in r:
+            # `or` et non un défaut de .get() : ytgrab peut renvoyer error=None
+            # (embed avec un champ vide -> 400 côté Discord).
+            why = (r or {}).get("error") or "service injoignable"
             emb = discord.Embed(title=self._title(audio), color=0xE74C3C,
                                 description=f"[Lien]({url})")
-            emb.add_field(name="⚠️ Impossible de lancer",
-                          value=(r or {}).get("error", "service injoignable"), inline=False)
+            emb.add_field(name="⚠️ Impossible de lancer", value=str(why)[:1024], inline=False)
+            self.bot.audit.record(user=f"{user} ({user.id})", action=action,
+                                  target=url[:200], result=f"error: {str(why)[:120]}")
             await self._safe_edit(msg, emb, None)
             return
         jid = r["id"]
+        # _launch est l'entonnoir UNIQUE (/yt, /tw, /musique, les trois branches playlist
+        # et /dl) : un seul enregistrement y couvre tout sans doublon. `actor` est un
+        # display_name modifiable — seule cette ligne porte un user id stable (2026-08-11).
+        self.bot.audit.record(user=f"{user} ({user.id})", action=action,
+                              target=url[:200], result=f"job {jid}")
         emb = discord.Embed(title=self._title(audio), description=f"[Lien]({url})",
                             color=0xE5A50A)
         emb.add_field(name="État", value="En file d'attente…", inline=False)
@@ -555,15 +709,23 @@ class YouTube(commands.Cog):
         view = DownloadView(self, jid, user.id)
         view.sync("queued")
         await self._safe_edit(msg, emb, view)
-        asyncio.create_task(self._track(msg, jid, url, view, actor,
-                                        hours=hours, audio=audio, playlist=playlist))
+        bg.spawn(self._track(msg, jid, url, view, actor,
+                             hours=hours, audio=audio, playlist=playlist),
+                 name=f"youtube:track:{jid}", logger=log)
 
     # ---------------------------------------------------------------- playlists
     async def _probe(self, url, audio):
+        # même garde que _launch : le sondage fait DÉJÀ sortir une requête de CT120
+        # vers l'hôte visé (2026-08-11).
+        if not _valid_url(url):
+            return {"state": "error",
+                    "error": "lien non autorisé (YouTube/Twitch en http(s) uniquement)"}
         r = await self._yt("POST", "/probe", {"url": url, "audio": audio})
         if not r or r.get("error") or "id" not in r:
+            # `or` et non un défaut de .get() : une réponse « error: null » (ou sans « id »)
+            # renvoyait error=None, alors que le contrat de _probe est une chaîne.
             return {"state": "error",
-                    "error": (r or {}).get("error", "service injoignable")}
+                    "error": (r or {}).get("error") or "service injoignable"}
         pid = r["id"]
         for _ in range(150):                    # 150 × 2 s = 5 min max
             await asyncio.sleep(2)
@@ -586,8 +748,11 @@ class YouTube(commands.Cog):
         if not p or p.get("state") != "done":
             emb = discord.Embed(title="❌ Sondage impossible", color=0xE74C3C,
                                 description=f"[Lien]({url})")
+            # `or` : un sondage en erreur peut porter error=None -> None[:300] planterait
+            # la commande au lieu d'afficher l'échec (2026-08-11).
             emb.add_field(name="Erreur",
-                          value=f"`{(p or {}).get('error', 'inconnue')[:300]}`", inline=False)
+                          value=f"`{str((p or {}).get('error') or 'inconnue')[:300]}`",
+                          inline=False)
             await self._safe_edit(msg, emb, None)
             return
         if not p.get("playlist"):
@@ -669,7 +834,13 @@ class YouTube(commands.Cog):
             await asyncio.sleep(POLL_SECONDS)
             j = await self._yt("GET", f"/jobs/{jid}")
             if j is None:
-                continue       # ytgrab injoignable -> transitoire, on réessaie
+                # ytgrab injoignable -> transitoire, on réessaie. Mais on CONSOMME du
+                # budget (2026-08-11) : sans ça, un CT120 éteint rendait la tâche de
+                # suivi immortelle (le garde-fou des ~10 h était neutralisé exactement
+                # dans le cas où il sert) et chaque /yt d'avant la panne laissait un
+                # poller à vie occupant un thread du pool partagé de to_thread.
+                budget -= 1
+                continue
             if "state" not in j:
                 # _yt renvoie le CORPS d'une erreur HTTP (ex. 404 « job inconnu ») : ce n'est
                 # PAS un job. Un 404 franc = ytgrab a redémarré et _sweep_orphans a tué le
@@ -821,6 +992,14 @@ class YouTube(commands.Cog):
     # ---------------------------------------------------------------- auto-delete
     @tasks.loop(minutes=15)
     async def autodelete(self):
+        # Rattrapage des délais AVANT de décider des suppressions : un job encore en cours
+        # au démarrage du bot n'était réconcilié nulle part, et son « suppression:jamais »
+        # se perdait (2026-08-11). Encadré : une réconciliation en échec ne doit pas
+        # empêcher le cycle de suppression (ni tuer la boucle).
+        try:
+            await self._reconcile_delays()
+        except Exception:  # noqa: BLE001
+            log.exception("autodelete: réconciliation des délais en échec")
         lib = await self._youtube_lib_id()
         if not lib:
             return
@@ -903,7 +1082,17 @@ class YouTube(commands.Cog):
         # pour ceux qui attendent leur premier scan). Le listing a réussi pour TOUS
         # les users (sinon on a `return` plus haut), biblio vide comprise.
         for key in list(cur):
-            if key not in known and ((cur[key] or {}).get("ts") or 0) < cut:
+            if key in known:
+                continue
+            # `ts` relu défensivement (2026-08-11) : state.json peut contenir des entrées
+            # héritées d'un `finished` non numérique, et « str < float » lèverait ici —
+            # dans le corps NON encadré de la boucle, donc auto-suppression morte jusqu'au
+            # prochain redémarrage. Une entrée hors contrat est traitée comme périmée.
+            try:
+                ts = float((cur[key] or {}).get("ts") or 0)
+            except (TypeError, ValueError, AttributeError):
+                ts = 0.0
+            if ts < cut:
                 cur.pop(key, None)
                 dirty = True
         if dirty:
@@ -941,12 +1130,15 @@ class YouTube(commands.Cog):
             try:
                 ch = await guild.create_text_channel(NOTICE_CHANNEL, category=cat,
                                                      topic="Téléchargements YouTube à la demande (/yt)")
-            except discord.HTTPException:
+            except discord.HTTPException as e:
+                # ne pas avaler : sans ce salon, une suppression automatique reste
+                # totalement invisible pour l'utilisateur (2026-08-11).
+                log.warning("salon #%s introuvable et non créable: %s", NOTICE_CHANNEL, e)
                 return
         try:
             await ch.send(text)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            log.warning("notification /yt non envoyée dans #%s: %s", NOTICE_CHANNEL, e)
 
 
 async def setup(bot):

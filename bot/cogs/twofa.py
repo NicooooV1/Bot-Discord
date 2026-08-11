@@ -16,9 +16,16 @@ import qrcode
 from discord import app_commands
 from discord.ext import commands
 
+from ..core.gates import GatedView
+from ..core.twofa import TwoFAStoreError
 from ..views.twofa_view import CodeModal
 
 log = logging.getLogger("discord-bot.twofa")
+
+# Description d'embed = 4096 caractères max côté Discord. Au-delà, l'envoi part en 400 et
+# PERSONNE ne peut plus s'inscrire (seule porte du 2FA) : on garde de la marge pour le
+# texte qui entoure le QR et on retombe sur la saisie manuelle de la clé si besoin.
+QR_MAX = 3000
 
 
 def _qr_ascii(uri):
@@ -42,8 +49,11 @@ async def _audit_2fa(bot, user, event):
     try:
         await ch.send(f"🔐 **{event}** — {user} (`{user.id}`) · <t:{int(time.time())}:R>",
                       allowed_mentions=discord.AllowedMentions.none())
-    except discord.HTTPException:
-        pass
+    except Exception as e:  # noqa: BLE001 — 2026-08-11 : un aiohttp.ClientError ou un
+        # TimeoutError n'est PAS une HTTPException et remontait jusqu'au callback de
+        # modale, empêchant l'affichage des codes de secours. Le docstring dit
+        # « best-effort » : on tient parole, en journalisant quand même.
+        log.warning("2fa: journal #logs-2fa indisponible (%s): %s", event, e)
 
 
 class TwoFACog(commands.Cog):
@@ -64,12 +74,22 @@ class TwoFACog(commands.Cog):
 
         label = f"{itx.user.name}"
         secret, uri = tf.begin_enroll(itx.user.id, label)
+        # Le QR est un CONFORT : s'il est trop gros pour un embed (limite 4096) ou si le
+        # rendu échoue, on garde la clé à saisir à la main plutôt que de faire tomber
+        # l'inscription — c'est la seule porte d'entrée du 2FA (2026-08-11).
+        try:
+            bloc = f"```\n{_qr_ascii(uri)}\n```\n"
+            if len(bloc) > QR_MAX:
+                raise ValueError(f"QR trop volumineux ({len(bloc)} caractères)")
+        except Exception as e:  # noqa: BLE001
+            log.warning("2fa: QR non rendu (%s) — repli sur la clé manuelle", e)
+            bloc = "_(QR indisponible — utilise la clé ci-dessous.)_\n"
         emb = discord.Embed(
             title="🔐 Inscription 2FA",
             description=(
                 "**1.** Scanne ce QR avec ton application d'authentification "
                 "(Aegis, Google Authenticator, Bitwarden…)\n"
-                f"```\n{_qr_ascii(uri)}\n```\n"
+                f"{bloc}"
                 "**2.** Si le QR ne passe pas, saisis la clé à la main :\n"
                 f"||`{secret}`||\n\n"
                 "**3.** Clique sur **Confirmer** et entre le code affiché."),
@@ -135,43 +155,74 @@ class TwoFACog(commands.Cog):
 
         async def done(i: discord.Interaction, code: str):
             if not tf.verify(i.user.id, code):
-                await i.response.send_message("❌ Code invalide.", ephemeral=True)
+                await i.response.send_message("❌ Code invalide ou déjà utilisé.",
+                                              ephemeral=True)
                 return
-            tf.revoke(i.user.id)
-            log.warning("2fa: desinscription de %s", i.user)
-            await _audit_2fa(self.bot, i.user, "Désinscription")
+            try:
+                tf.revoke(i.user.id)
+            except TwoFAStoreError as e:
+                # Désinscription ANNULÉE côté magasin : le dire, sinon l'utilisateur
+                # croirait son 2FA retiré alors qu'il revient au prochain redémarrage.
+                log.error("2fa: desinscription de %s NON enregistrée: %s", i.user, e)
+                await i.response.send_message(
+                    "❌ Désinscription **non enregistrée** (erreur d'écriture côté bot) — "
+                    "ton 2FA reste actif. Préviens Nico.", ephemeral=True)
+                return
             msg = "🔓 2FA désactivé pour ton compte."
             if self.bot.cfg.twofa_enabled:
                 msg += ("\n⚠️ Le bot exige toujours le 2FA : sans inscription tu ne pourras "
                         "plus lancer **aucune** commande. Refais `/2fa setup` tout de suite.")
+            # RÉPONDRE D'ABORD (budget de 3 s d'une modale), journaliser ensuite : le
+            # ch.send() de _audit_2fa est un appel réseau qui, lent, ferait expirer le
+            # jeton d'interaction alors que la désinscription a bien eu lieu. Même ordre
+            # que `unlock` (2026-08-11).
             await i.response.send_message(msg, ephemeral=True)
+            log.warning("2fa: desinscription de %s", i.user)
+            await _audit_2fa(self.bot, i.user, "Désinscription")
 
         await itx.response.send_modal(CodeModal("Confirmer la désinscription", done))
 
 
-class _ConfirmView(discord.ui.View):
-    """Bouton « Confirmer » de l'inscription."""
+class _ConfirmView(GatedView):
+    """Bouton « Confirmer » de l'inscription.
+
+    gate=None ASSUMÉ : c'est la porte d'entrée du 2FA elle-même (comme la famille `/2fa`,
+    exemptée par TWOFA_EXEMPT). Exiger une session 2FA ici rendrait toute PREMIÈRE
+    inscription impossible — la clé serait enfermée à l'intérieur. La vue reste bornée à
+    son destinataire par `gate_user_id` (message éphémère, mais un id d'interaction fuité
+    ne doit pas permettre à un tiers de confirmer l'inscription à sa place)."""
+
+    gate = None
+    gate_reason = ("bouton d'inscription au 2FA : exiger une session 2FA ici rendrait "
+                   "toute première inscription impossible (poule et œuf)")
 
     def __init__(self, owner_id):
         super().__init__(timeout=300)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        return itx.user.id == self.owner_id
+        self.gate_user_id = owner_id
 
     @discord.ui.button(label="Confirmer", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, itx: discord.Interaction, _b: discord.ui.Button):
         tf = itx.client.twofa
 
         async def done(i: discord.Interaction, code: str):
-            backup = tf.confirm_enroll(i.user.id, code)
-            if backup is None:
+            try:
+                backup = tf.confirm_enroll(i.user.id, code)
+            except TwoFAStoreError as e:
+                # NE PAS dire « code invalide » : l'utilisateur irait régler l'heure de son
+                # téléphone pour une panne d'écriture. L'inscription a été annulée côté
+                # magasin, le QR reste valable pour un nouveau clic (2026-08-11).
+                log.error("2fa: inscription de %s NON enregistrée: %s", i.user, e)
                 await i.response.send_message(
-                    "❌ Code invalide. Vérifie l'heure de ton téléphone puis relance `/2fa setup`.",
+                    "❌ Inscription **non enregistrée** (erreur d'écriture côté bot). "
+                    "Réessaie dans un instant ; si ça persiste, préviens Nico.",
                     ephemeral=True)
                 return
+            if backup is None:
+                await i.response.send_message(
+                    "❌ Code invalide ou déjà utilisé. Vérifie l'heure de ton téléphone "
+                    "puis relance `/2fa setup`.", ephemeral=True)
+                return
             log.info("2fa: inscription confirmee pour %s", i.user)
-            await _audit_2fa(i.client, i.user, "Inscription confirmée")
             emb = discord.Embed(
                 title="✅ 2FA activé",
                 description=(
@@ -183,7 +234,19 @@ class _ConfirmView(discord.ui.View):
                 color=0x2ECC71)
             emb.set_footer(text="En dernier recours : TWOFA_ENABLED=false dans "
                                 "/opt/discord-bot/config.env + redémarrage du bot.")
-            await i.response.send_message(embed=emb, ephemeral=True)
+            # RÉPONDRE D'ABORD, auditer ensuite : les codes ne sont rendus qu'UNE fois et
+            # ne sont pas restituables. Un ch.send() lent avant la réponse ferait expirer
+            # le jeton (3 s) et les perdrait définitivement. Repli en MP si l'envoi
+            # échoue quand même — c'est la seule copie (2026-08-11).
+            try:
+                await i.response.send_message(embed=emb, ephemeral=True)
+            except discord.HTTPException as e:
+                log.warning("2fa: embed des codes de secours non envoyé (%s) — repli MP", e)
+                try:
+                    await i.user.send(embed=emb)
+                except discord.HTTPException:
+                    log.error("2fa: codes de secours PERDUS pour %s (MP fermés)", i.user)
+            await _audit_2fa(i.client, i.user, "Inscription confirmée")
 
         await itx.response.send_modal(CodeModal("Confirmer l'inscription", done))
 

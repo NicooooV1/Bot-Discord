@@ -49,20 +49,33 @@ class Hardware(commands.Cog):
             if not ctrl.get("vd_optimal") or not ctrl.get("batt_good"):
                 color = fmt.RED
         if summ:
+            # valeurs Influx en float : int(None) lèverait, int("4") passerait
             emb.add_field(name="Disques",
-                          value=f"{int(summ.get('disks_online', 0))}/{int(summ.get('disks_total', 0))} online",
+                          value=f"{int(float(summ.get('disks_online') or 0))}/"
+                                f"{int(float(summ.get('disks_total') or 0))} online",
                           inline=True)
         if disks:
-            lines, worst = [], 0
+            lines, worst, offline_slots = [], 0, []
             for d in disks:
                 gd = int(d.get("grown_defects", 0) or 0)
                 worst = max(worst, gd)
                 flag = "⚠️" if gd >= 100 else ("•" if gd else "✅")
                 offline = "" if d.get("online") else " **(offline!)**"
+                if offline:
+                    offline_slots.append(str(d.get("slot")))
                 lines.append(f"{flag} slot {d.get('slot')}: {gd} grown{offline}")
             emb.add_field(name="Secteurs réalloués (grown defects)",
                           value="\n".join(lines)[:1024], inline=False)
-            if worst >= 100 and color != fmt.RED:
+            if offline_slots:
+                # 2026-08-11 : un disque tombé alors que le VD reste « optimal » (hot
+                # spare déjà reconstruit) laissait l'embed VERT — il fallait repérer le
+                # « **(offline!)** » au milieu de la liste des slots. C'est justement le
+                # cas où l'alerte doit sauter aux yeux. /alerts et /status le classaient
+                # déjà en « crit » ; seul l'habillage de /raid était aveugle.
+                color = fmt.RED
+                emb.description = (f"❌ **{len(offline_slots)} disque(s) offline** — "
+                                   f"slot(s) {', '.join(offline_slots[:8])}")
+            elif worst >= 100 and color != fmt.RED:
                 color = fmt.YELLOW
         emb.color = color
         await itx.followup.send(embed=emb)

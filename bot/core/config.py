@@ -29,6 +29,33 @@ def _bool(v, default=False):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _verify_ssl(v, default=False):
+    """Valeur `verify_ssl` transmise à proxmoxer -> requests.Session.verify : un booléen,
+    OU le CHEMIN d'un bundle CA (accepté tel quel s'il existe) pour authentifier
+    l'hyperviseur sans dépendre du magasin du CT (2026-08-11).
+
+    ⚠️ Le défaut reste False à dessein : le certificat de PVE est auto-signé et ne porte
+    pas l'IP en SAN. Passer à true SANS avoir d'abord régénéré/étendu le certificat
+    (`pvenode cert`) ou pointé PVE_HOST sur un nom couvert ferait échouer TOUS les appels
+    (hostname mismatch) — c'est-à-dire couper le bot.
+
+    ⚠️ PIÈGE (relecture 2026-08-11) : cette valeur n'est PAS lue que par proxmoxer.
+    cogs/terminal.py construit son propre contexte SSL avec `if not cfg.pve_verify_ssl:
+    CERT_NONE` — un CHEMIN est vrai, donc la console termproxy repasserait au magasin CA
+    du système, qui ne connaît pas le CA de PVE : plus de shell root. Avant de renseigner
+    un chemin ici, terminal.py doit faire
+    `ssl.create_default_context(cafile=cfg.pve_verify_ssl if isinstance(cfg.pve_verify_ssl, str) else None)`."""
+    s = str(v or "").strip()
+    if s.startswith("/"):
+        if os.path.exists(s):
+            return s
+        # sinon on retomberait sur False EN SILENCE (faute de frappe dans le chemin =
+        # TLS non vérifié sans que rien ne le dise) — 2026-08-11
+        _log.error("verify_ssl=%r : bundle CA INTROUVABLE -> TLS NON vérifié", s)
+        return default
+    return _bool(v, default)
+
+
 class Config:
     def __init__(self, env=None):
         e = env if env is not None else os.environ
@@ -55,8 +82,18 @@ class Config:
         # une instance secondaire (false) ne gère QUE son serveur.
         self.server_key = g("SERVER_KEY", "R820").strip()
         self.is_primary = _bool(g("IS_PRIMARY"), True)
-        # serveur dont dépend le salon du NŒUD (catégorie Lock) — 1er par défaut.
-        self.node_server_key = g("NODE_SERVER_KEY", next(iter(self.gestion_servers), ""))
+        # Serveur dont dépend le salon du NŒUD (catégorie Lock, boutons du salon
+        # hyperviseur dont 💾 vzdump de TOUS les invités, portail #demandes, shell root SSH).
+        # ⚠️ Le repli était `next(iter(GESTION_SERVERS))` : RÉORDONNER la variable
+        # d'environnement (ou y ajouter une entrée en tête) transférait silencieusement ces
+        # trois pouvoirs aux rôles M/O d'un AUTRE serveur. Repli désormais sur SERVER_KEY
+        # (le serveur de CETTE instance, « R820 » par défaut), et clé inconnue = AUCUN rôle
+        # ne l'obtient — propriétaire du guild / ADMIN_IDS seuls (2026-08-11).
+        self.node_server_key = g("NODE_SERVER_KEY", "").strip() or self.server_key
+        if self.node_server_key not in self.gestion_servers:
+            _log.error("NODE_SERVER_KEY=%r absent de GESTION_SERVERS -> catégorie Lock, "
+                       "boutons du salon-nœud et console du nœud SANS rôle "
+                       "(propriétaire/ADMIN_IDS seuls)", self.node_server_key)
         _ns = self.gestion_servers.get(self.node_server_key, {})
         self.node_view_role_id = _ns.get("view", 0)     # G — visualiser
         self.node_mod_role_id = _ns.get("mod", 0)       # M — actions + Lock
@@ -111,7 +148,7 @@ class Config:
         self.pve_host = g("PVE_HOST", "10.3.10.200")
         self.pve_port = _int(g("PVE_PORT", "8006"), 8006)
         self.pve_node = g("PVE_NODE", "pve")
-        self.pve_verify_ssl = _bool(g("PVE_VERIFY_SSL"), False)
+        self.pve_verify_ssl = _verify_ssl(g("PVE_VERIFY_SSL"), False)
         self.pve_token_id = g("PVE_TOKEN_ID", "discordbot@pve!bot")
         self.pve_token_secret = g("PVE_TOKEN_SECRET").strip()
         self.pve_action_token_id = g("PVE_ACTION_TOKEN_ID", "discordbot@pve!actions")
@@ -126,7 +163,7 @@ class Config:
         self.avy_suffix = g("AVY_SUFFIX", "avy").strip()
         self.avy_host = g("AVY_PVE_HOST", "").strip()
         self.avy_port = _int(g("AVY_PVE_PORT", "8006"), 8006)
-        self.avy_verify_ssl = _bool(g("AVY_PVE_VERIFY_SSL"), False)
+        self.avy_verify_ssl = _verify_ssl(g("AVY_PVE_VERIFY_SSL"), False)
         self.avy_token_id = g("AVY_PVE_TOKEN_ID", "discordbot@pve!bot")
         self.avy_token_secret = g("AVY_PVE_TOKEN_SECRET").strip()
         self.avy_action_token_id = g("AVY_PVE_ACTION_TOKEN_ID", "discordbot@pve!actions")
@@ -136,6 +173,20 @@ class Config:
         # chaque nœud = un « serveur » à part entière (clé AVY-<NOM>, cf. pve.avy_server_key)
         self.avy_nodes = [x.strip() for x in g("AVY_NODES", "").split(",") if x.strip()]
         self.avy_enabled = bool(self.avy_host and self.avy_token_secret)
+
+        # Certificat de l'hyperviseur NON authentifié tant que *_VERIFY_SSL est faux : les
+        # jetons (dont celui d'ACTION : start/stop/backup/delete-backup) partent sur un
+        # canal qu'un équipement du VLAN mgmt peut usurper — alors que la host key SSH du
+        # même hôte, elle, est épinglée (nodeshell.py). On ne peut pas l'activer par défaut
+        # (certificat auto-signé sans l'IP en SAN : tous les appels échoueraient), mais on
+        # cesse de le TAIRE — 2026-08-11.
+        if self.pve_verify_ssl is False:
+            _log.warning("PVE_VERIFY_SSL=false : API Proxmox %s en TLS NON vérifié "
+                         "(jeton d'action exposé à un MITM du réseau mgmt) — voir "
+                         "_verify_ssl() pour passer un chemin de bundle CA", self.pve_host)
+        if self.avy_enabled and self.avy_verify_ssl is False:
+            _log.warning("AVY_PVE_VERIFY_SSL=false : API du cluster %s (%s) en TLS "
+                         "NON vérifié", self.avy_key, self.avy_host)
 
         # --- NAS Synology = serveur à part entière (clé SYNO) 2026-08-07 ---
         # Supervisé en SNMP par Telegraf (mesures synology* du bucket Proxmox) : le bot

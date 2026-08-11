@@ -38,6 +38,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from ..core import bg
 from ..core.permissions import is_guild_owner
 
 log = logging.getLogger("discord-bot.gestion")
@@ -55,12 +56,14 @@ class Gestion(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._lock = asyncio.Lock()
+        # alerte « magasin 2FA dégradé » : une seule fois par épisode (la boucle repasse
+        # toutes les 3 min — on ne veut pas un message d'alerte toutes les 3 min)
+        self._degraded_notified = False
 
     async def cog_load(self):
         self._migrate_levels()
         # sessions 2FA : retrait/remise IMMÉDIATE des rôles de session (sinon la seule
         # boucle de 3 min laisserait « 2FA Complet »/« O » traîner après expiration)
-        self._twofa_tasks = set()
         self.bot.twofa.on_change = self._on_twofa_change
         self.reconcile_loop.start()
         self.session_sweep_loop.start()
@@ -114,6 +117,39 @@ class Gestion(commands.Cog):
         if self.bot.cfg.twofa_role_id:
             out.add(self.bot.cfg.twofa_role_id)
         return out
+
+    def _session_ok(self, uid):
+        """Condition « session 2FA » de la pose des rôles, en UN SEUL endroit.
+
+        Miroir exact de `_apply_member` (break-glass TWOFA_ENABLED=false compris) :
+        `add` et `list_` l'appellent aussi, pour que les trois ne puissent plus diverger.
+        C'est cette divergence qui avait laissé « le rôle **O** ne sera posé qu'à… » alors
+        que l'extension du 2026-07-18 suspend AUSSI G et M (corrigé 2026-08-11)."""
+        return (self.bot.twofa.trusted(uid)
+                or not getattr(self.bot.cfg, "twofa_enabled", False))
+
+    def _role_block(self, serveur, niveau):
+        """Raison pour laquelle le bot ne POURRA PAS poser ce rôle, ou None si rien ne s'y
+        oppose — ou si on ne peut pas le savoir (cache incomplet : on n'invente pas
+        d'obstacle). Sans ce contrôle, /gestion add répondait « ✅ » alors que la pose
+        partait en 403 à chaque réconciliation, sans un mot côté Discord : le délégué
+        était réputé habilité sans l'être (2026-08-11)."""
+        rid = self._role_id(serveur, niveau)
+        if not rid:
+            return f"aucun rôle **{niveau}** n'est déclaré pour **{serveur}** (GESTION_SERVERS)"
+        g = self.bot.get_guild(self.bot.cfg.guild_id)
+        me = getattr(g, "me", None) if g is not None else None
+        if me is None:
+            return None                 # inconnue : ne pas bloquer une délégation légitime
+        if not me.guild_permissions.manage_roles:
+            return "le bot n'a pas la permission **Gérer les rôles**"
+        role = g.get_role(rid)
+        if role is None:
+            return f"le rôle `{rid}` déclaré pour **{serveur}/{niveau}** n'existe plus"
+        if not me.top_role > role:
+            return (f"le rôle **{role.name}** est au-dessus du rôle du bot — descends-le "
+                    "sous le rôle d'Edmine dans les paramètres du serveur")
+        return None
 
     # ------------------------------------------------------------------ délégation
     def _grantable(self, itx, server):
@@ -173,8 +209,10 @@ class Gestion(commands.Cog):
                                   action="role-grant" if want else "role-revoke",
                                   target=f"{(r.name if r else rid)} → {uid} ({reason})",
                                   result="ok")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 — le mouvement de rôle A EU LIEU : ne pas
+            # le faire échouer parce que la piste d'audit est indisponible, mais ne plus
+            # l'avaler en silence non plus (un audit muet = mouvements invisibles).
+            log.warning("audit du mouvement de rôle %s/%s non écrit: %s", rid, uid, e)
         return True
 
     # ------------------------------------------------------------------ réconciliation
@@ -199,7 +237,7 @@ class Gestion(commands.Cog):
         # Sans 2FA exigé, aucune exigence de session — sinon les rôles seraient dépouillés
         # en boucle alors que plus personne ne PEUT ouvrir de session (téléphone perdu +
         # codes de secours épuisés = le scénario même du break-glass).
-        trusted = tf.trusted(uid) or not getattr(cfg, "twofa_enabled", False)
+        trusted = self._session_ok(uid)
         R = "réconciliation gestion/2FA"
 
         # rôle voulu par serveur = celui du niveau, si (dans le groupe ET 2FA inscrit
@@ -232,13 +270,49 @@ class Gestion(commands.Cog):
             elif not want_tr and tr in have:
                 await self._set_role(uid, tr, False, R)
 
+    async def _notify_degraded(self):
+        """Signale UNE fois par épisode que la réconciliation est gelée. Un log.warning
+        toutes les 3 min n'est visible de personne : sans ce signal, « aucun accès visuel
+        sans 2FA » cessait de s'appliquer en silence (2026-08-11)."""
+        if self._degraded_notified:
+            return
+        self._degraded_notified = True
+        try:
+            self.bot.audit.record(user="système", action="2fa-degraded",
+                                  target=getattr(self.bot.cfg, "twofa_path", "2fa.json"),
+                                  result="réconciliation des rôles GELÉE")
+        except Exception:  # noqa: BLE001
+            log.exception("audit du magasin 2FA dégradé impossible")
+        cid = getattr(self.bot.cfg, "alert_channel_id", 0)
+        if not cid:
+            return
+        ch = self.bot.get_channel(cid)
+        if ch is None:
+            return
+        try:
+            await ch.send(
+                "🔴 **Magasin 2FA illisible** — la réconciliation des rôles est **gelée** :"
+                " aucun rôle G/M/O ni « 2FA Complet » ne sera posé NI retiré, et plus aucun"
+                " `/2fa unlock` ne peut aboutir. Restaure `2fa.json` (sauvegarde/PBS) :"
+                f" le bot le relit tout seul au passage suivant (≤ {RECONCILE_MIN} min).",
+                allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:  # noqa: BLE001 — best-effort, l'audit reste la trace
+            log.warning("alerte « magasin 2FA dégradé » non postée: %s", e)
+
     async def reconcile(self):
         """Aligne les rôles Discord de TOUS les membres (groupes × niveau × 2FA)."""
         tf = self.bot.twofa
         # 2FA store illisible -> enrolled() renverrait False pour TOUS = révocation de masse.
         if getattr(tf, "degraded", False):
-            log.warning("réconciliation gelée : magasin 2FA dégradé (aucun rôle retiré)")
-            return
+            # 2026-08-11 : on RETENTE la lecture à chaque passage (fichier de quelques
+            # centaines d'octets, en local). Avant, `degraded` n'était jamais remis à
+            # False : le gel durait jusqu'au redémarrage du processus, sans un mot dans
+            # Discord. reload() n'écrase les inscriptions que sur une lecture VALIDE.
+            if not (hasattr(tf, "reload") and tf.reload()):
+                log.warning("réconciliation gelée : magasin 2FA dégradé (aucun rôle retiré)")
+                await self._notify_degraded()
+                return
+        self._degraded_notified = False      # épisode clos : réarmer l'alerte
         members = await self._guild_members()
         if members is None:
             return
@@ -273,17 +347,21 @@ class Gestion(commands.Cog):
     def _on_twofa_change(self, uid):
         """Branché sur TwoFA.on_change (session ouverte/fermée/expirée, désinscription).
         Ne fait que PLANIFIER une tâche : jamais bloquant pour le déverrouillage appelant.
-        Référence forte conservée (la boucle ne garde que des weakrefs sur les tâches)."""
+        bg.spawn garde la référence forte (la boucle asyncio ne garde qu'une weakref : une
+        tâche sans référence peut être ramassée en plein vol) et journalise l'exception."""
         try:
             uid = int(uid)
         except (TypeError, ValueError):
             return
+        # La boucle est vérifiée AVANT de créer la coroutine : l'inverse (créer l'objet
+        # coroutine comme ARGUMENT de bg.spawn puis se prendre le RuntimeError) laisse une
+        # coroutine jamais attendue derrière soi — même piège que audit.record (2026-08-11).
         try:
-            t = asyncio.get_running_loop().create_task(self._reconcile_member_now(uid))
+            asyncio.get_running_loop()
         except RuntimeError:
             return          # pas de boucle (arrêt en cours) : la réconciliation suffira
-        self._twofa_tasks.add(t)
-        t.add_done_callback(self._twofa_tasks.discard)
+        bg.spawn(self._reconcile_member_now(uid),
+                 name=f"gestion:reconcile-member:{uid}", logger=log)
 
     @tasks.loop(minutes=RECONCILE_MIN)
     async def reconcile_loop(self):
@@ -315,8 +393,17 @@ class Gestion(commands.Cog):
         description="Accès de gestion par serveur (propriétaire + porteurs de O)")
 
     async def _server_ac(self, itx: discord.Interaction, current: str):
-        return [app_commands.Choice(name=s, value=s) for s in self._server_choices()
-                if current.lower() in s.lower()][:25]
+        # 2026-08-11 : ne proposer QUE les serveurs que l'invocateur peut gérer. Avant,
+        # l'autocomplétion livrait la carte complète des serveurs à tout membre ayant une
+        # session 2FA (aucune porte sur /gestion, cf. GatedTree qui ne filtre que le 2FA)
+        # — la même reconnaissance que /gestion list refuse justement de donner.
+        try:
+            srvs = [s for s in self._server_choices() if self._grantable(itx, s)]
+        except Exception:  # noqa: BLE001 — une autocomplétion ne doit jamais lever
+            log.exception("autocomplétion des serveurs de gestion")
+            return []
+        return [app_commands.Choice(name=s, value=s) for s in srvs
+                if current.lower() in s.lower()][:25]     # 25 = maximum Discord
 
     @group.command(name="add", description="Donner un accès de gestion à un membre sur un serveur")
     @app_commands.describe(membre="Le membre à autoriser", serveur="Ex : R820",
@@ -330,21 +417,32 @@ class Gestion(commands.Cog):
         if cfg.guild_id and itx.guild_id != cfg.guild_id:
             await itx.followup.send("Serveur non autorisé.", ephemeral=True)
             return
-        if serveur not in cfg.gestion_servers:
-            await itx.followup.send(
-                f"⛔ Serveur inconnu « {serveur} ». Connus : {', '.join(self._server_choices()) or 'aucun'}.",
-                ephemeral=True)
-            return
         niveau = (niveau or "G").upper()
         if niveau not in LEVELS:
             niveau = "G"
         allowed = self._grantable(itx, serveur)
-        # niveau VOULU autorisé ?
+        # niveau VOULU autorisé ? (contrôle AVANT le message « serveur inconnu », qui
+        # énumère les serveurs : sur une clé inconnue _grantable ne rend {G,M,O} qu'au
+        # propriétaire, donc lui seul voit la liste — 2026-08-11)
         if niveau not in allowed:
             await itx.followup.send(
                 "⛔ Tu ne peux pas accorder ce niveau sur ce serveur." +
                 (f" Tu peux accorder : {', '.join(sorted(allowed))}." if allowed else
                  " Réservé au propriétaire ou à un porteur de O."), ephemeral=True)
+            return
+        if serveur not in cfg.gestion_servers:
+            await itx.followup.send(
+                f"⛔ Serveur inconnu « {serveur} ». Connus : {', '.join(self._server_choices()) or 'aucun'}.",
+                ephemeral=True)
+            return
+        # Faisabilité AVANT d'enregistrer quoi que ce soit : inutile (et trompeur)
+        # d'accepter une délégation que le bot ne pourra jamais matérialiser.
+        blocked = self._role_block(serveur, niveau)
+        if blocked:
+            await itx.followup.send(
+                f"⛔ Rôle **{niveau}** non posable sur **{serveur}** : {blocked}.\n"
+                "Corrige-le puis relance la commande (rien n'a été enregistré).",
+                ephemeral=True)
             return
         async with self._lock:
             groups = self._members()
@@ -361,14 +459,22 @@ class Gestion(commands.Cog):
             self.bot.state.set("gestion_members", groups)
         self.bot.audit.record(user=f"{itx.user} ({itx.user.id})", action="gestion-add",
                               target=f"{serveur}/{membre.id}={niveau}", result="ok")
-        enrolled = self.bot.twofa.enrolled(membre.id)
-        if not enrolled:
+        if getattr(self.bot.twofa, "degraded", False):
+            # Ne PAS accuser le membre de ne pas avoir activé le 2FA : c'est le magasin
+            # qui est illisible (enrolled() répond False pour tout le monde) et la
+            # réconciliation est gelée — aucun rôle ne bougera (2026-08-11).
+            note = ("\n⛔ **Magasin 2FA illisible** : la réconciliation des rôles est gelée, "
+                    "aucun rôle ne sera posé tant qu'il n'est pas réparé. La délégation, "
+                    "elle, est bien enregistrée.")
+        elif not self.bot.twofa.enrolled(membre.id):
             note = ("\n⚠️ Ce membre n'a **pas encore activé le 2FA** : le rôle ne sera accordé "
                     "qu'après son `/2fa setup` (dans #général).")
-        elif (niveau == "O" and self.bot.cfg.twofa_enabled
-              and not self.bot.twofa.trusted(membre.id)):
-            note = ("\n⏳ Sa session 2FA est fermée : le rôle **O** ne sera posé qu'à son "
-                    "prochain `/2fa unlock` (et retiré à chaque expiration de session).")
+        elif not self._session_ok(membre.id):
+            # 2026-07-18 : la session conditionne AUSSI G et M, plus seulement O. Le test
+            # passe par _session_ok pour rester le miroir exact de _apply_member (dont le
+            # break-glass TWOFA_ENABLED=false, où les rôles SONT posés sans session).
+            note = (f"\n⏳ Sa session 2FA est fermée : le rôle **{niveau}** ne sera posé qu'à "
+                    "son prochain `/2fa unlock` (et retiré à chaque expiration de session).")
         else:
             note = ""
         await itx.followup.send(
@@ -387,6 +493,22 @@ class Gestion(commands.Cog):
             await itx.followup.send("Serveur non autorisé.", ephemeral=True)
             return
         allowed = self._grantable(itx, serveur)
+        # PORTE AVANT LE VERROU (2026-08-11) : l'autorisation ne dépend que des rôles de
+        # l'appelant, donc aucun TOCTOU introduit. Elle était posée APRÈS la lecture de
+        # l'état : n'importe quel membre avec une session 2FA apprenait, pour tout couple
+        # (membre, serveur), s'il y avait un accès et lequel — la carte de délégation que
+        # /gestion list refuse justement de donner. `add` refusait déjà avant de lire.
+        if not allowed:
+            await itx.followup.send(
+                "⛔ Réservé au propriétaire ou à un porteur de O.", ephemeral=True)
+            return
+        # cohérence avec `add` — après la porte, pour ne pas énumérer les serveurs à
+        # quelqu'un qui n'a rien à y faire
+        if serveur not in cfg.gestion_servers:
+            await itx.followup.send(
+                f"⛔ Serveur inconnu « {serveur} ». Connus : {', '.join(self._server_choices()) or 'aucun'}.",
+                ephemeral=True)
+            return
         async with self._lock:
             groups = self._members()
             # lecture + contrôle + mutation dans la MÊME section critique (TOCTOU sinon,
@@ -397,9 +519,11 @@ class Gestion(commands.Cog):
                     f"ℹ️ **{membre.display_name}** n'a aucun accès sur **{serveur}**.", ephemeral=True)
                 return
             if cur not in allowed:
+                # le niveau exact n'est PAS cité : un porteur de O n'a pas à distinguer
+                # « M » de « O » sur les membres qu'il ne peut pas toucher.
                 await itx.followup.send(
-                    f"⛔ Tu ne peux pas retirer un membre de niveau **{cur}** (réservé au propriétaire).",
-                    ephemeral=True)
+                    f"⛔ Tu ne peux pas retirer **{membre.display_name}** de **{serveur}** "
+                    "(réservé au propriétaire).", ephemeral=True)
                 return
             groups.get(serveur, {}).pop(str(membre.id), None)
             self.bot.state.set("gestion_members", groups)
@@ -438,10 +562,24 @@ class Gestion(commands.Cog):
             keys = [serveur] if serveur in manageable else []
         else:
             keys = manageable
+        # DEUX limites Discord, pas une : 25 champs par embed ET 6000 caractères au TOTAL
+        # (titre + noms + valeurs + pied). Franchir l'une OU l'autre = 400 à l'envoi, donc
+        # une commande qui ne répond plus du tout. On tronque plutôt, en le disant.
+        # 2026-08-11 : le plafond de champs seul ne suffisait pas — 25 champs pleins font
+        # ~25 000 caractères.
+        BUDGET = 5500           # marge laissée au titre, au pied et au champ « … »
+        used, skipped = 0, []
         for srv in keys:
+            if len(emb.fields) >= 24:      # 24 + le champ « … » = 25, le maximum
+                skipped.append(srv)
+                continue
             mem = groups.get(srv, {})
             if not mem:
+                if used + len(srv) + 12 > BUDGET:
+                    skipped.append(srv)
+                    continue
                 emb.add_field(name=srv, value="_(personne)_", inline=False)
+                used += len(srv) + 12
                 continue
             lines = []
             for uid, lvl in sorted(mem.items(), key=lambda kv: LEVELS.index(kv[1]) if kv[1] in LEVELS else 9):
@@ -451,11 +589,31 @@ class Gestion(commands.Cog):
                 elif tf.trusted(int(uid)):
                     enr = "🔓 session active"
                 else:
-                    enr = "🔐 verrouillé" + (" — O suspendu" if lvl == "O" else "")
+                    # TOUS les niveaux sont suspendus hors session depuis le 2026-07-18,
+                    # plus seulement O (le suffixe le disait encore le 2026-08-11). En
+                    # break-glass (TWOFA_ENABLED=false) les rôles restent posés : pas de
+                    # mention de suspension, d'où _session_ok plutôt qu'un texte figé.
+                    enr = "🔐 verrouillé" + ("" if self._session_ok(int(uid))
+                                             else " — rôle suspendu")
                 lines.append(f"• <@{uid}> — **{lvl}** {enr}")
-            emb.add_field(name=srv, value="\n".join(lines)[:1024], inline=False)
-        emb.set_footer(text="G voir · M tout faire · O owner (rôle O + 2FA Complet posés "
-                            "seulement pendant une session 2FA active)")
+            val = "\n".join(lines)
+            if len(val) > 1024:      # limite Discord d'un champ : couper à la ligne près
+                cut = []
+                for line in lines:
+                    if sum(len(x) + 1 for x in cut) + len(line) > 960:
+                        break
+                    cut.append(line)
+                val = "\n".join(cut) + f"\n… (+{len(lines) - len(cut)} — filtre par serveur)"
+            if used + len(srv) + len(val) > BUDGET:
+                skipped.append(srv)
+                continue
+            emb.add_field(name=srv, value=val, inline=False)
+            used += len(srv) + len(val)
+        if skipped:
+            emb.add_field(name="…", value=f"+{len(skipped)} serveur(s) non affiché(s) — "
+                                          "relance avec le filtre `serveur`", inline=False)
+        emb.set_footer(text="G voir · M tout faire · O owner (les rôles G/M/O + 2FA Complet "
+                            "ne sont posés que pendant une session 2FA active)")
         await itx.response.send_message(embed=emb, ephemeral=True)
 
 

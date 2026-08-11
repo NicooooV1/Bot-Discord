@@ -17,23 +17,40 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.permissions import admin_button_ok, read_check
+from ..core.gates import GatedView
+from ..core.permissions import read_check
 
 log = logging.getLogger("discord-bot.medias")
 
 APIS_FILE = "/opt/discord-bot/servarr-apis.json"
-SUPERVISION_CATEGORY = "📊 Supervision"
+# provision.py fabrique « 📊 Supervision <SERVER_KEY> » depuis le multi-serveurs : le nom
+# figé ci-dessous ne résolvait plus la catégorie, et #telechargements naissait alors à la
+# RACINE du serveur, sans overwrites (= noms des torrents visibles de @everyone).
+# On garde l'ancien nom en dernier recours : la catégorie historique, adoptée par ID par
+# provision, n'a jamais été renommée. 2026-08-11.
+SUPERVISION_CATEGORY_LEGACY = "📊 Supervision"
 DL_CHANNEL = "telechargements"
 DL_STATES = ("downloading", "stalledDL", "metaDL", "forcedDL",
              "checkingDL", "allocating", "queuedDL")
 
 
 def _load_apis():
+    """Charge servarr-apis.json.
+
+    Une lecture ratée désactive silencieusement TOUT le cog (dltracker n'est jamais
+    démarré, /film répond « Seerr non configuré ») et le fichier n'est relu nulle part :
+    sans ces logs, la panne est indiagnosticable. 2026-08-11.
+    """
     try:
         with open(APIS_FILE) as f:
             return json.load(f)
+    except FileNotFoundError:
+        log.warning("%s absent — cog medias inactif (pas de suivi ni de /film)", APIS_FILE)
+    except PermissionError:
+        log.error("%s illisible (droits du fichier) — cog medias inactif", APIS_FILE)
     except Exception:
-        return {}
+        log.exception("%s illisible (JSON invalide ?) — cog medias inactif", APIS_FILE)
+    return {}
 
 
 def _bar(pct, width=12):
@@ -192,6 +209,21 @@ class Medias(commands.Cog):
             return None
 
     # -------------------------------------------------- salon #telechargements
+    def _supervision_name(self):
+        return f"📊 Supervision {getattr(self.bot.cfg, 'server_key', 'R820')}"
+
+    def _supervision_category(self, guild):
+        """Catégorie de supervision de PROVISION : id publié par le cog, puis nom réel,
+        puis nom historique. Jamais de création ici — une catégorie créée à la volée
+        naîtrait sans overwrites, donc publique."""
+        prov = self.bot.get_cog("Provision")
+        cid = ((getattr(prov, "prov", None) or {}).get("categories") or {}).get("supervision")
+        cat = guild.get_channel(cid) if cid else None
+        if isinstance(cat, discord.CategoryChannel):
+            return cat
+        return (discord.utils.get(guild.categories, name=self._supervision_name())
+                or discord.utils.get(guild.categories, name=SUPERVISION_CATEGORY_LEGACY))
+
     async def _ensure_dl_channel(self):
         gid = getattr(self.bot.cfg, "guild_id", None)
         guild = self.bot.get_guild(gid) if gid else None
@@ -201,8 +233,28 @@ class Medias(commands.Cog):
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
         if ch is not None:
             return ch
-        cat = discord.utils.get(guild.categories, name=SUPERVISION_CATEGORY)
-        ch = discord.utils.get(guild.text_channels, name=DL_CHANNEL)
+        cat = self._supervision_category(guild)
+        if cat is None:
+            # Pas de catégorie résolue -> create_text_channel(category=None) posait le
+            # salon À LA RACINE, sans overwrites. Mieux vaut pas de salon (provision le
+            # créera) qu'un salon public listant les torrents. 2026-08-11.
+            log.warning("catégorie « %s » introuvable — salon #%s NON créé",
+                        self._supervision_name(), DL_CHANNEL)
+            return None
+        ch = discord.utils.get(cat.text_channels, name=DL_CHANNEL)
+        if ch is None:
+            # homonyme ailleurs dans le serveur : le rapatrier (il héritait sinon des
+            # permissions de là où il traînait, souvent aucune).
+            stray = discord.utils.get(guild.text_channels, name=DL_CHANNEL)
+            if stray is not None:
+                ch = stray
+                try:
+                    await stray.edit(category=cat, sync_permissions=True,
+                                     reason="#telechargements appartient à la supervision")
+                    log.warning("#%s trouvé hors de « %s » — rapatrié", DL_CHANNEL, cat.name)
+                except discord.HTTPException:
+                    log.warning("#%s hors de « %s » et non déplaçable — adopté tel quel",
+                                DL_CHANNEL, cat.name)
         if ch is None:
             try:
                 ch = await guild.create_text_channel(
@@ -210,6 +262,7 @@ class Medias(commands.Cog):
                     topic="Téléchargements en cours (barre de progression, mise à jour ~30 s)")
                 log.info("salon #%s créé", DL_CHANNEL)
             except discord.HTTPException:
+                log.exception("création du salon #%s", DL_CHANNEL)
                 return None
         cur = self.bot.state.get("media_dl") or {}
         cur["channel"] = ch.id
@@ -351,6 +404,14 @@ class Medias(commands.Cog):
         return ranked[:15], best >= _EXACT_FLOOR
 
     async def _request(self, kind, tmdb):
+        """Crée la demande DIRECTEMENT dans Seerr avec la clé API admin — donc
+        auto-approuvée et téléchargée dans la foulée.
+
+        ⚠️ NE PAS rebrancher ceci sur /film ou /serie : c'est exactement le repli qui
+        contournait le portail de validation #demandes (supprimé le 2026-08-11). Le seul
+        chemin légitime pour créer une demande est le bouton « Approuver » du portail
+        (bot/cogs/requests.py), gardé par le tier M/O + 2FA.
+        """
         if kind == "film":
             body = {"mediaType": "movie", "mediaId": int(tmdb)}
         else:
@@ -385,7 +446,15 @@ class Medias(commands.Cog):
             desc = (f"Aucun {noun} exactement à ce nom. Voici les plus probables "
                     f"(triés par ressemblance + popularité) :")
         emb = discord.Embed(title=title, description=desc, color=fmt.BLURPLE)
-        await itx.followup.send(embed=emb, view=RequestView(self, kind, res), ephemeral=True)
+        # La vue mémorise l'interaction ET le message envoyé : sur un ÉPHÉMÈRE, ce sont
+        # les deux seules routes pour griser le menu à l'expiration (Message.edit() est
+        # inutilisable, cf. TorrentsView._repaint dans servarr.py).
+        # ⚠️ `wait=True` est OBLIGATOIRE : sans lui `followup.send` renvoie None (webhook),
+        # `bind(None)` ne mémorise rien et `on_timeout` retombe sur
+        # `edit_original_response` de la commande — c'est à dire le message d'ATTENTE du
+        # defer, pas le menu, qui resterait cliquable. 2026-08-11.
+        view = RequestView(self, kind, res, itx)
+        view.bind(await itx.followup.send(embed=emb, view=view, ephemeral=True, wait=True))
 
     @app_commands.command(description="Demander un film à télécharger (via Seerr).")
     @app_commands.describe(titre="Nom du film")
@@ -400,11 +469,23 @@ class Medias(commands.Cog):
         await self._flow(itx, "serie", titre)
 
 
-class RequestView(discord.ui.View):
-    def __init__(self, cog, kind, results):
+class RequestView(GatedView):
+    """Menu éphémère de /film et /serie.
+
+    Porte : « read » (le tier de la commande, cf. read_check) + `gate_user_id` = celui
+    qui a lancé la commande. Le message est éphémère, mais la porte déclarée rejoue
+    aussi la session 2FA : un panneau resté ouvert après expiration ne doit plus agir.
+    """
+
+    gate = "read"
+
+    def __init__(self, cog, kind, results, itx=None):
         super().__init__(timeout=120)
         self.cog = cog
         self.kind = kind
+        self._itx = itx
+        self._msg = None
+        self.gate_user_id = itx.user.id if itx is not None else None
         results = results[:25]  # limite Discord d'un menu déroulant
         self.byid = {str(r["id"]): r for r in results}
         options = []
@@ -421,39 +502,92 @@ class RequestView(discord.ui.View):
         sel.callback = self._on_select
         self.add_item(sel)
 
+    async def _close(self, itx):
+        """Grise le menu et arrête la vue.
+
+        Sans ça le menu reste cliquable après la sélection (et après le timeout de 2 min) :
+        Discord répond alors « Cette interaction a échoué », sans dire qu'il faut relancer
+        la commande. Sur un ÉPHÉMÈRE, seul edit_original_response fonctionne. 2026-08-11.
+        """
+        for c in self.children:
+            c.disabled = True
+        try:
+            await itx.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+    def bind(self, msg):
+        """Mémorise le message éphémère réellement envoyé (followup) : après un defer,
+        `edit_original_response` vise le message d'attente, pas forcément celui qui porte
+        le menu — on édite donc le message quand on l'a, l'interaction sinon."""
+        self._msg = msg
+
+    async def on_timeout(self):
+        # Sans ça, passé 2 min la vue est retirée côté bot mais le menu reste cliquable
+        # côté client : Discord répond « Cette interaction a échoué », sans explication.
+        for c in self.children:
+            c.disabled = True
+        try:
+            if self._msg is not None:
+                await self._msg.edit(view=self)
+            elif self._itx is not None:
+                await self._itx.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
     async def _on_select(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)
-        r = self.byid.get(itx.data["values"][0])
+        values = (itx.data or {}).get("values") or []
+        r = self.byid.get(values[0]) if values else None
         if not r:
             await itx.followup.send("Sélection invalide.", ephemeral=True)
+            await self._close(itx)
             return
         t = r.get("title") or r.get("name") or "?"
+        # « déjà demandé / déjà disponible » : le dire tout de suite. Ce contrôle vivait
+        # dans le repli 409 supprimé ci-dessous ; sans lui, #demandes se remplirait de
+        # propositions inutiles. On laisse passer « en cours » et « partiel » : demander
+        # les saisons manquantes d'une série est légitime, c'est l'admin qui tranche.
+        status = ((r.get("mediaInfo") or {}) or {}).get("status")
+        if status in (2, 5):
+            await itx.followup.send(
+                f"ℹ️ **{t}** est déjà demandé ou disponible ({_SEERR_STATUS[status]}).",
+                ephemeral=True)
+            await self._close(itx)
+            return
         # passer par le PORTAIL de validation : poster une proposition dans #demandes
         # (rien n'est créé/téléchargé tant qu'un admin n'a pas approuvé).
         gate = self.cog.bot.get_cog("Requests")
         posted = False
-        if gate is not None:
+        if gate is None:
+            log.error("cog Requests indisponible — demande « %s » refusée (aucun repli)", t)
+        else:
             try:
-                posted = await gate.propose(itx, self.kind, r)
-            except Exception as e:
-                log.warning("propose %s: %s", t, e); posted = False
+                posted = bool(await gate.propose(itx, self.kind, r))
+            except Exception:
+                log.exception("portail #demandes indisponible — « %s » NON demandé", t)
         if posted:
             await itx.followup.send(
                 f"✅ **{t}** envoyé pour **validation** dans **#demandes**. "
                 f"Une fois approuvé par un admin, suis l'avancement dans **#telechargements**.", ephemeral=True)
         else:
-            # repli : portail indisponible -> création directe (comportement historique)
-            st, data = await self.cog._request(self.kind, r["id"])
-            if st in (200, 201):
-                await itx.followup.send(f"✅ Demande créée : **{t}** (portail indispo).", ephemeral=True)
-            elif st == 409 or (isinstance(data, str) and "exist" in data.lower()):
-                await itx.followup.send(f"ℹ️ **{t}** est déjà demandé ou disponible.", ephemeral=True)
-            else:
-                await itx.followup.send(f"⚠️ Échec de la demande pour **{t}** (code {st}).", ephemeral=True)
-        self.stop()
+            # fail-CLOSED (2026-08-11) : l'ancien repli créait la demande DIRECTEMENT dans
+            # Seerr avec la clé admin — donc auto-approuvée et téléchargée — dès que le
+            # portail était indisponible (cog non chargé, salon absent, 500 transitoire).
+            # C'était la seule barrière de validation du workflow : on refuse, on alerte.
+            await itx.followup.send(
+                f"⚠️ Portail de validation indisponible — **{t}** n'a PAS été demandé. "
+                f"Réessaie plus tard ou préviens un admin.", ephemeral=True)
+        await self._close(itx)
 
 
-class DlRefreshView(discord.ui.View):
+class DlRefreshView(GatedView):
+    """Bouton du salon #telechargements : tier « mod » (= l'ancien admin_button_ok,
+    rôle Gestion + 2FA), pas le rôle A « vision »."""
+
+    gate = "mod"
+
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
@@ -461,8 +595,6 @@ class DlRefreshView(discord.ui.View):
     @discord.ui.button(label="Rafraîchir", emoji="🔄",
                        style=discord.ButtonStyle.primary, custom_id="medias:dl:refresh")
     async def refresh(self, itx: discord.Interaction, button: discord.ui.Button):
-        if not await admin_button_ok(itx):     # rôle Gestion + 2FA (pas le rôle A « vision »)
-            return
         await itx.response.defer()
         try:
             emb = await self.cog._build_dl_embed()

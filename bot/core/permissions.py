@@ -2,8 +2,16 @@
 
 Access is tied to Discord ROLES (ADMIN_ROLE_IDS / READ_ROLE_IDS): grant the bot to
 someone by giving them the role in the server, not by editing a user-id list. ADMIN_IDS
-stays as an owner break-glass (always allowed). If NEITHER ADMIN_IDS nor ADMIN_ROLE_IDS
-is configured, admin falls open (legacy behavior) to avoid a total lockout.
+stays as an owner break-glass (always allowed).
+
+⚠️ FAIL-CLOSED partout (corrigé 2026-08-11 — ce docstring annonçait l'inverse) : si
+NI ADMIN_IDS NI ADMIN_ROLE_IDS n'est configuré, seul le propriétaire du guild est admin ;
+et une clé `server` absente de GESTION_SERVERS refuse au lieu de retomber sur les rôles
+globaux. Le propriétaire du guild reste le break-glass permanent : aucune configuration
+cassée ne peut verrouiller totalement le bot.
+
+Les BOUTONS ne passent pas par ce module directement : ils déclarent leur tier via
+`core.gates.GatedView`, qui appelle `is_admin` / `can_read` / `may_lock` ci-dessous.
 
 The invoking member's roles arrive in the interaction payload, so role checks work
 without the privileged GUILD_MEMBERS intent.
@@ -56,8 +64,20 @@ def is_admin(cfg, interaction, server=None) -> bool:
     role_ids = set(cfg.admin_role_ids or ())
     if server:
         srv = (getattr(cfg, "gestion_servers", {}) or {}).get(server)
-        if srv:                       # serveur connu -> SES tiers M/O uniquement
-            role_ids = {srv.get("mod"), srv.get("owner")} - {0, None}
+        if not srv:
+            # FAIL-CLOSED (corrigé 2026-08-11). Avant, une clé inconnue laissait
+            # `role_ids` sur cfg.admin_role_ids : la restriction par serveur était
+            # ANNULÉE en silence et un porteur de « Gestion R820 » pouvait piloter une
+            # machine d'Aveyron. La clé n'est pas statique — pve.server_of_name() la
+            # fabrique depuis le nœud RÉEL renvoyé par l'API (« AVY-<NODE> ») — donc un
+            # nœud ajouté, renommé, ou une entrée GESTION_SERVERS mal formée (rejetée
+            # avec un simple warning par Config._parse_gestion_servers) suffisait.
+            # Les break-glass ci-dessus restent valables : pas de verrouillage total.
+            log.warning("is_admin: serveur %r absent de GESTION_SERVERS -> refus "
+                        "(déclarer « %s:G:M:O » pour rendre la main aux M/O)",
+                        server, server)
+            return False
+        role_ids = {srv.get("mod"), srv.get("owner")} - {0, None}
     if role_ids and (_member_role_ids(interaction) & role_ids):
         return True
     return False
@@ -165,8 +185,10 @@ def admin_check(require_admin_channel=True):
         if require_admin_channel and cfg.admin_channel_id and interaction.channel_id != cfg.admin_channel_id:
             raise app_commands.CheckFailure("Action réservée au salon admin.")
         if not is_admin(cfg, interaction):
+            # ⚠️ Ne PAS mentionner la permission Discord « Administrateur » : elle n'est
+            # plus honorée depuis 2026-07-16 (seul le rôle Gestion ouvre les actions).
             raise app_commands.CheckFailure(
-                "Réservé aux administrateurs (rôle autorisé ou permission Discord « Administrateur »).")
+                "Réservé aux gestionnaires (rôle Gestion accordé via /gestion).")
         return True
 
     return app_commands.check(predicate)

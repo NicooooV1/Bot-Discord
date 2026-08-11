@@ -21,6 +21,24 @@ from ..core.pve import AvyUnreachable, LlmExecError
 
 log = logging.getLogger("discord-bot.avymetrics")
 
+# Fraîcheur exigée de l'instantané resources() distant avant d'en tirer des métriques
+# (le cycle est de 2 min ; l'instantané est rafraîchi juste avant d'être lu).
+AVY_ROWS_MAX_AGE = 60
+# L'énumération CIFS de nas-backup coûte ~16 s à travers le tunnel WG, pour une donnée
+# (âge de la dernière sauvegarde) qui bouge une fois par jour : inutile de la repayer
+# toutes les 2 min. (2026-08-11)
+PBS_CACHE_TTL = 900
+
+
+def _write_failed(conf, data, exc):
+    """Rappel d'échec du pipeline d'écriture InfluxDB (mode batching).
+
+    ⚠️ En batching, `write()` met en file et rend la main : l'erreur HTTP est levée dans
+    le thread de fond et n'atteint JAMAIS le try/except de `collect()`. Sans ce rappel,
+    un jeton révoqué, un bucket renommé ou un disque plein videraient les dashboards
+    Grafana « Aveyron » sans une ligne dans les logs (2026-08-11)."""
+    log.error("métriques Aveyron: écriture InfluxDB refusée (%s) : %s", conf, exc)
+
 
 class AvyMetrics(commands.Cog):
     def __init__(self, bot):
@@ -29,13 +47,23 @@ class AvyMetrics(commands.Cog):
                             and getattr(bot.cfg, "avy_influx_token", ""))
         self._client = None
         self._write_api = None
+        self._pbs_cache = None       # {vmid: ctime} de la dernière énumération réussie
+        self._pbs_cache_ts = 0.0
         if self.enabled:
             try:
                 from influxdb_client import InfluxDBClient
                 self._client = InfluxDBClient(
                     url=bot.cfg.influx_url, token=bot.cfg.avy_influx_token,
                     org=bot.cfg.influx_org, timeout=20_000)
-                self._write_api = self._client.write_api()
+                # On GARDE le mode batching (réessais automatiques offerts par le client,
+                # précieux sur un InfluxDB qui redémarre) mais on branche le rappel
+                # d'erreur : sans lui les échecs d'écriture sont totalement invisibles.
+                try:
+                    self._write_api = self._client.write_api(error_callback=_write_failed)
+                except TypeError:      # client trop ancien pour les rappels : on dégrade
+                    log.warning("collecteur métriques Aveyron: rappels d'écriture non "
+                                "supportés par influxdb-client, échecs non journalisés")
+                    self._write_api = self._client.write_api()
                 log.info("collecteur métriques Aveyron: client InfluxDB initialisé (bucket %s)",
                          bot.cfg.avy_influx_bucket)
             except Exception:
@@ -49,13 +77,49 @@ class AvyMetrics(commands.Cog):
     def cog_unload(self):
         if self.enabled:
             self.collect.cancel()
+        # ⚠️ Fermer le write_api AVANT le client : close() vide le tampon de batch, et le
+        # flush tardif du __del__ taperait sinon sur un client déjà fermé (2026-08-11).
+        if self._write_api is not None:
+            try:
+                self._write_api.close()
+            except Exception:
+                log.warning("métriques Aveyron: fermeture du write_api", exc_info=True)
         if self._client is not None:
             try:
                 self._client.close()
             except Exception:
-                pass
+                log.warning("métriques Aveyron: fermeture du client InfluxDB",
+                            exc_info=True)
 
     # ------------------------------------------------------------------ collecte
+
+    def _backups(self, pve):
+        """{vmid réel: ctime de l'archive la plus récente} — ou None si INCONNU.
+
+        ⚠️ Deux pièges encodés ici (2026-08-11) :
+        1. l'énumération CIFS de nas-backup coûte ~16 s à travers le tunnel WG (cf.
+           Pve.avy_pbs_content) ; la repayer toutes les 2 min saturait le lien le plus
+           fragile de l'infra pour une donnée qui se compte en JOURS — d'où le cache
+           PBS_CACHE_TTL. Le cog avy.py, lui, ne la paie qu'une fois par cycle de 5 min ;
+        2. une lecture en échec renvoie None et NON un dict vide : un dict vide se
+           traduirait par « jamais sauvegardé » pour tout le cluster.
+        Le cache n'est jamais peuplé sur exception, et ne court-circuite pas le chemin à
+        la demande `Pve.pbs_content(vmid)` des commandes utilisateur."""
+        now = time.time()
+        if self._pbs_cache is not None and now - self._pbs_cache_ts <= PBS_CACHE_TTL:
+            return self._pbs_cache
+        table = {}
+        try:
+            for it in pve.avy_pbs_content() or []:
+                v = str(it.get("vmid"))
+                table[v] = max(table.get(v, 0), it.get("ctime") or 0)
+        except AvyUnreachable:
+            return None          # cluster injoignable : déjà signalé par le coupe-circuit
+        except Exception:
+            log.exception("métriques Aveyron: contenu sauvegardes")
+            return None
+        self._pbs_cache, self._pbs_cache_ts = table, now
+        return table
 
     def _points_sync(self):
         """Tout le travail réseau (PVE + construction des points) — appelé via
@@ -175,22 +239,28 @@ class AvyMetrics(commands.Cog):
         except Exception:
             log.exception("métriques Aveyron: statut cluster")
 
+        sfx = "-" + self.bot.cfg.avy_suffix
         try:
-            sfx = "-" + self.bot.cfg.avy_suffix
             rows = [r for r in pve.resources()
                    if r.get("name") and pve.is_avy_name(r["name"])]
         except Exception:
             rows = []
             log.exception("métriques Aveyron: resources()")
-        backups = {}
-        try:
-            for it in pve.avy_pbs_content() or []:
-                v = str(it.get("vmid"))
-                backups[v] = max(backups.get(v, 0), it.get("ctime") or 0)
-        except AvyUnreachable:
-            pass                 # cluster injoignable : déjà signalé par le coupe-circuit
-        except Exception:
-            log.exception("métriques Aveyron: contenu sauvegardes")
+        # ⚠️ _avy_resources() sert DÉLIBÉRÉMENT le dernier instantané réussi pendant
+        # AVY_STALE_MAX (15 min) : cette tolérance existe pour que provision n'archive
+        # pas tous les salons AVY sur un blip WireGuard — surtout pas pour alimenter des
+        # métriques. Écrits sans horodatage explicite, ces points figés donnent dans
+        # Grafana un plateau plat au lieu d'un trou, gardent un invité crashé à
+        # status=1 et un débit calculé à 0 o/s. On lit la fraîcheur à la source plutôt
+        # que de la déduire (une liste de nœuds vide ne prouve rien). (2026-08-11)
+        # ts == 0 = aucun instantané distant n'a jamais réussi : _avy_resources() a
+        # renvoyé [] et il n'y a donc rien de périmé à écarter.
+        ts = getattr(pve, "_avy_last_ts", 0) or 0
+        if rows and ts and time.time() - ts > AVY_ROWS_MAX_AGE:
+            log.warning("métriques Aveyron: instantané des invités périmé (%.0f s) — "
+                        "aucun point invité écrit ce cycle", time.time() - ts)
+            rows = []
+        backups = self._backups(pve)
 
         for r in rows:
             real_name = r["name"].removesuffix(sfx)
@@ -222,13 +292,18 @@ class AvyMetrics(commands.Cog):
                     pass
             pts.append(p)
 
-            last = backups.get(str(real_vmid))
-            pb = Point("pve_backup_age").tag("name", real_name)
-            if last:
-                pb.field("age_seconds", int(now - last)).field("has_backup", 1)
-            else:
-                pb.field("age_seconds", -1).field("has_backup", 0)
-            pts.append(pb)
+            # ⚠️ backups vaut None quand l'énumération a ÉCHOUÉ : « inconnu » n'est pas
+            # « jamais sauvegardé ». Écrire has_backup=0 pour tout le cluster à chaque
+            # hoquet du stockage (5xx, timeout des ~16 s d'énumération CIFS, ACL) est un
+            # faux positif qui se lit ensuite comme une alerte dans Grafana (2026-08-11).
+            if backups is not None:
+                last = backups.get(str(real_vmid))
+                pb = Point("pve_backup_age").tag("name", real_name)
+                if last:
+                    pb.field("age_seconds", int(now - last)).field("has_backup", 1)
+                else:
+                    pb.field("age_seconds", -1).field("has_backup", 0)
+                pts.append(pb)
 
             # OS + systèmes de fichiers (VM avec guest-agent actif uniquement)
             if running and r.get("type") == "qemu":
@@ -287,11 +362,14 @@ class AvyMetrics(commands.Cog):
         if not pts:
             return
         try:
+            # en mode batching ce write ne fait que sérialiser et mettre en file : il ne
+            # remonte QUE les erreurs locales (point invalide). Les échecs HTTP sont
+            # journalisés par _write_failed, dans le thread de fond du client.
             await asyncio.to_thread(
                 self._write_api.write, self.bot.cfg.avy_influx_bucket,
                 self.bot.cfg.influx_org, pts)
         except Exception:
-            log.exception("métriques Aveyron: écriture InfluxDB échouée")
+            log.exception("métriques Aveyron: mise en file de l'écriture InfluxDB échouée")
 
     @collect.before_loop
     async def _before(self):
