@@ -137,6 +137,60 @@ class TestAntiSpam(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- config
+class TestCurseurRefus(unittest.TestCase):
+    """Le curseur ne doit avancer QUE si le lot a été réellement posté (sinon les refus
+    seraient perdus à jamais — salon absent, 403, catégorie…)."""
+
+    def _cog_with_api(self, refused_rows, allowed=False, chan=None):
+        import asyncio
+        cog = _cog()
+        cog.bot.cfg = type("C", (), {"dist_alert_channel_id": 0, "alert_channel_id": 999})()
+
+        async def fake_api(method, action, data=None, params=None, timeout=15):
+            if action == "admin_refused":
+                return {"status": "ok", "refused": refused_rows}
+            if action == "admin_list":
+                return {"status": "ok", "ip": {"allowed": allowed}}
+            return {"status": "ok"}
+        cog.api = fake_api
+        cog.bot.get_channel = lambda cid: chan
+        cog._refused_view = object()
+        return cog, asyncio
+
+    def test_curseur_non_avance_si_salon_absent(self):
+        rows = [{"id": 7, "ip": "203.0.113.5", "kind": "redeem", "at": "t"}]
+        cog, aio = self._cog_with_api(rows, chan=None)   # salon introuvable
+        aio.get_event_loop().run_until_complete(cog.refus_watch())
+        self.assertIsNone(cog.bot.state.get("dist_refused_cursor"))  # PAS avancé
+
+    def test_curseur_avance_si_tout_deja_whiteliste(self):
+        rows = [{"id": 7, "ip": "203.0.113.5", "kind": "redeem", "at": "t"}]
+        cog, aio = self._cog_with_api(rows, allowed=True, chan=None)
+        aio.get_event_loop().run_until_complete(cog.refus_watch())
+        self.assertEqual(cog.bot.state.get("dist_refused_cursor"), 7)  # rien à poster → OK
+
+    def test_curseur_avance_apres_envoi_reussi(self):
+        sent = []
+
+        class Chan:
+            async def send(self, *a, **k):
+                sent.append((a, k))
+        rows = [{"id": 9, "ip": "203.0.113.5", "kind": "redeem", "at": "t"}]
+        cog, aio = self._cog_with_api(rows, chan=Chan())
+        aio.get_event_loop().run_until_complete(cog.refus_watch())
+        self.assertEqual(cog.bot.state.get("dist_refused_cursor"), 9)
+        self.assertEqual(len(sent), 1)
+
+    def test_curseur_non_avance_si_envoi_echoue(self):
+        class Chan:
+            async def send(self, *a, **k):
+                raise RuntimeError("403 Missing Access")  # pas une HTTPException
+        rows = [{"id": 9, "ip": "203.0.113.5", "kind": "redeem", "at": "t"}]
+        cog, aio = self._cog_with_api(rows, chan=Chan())
+        aio.get_event_loop().run_until_complete(cog.refus_watch())
+        self.assertIsNone(cog.bot.state.get("dist_refused_cursor"))  # lot rejouable
+
+
 class TestConfigDist(unittest.TestCase):
     def _cfg(self, **extra):
         env = {"DISCORD_TOKEN": "x", "GUILD_ID": "100"}

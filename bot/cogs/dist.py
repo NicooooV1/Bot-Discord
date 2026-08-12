@@ -125,11 +125,16 @@ class RefusedActionView(GatedView):
         if cog is None or not ip:
             await itx.response.send_message("IP introuvable dans ce message.", ephemeral=True)
             return
+        # On ACQUITTE avant l'édition REST (_finish) : symétrique de allow(). L'edit du
+        # message d'origine peut dépasser la fenêtre de 3 s (bucket d'édition du salon
+        # épuisé par des clics rapprochés, retries 502/504) ; le faire avant l'ack
+        # ferait expirer le token de l'interaction (constat revue 2026-08-12).
+        await itx.response.defer(ephemeral=True)
         cog.mark_ignored(ip)
         itx.client.audit.record(user=f"{itx.user} ({itx.user.id})", action="dist-ignore",
                                 target=ip, result="ok")
         await self._finish(itx, f"🔕 Ignorée par {itx.user.display_name} (24 h)")
-        await itx.response.send_message(
+        await itx.followup.send(
             f"🔕 `{ip}` ignorée : plus de notification pendant 24 h "
             "(ses tentatives restent refusées et journalisées).", ephemeral=True)
 
@@ -142,9 +147,15 @@ class Dist(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        # UNE seule vue persistante réutilisée pour tous les envois : ses custom_id sont
+        # fixes, elle dispatche donc les clics de N'IMPORTE quel message. Créer une vue
+        # NEUVE à chaque chan.send la ferait s'accumuler dans le view-store de discord.py
+        # (timeout=None → jamais retirée) — fuite mémoire lente sur un salon très actif
+        # (constat revue 2026-08-12).
+        self._refused_view = RefusedActionView(self)
 
     async def cog_load(self):
-        self.bot.add_view(RefusedActionView(self))
+        self.bot.add_view(self._refused_view)
         guard_cog_loops(self)
         if self.enabled:
             secs = getattr(self.bot.cfg, "dist_poll_seconds", 120)
@@ -246,6 +257,11 @@ class Dist(commands.Cog):
         return emb
 
     # ------------------------------------------------------------------ veille
+    # Nombre max d'IP notifiées par tick : au-delà, un récapitulatif renvoie vers
+    # /dist refus. Sans borne, N IP distinctes = N embeds + N appels admin_list en
+    # rafale dans #alertes (endpoint public non limité → amplification possible).
+    MAX_NOTIFY_PER_TICK = 10
+
     @tasks.loop(seconds=120)
     async def refus_watch(self):
         cursor = int(self.bot.state.get("dist_refused_cursor") or 0)
@@ -257,8 +273,18 @@ class Dist(commands.Cog):
         if not rows:
             return
         agg = self._aggregate(rows)
-        self.bot.state.set("dist_refused_cursor",
-                           max(cursor, *(a["max_id"] for a in agg.values())))
+        new_cursor = max(cursor, *(a["max_id"] for a in agg.values()))
+
+        # ⚠️ Le salon est résolu AVANT d'avancer le curseur. Le curseur ne recule jamais
+        # (max()), donc l'avancer puis échouer à poster = lot PERDU à jamais (salon
+        # supprimé/mal configuré, cache vidé pendant un re-IDENTIFY). Si des refus sont à
+        # signaler mais que le salon est absent ou n'est pas postable, on NE touche PAS
+        # au curseur : le même lot sera relu au prochain tick (constat revue 2026-08-12).
+        cid = (getattr(self.bot.cfg, "dist_alert_channel_id", 0)
+               or self.bot.cfg.alert_channel_id)
+        chan = self.bot.get_channel(cid) if cid else None
+        postable = chan is not None and hasattr(chan, "send")  # ni None ni catégorie/forum
+
         now = time.time()
         to_notify = []
         for ip, info in agg.items():
@@ -268,21 +294,41 @@ class Dist(commands.Cog):
             if st and st.get("status") == "ok" and (st.get("ip") or {}).get("allowed"):
                 continue                # whitelistée entre-temps : rien à signaler
             to_notify.append((ip, info))
+
         if not to_notify:
+            # Rien à annoncer (tout supprimé/déjà whitelisté) : on peut avancer sans risque.
+            self.bot.state.set("dist_refused_cursor", new_cursor)
             return
-        cid = (getattr(self.bot.cfg, "dist_alert_channel_id", 0)
-               or self.bot.cfg.alert_channel_id)
-        chan = self.bot.get_channel(cid) if cid else None
-        if chan is None:
-            log.warning("refus dist à signaler mais aucun salon d'alertes configuré")
+        if not postable:
+            log.warning("refus dist à signaler (%d IP) mais salon d'alertes absent/non "
+                        "postable (cid=%s) — curseur NON avancé, relance au prochain tick",
+                        len(to_notify), cid)
             return
-        self._remember_notified([ip for ip, _ in to_notify], now)
+
+        overflow = to_notify[self.MAX_NOTIFY_PER_TICK:]
+        to_notify = to_notify[:self.MAX_NOTIFY_PER_TICK]
+
+        sent_ok = True
         for ip, info in to_notify:
             try:
                 await chan.send(embed=self._refused_embed(ip, info),
-                                view=RefusedActionView(self))
-            except discord.HTTPException as e:
+                                view=self._refused_view)
+                self._remember_notified([ip], now)   # mémorisé seulement si RÉELLEMENT posté
+            except Exception as e:  # noqa: BLE001 — HTTPException, mais aussi 403/AttributeError
+                sent_ok = False
                 log.warning("notification refus %s impossible: %s", ip, e)
+                break                                 # on n'avance pas le curseur ce tick
+        if overflow and sent_ok:
+            try:
+                await chan.send(f"➕ **{len(overflow)}** autre(s) IP refusée(s) ce cycle — "
+                                "`/dist refus` pour le détail et l'autorisation.")
+            except Exception:  # noqa: BLE001
+                pass
+        # Curseur avancé UNIQUEMENT si tout le lot a été posté sans erreur. Un échec en
+        # cours de route laisse le curseur en place → le reste sera revu au prochain tick
+        # (le cooldown _suppressed évite de re-poster les IP déjà annoncées).
+        if sent_ok:
+            self.bot.state.set("dist_refused_cursor", new_cursor)
 
     @refus_watch.before_loop
     async def _wait_ready(self):
