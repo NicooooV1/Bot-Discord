@@ -284,6 +284,16 @@ class Config:
         state_dir = g("STATE_DIRECTORY", "/var/lib/discord-bot")
         self.state_path = os.path.join(state_dir, "state.json")
 
+        # --- Serveur de distribution Fronote (CT122 fronote-dist) 2026-08-12 ---
+        # API d'admin de la whitelist d'IP (dist/server.php). DIST_ADMIN_TOKEN =
+        # admin_token de dist/config.php sur CT122 (partagé, jamais en clair en
+        # réponse). Les DEUX vides = cog /dist et veille des refus inactifs.
+        self.dist_url = g("DIST_URL", "").rstrip("/")
+        self.dist_admin_token = g("DIST_ADMIN_TOKEN").strip()
+        # salon des notifications « IP refusée » (défaut : le salon d'alertes)
+        self.dist_alert_channel_id = _int(g("DIST_ALERT_CHANNEL_ID"))
+        self.dist_poll_seconds = max(30, _int(g("DIST_POLL_SECONDS", "120"), 120))
+
         # --- 2FA (TOTP) --------------------------------------------------------
         # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les
         # commandes sans laisser personne s'inscrire. On active APRÈS un /2fa setup.
