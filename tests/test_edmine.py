@@ -574,6 +574,19 @@ class TestDureeInactiviteTerminal(unittest.TestCase):
         TerminalSession.__init__(sess, FauxCog(), None, 106, "ct", 1, None, idle_min=45)
         self.assertEqual(sess.idle_min, 45)
 
+    def test_archivage_du_fil_couvre_la_session(self):
+        """Le fil ne doit pas s'archiver sous une console encore vivante : Discord ne
+        compte QUE les messages, or la console édite son écran sans jamais en envoyer."""
+        from bot.cogs.terminal import auto_archive_for
+        self.assertEqual(auto_archive_for(0), 10080, "vie illimitée -> palier maximum")
+        self.assertEqual(auto_archive_for(None), 10080)
+        self.assertEqual(auto_archive_for(120), 1440,
+                         "2 h de vie sous un archivage à 60 min = fil archivé en séance")
+        self.assertEqual(auto_archive_for(60), 60)
+        self.assertEqual(auto_archive_for(99999), 10080)
+        self.assertIn(auto_archive_for(2000), (60, 1440, 4320, 10080),
+                      "Discord n'accepte QUE ces quatre paliers")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

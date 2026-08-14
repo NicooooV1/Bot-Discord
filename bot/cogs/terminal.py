@@ -84,6 +84,32 @@ def _fence(s: str) -> str:
 # maintenant partagée avec le 2FA, et elle sait dire « illimité » (0 minute).
 _parse_minutes = parse_duration
 
+# Paliers d'archivage automatique proposés par Discord pour un fil (minutes).
+_ARCHIVE_PALIERS = (60, 1440, 4320, 10080)
+
+
+def auto_archive_for(life_min):
+    """Palier d'archivage Discord couvrant la durée de vie possible d'une console.
+
+    ⚠️ Discord archive un fil après N minutes **sans nouveau MESSAGE** — or une console
+    n'en envoie qu'à l'ouverture : l'écran est ÉDITÉ en place et les frappes passent par
+    des boutons/une modale, ce qui ne compte pas comme activité. Le fil était donc créé
+    à 60 min : au-delà d'une heure, une session **encore vivante et pilotée** se
+    retrouvait archivée, l'écran figé (l'édition part en 400 sur un fil archivé) et les
+    boutons morts. Invisible tant que l'inactivité valait 10 min ; devenu la norme depuis
+    qu'on peut demander `2h`, `1h30` ou `illimité` (2026-08-14).
+
+    `life_min` = durée de vie ABSOLUE de la session, **0 = illimitée** (cas des consoles
+    LXC, qui n'ont pas de plafond de vie : tant qu'on tape, elles vivent). On prend alors
+    le plus grand palier — 7 jours, il n'y a pas d'« aucun archivage » chez Discord.
+    Le fil est de toute façon archivé + verrouillé explicitement par `_end` à la
+    fermeture : ce palier n'est qu'un filet si le bot meurt en cours de session.
+    """
+    life = max(0, int(life_min or 0))
+    if not life:
+        return _ARCHIVE_PALIERS[-1]
+    return next((p for p in _ARCHIVE_PALIERS if p >= life), _ARCHIVE_PALIERS[-1])
+
 
 class PveConsole:
     """Console termproxy -> websocket vers un LXC (auth ticket, compte least-priv)."""
@@ -792,7 +818,12 @@ class Terminal(commands.Cog):
             try:
                 thread = await itx.channel.create_thread(
                     name=f"terminal-{name}"[:90], type=discord.ChannelType.private_thread,
-                    invitable=False, auto_archive_duration=60, reason=f"terminal {itx.user}")
+                    invitable=False,
+                    # pas de durée de vie absolue côté LXC -> palier maximum : le fil ne
+                    # doit pas s'archiver sous une console encore pilotée (cf.
+                    # auto_archive_for). `_end` l'archive et le verrouille à la fermeture.
+                    auto_archive_duration=auto_archive_for(0),
+                    reason=f"terminal {itx.user}")
                 await thread.add_user(itx.user)
             except discord.HTTPException as e:
                 log.warning("terminal thread: %s", type(e).__name__)
@@ -937,7 +968,10 @@ class Terminal(commands.Cog):
             try:
                 thread = await itx.channel.create_thread(
                     name="terminal-noeud-pve", type=discord.ChannelType.private_thread,
-                    invitable=False, auto_archive_duration=60,
+                    invitable=False,
+                    # la console du nœud, elle, a une durée de vie absolue : le palier
+                    # juste au-dessus suffit (0 = illimitée -> palier maximum)
+                    auto_archive_duration=auto_archive_for(self.cfg.node_terminal_max_min),
                     reason=f"terminal nœud {itx.user}")
                 await thread.add_user(itx.user)
             except discord.HTTPException as e:
