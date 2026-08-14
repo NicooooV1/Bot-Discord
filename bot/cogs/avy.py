@@ -309,6 +309,7 @@ class Avy(commands.Cog):
         panne n'était PLUS JAMAIS signalée tant qu'elle ne s'était pas d'abord résorbée."""
         s = state.setdefault(node, {"down": 0, "down_alerted": False,
                                     "sto": {}, "guests": {}})
+        s.setdefault("sto_off", {})     # état persisté d'avant l'ajout du 2026-08-14
         if data is None:                                   # nœud injoignable
             s["down"] += 1
             # `>= 2` et non `== 2` : si l'envoi échoue au 2e cycle, le compteur continue
@@ -328,6 +329,24 @@ class Avy(commands.Cog):
 
         for st in data["storages"]:
             name, tot = st.get("storage"), st.get("total") or 0
+            # Stockage DÉCLARÉ ACTIF mais qui ne répond pas (montage NFS/CIFS tombé).
+            # Ajouté le 2026-08-14 : `nas-backup` était dans cet état depuis un moment
+            # sans que RIEN ne le dise — et comme PVE sonde chaque stockage activé à
+            # chaque appel /nodes/x/storage et dans pvestatd, il ralentissait l'API de
+            # tout le cluster (jusqu'à 30 s par lecture). C'est exactement le genre de
+            # panne muette qu'on veut voir dans #alertes plutôt que déduire d'un flapping.
+            if name and st.get("enabled") and not st.get("active"):
+                if not s["sto_off"].get(name):
+                    if await self._send_alert(
+                            node, f"🔴 **{node}** : stockage `{name}` **inactif** "
+                                  f"(activé mais injoignable — montage tombé ?). "
+                                  f"Tant qu'il reste activé, il ralentit l'API du nœud : "
+                                  f"`pvesm set {name} --disable 1` pour le neutraliser."):
+                        s["sto_off"][name] = True
+            elif name and s["sto_off"].get(name):
+                if await self._send_alert(
+                        node, f"🟢 **{node}** : stockage `{name}` de nouveau actif"):
+                    s["sto_off"][name] = False
             if not name or not tot or not st.get("active"):
                 continue
             pct = (st.get("used") or 0) / tot * 100
@@ -446,6 +465,28 @@ class Avy(commands.Cog):
         s = state.setdefault("_cluster", {})
         if not cl.get("ok"):
             return                                      # API muette : géré par nœud
+
+        # ---- l'inventaire configuré colle-t-il au cluster RÉEL ? (2026-08-14)
+        # Le nœud `pve` d'Aveyron a été remplacé par `ms01` sans que le bot n'en dise
+        # rien : il a continué à sonder un fantôme (timeout à chaque cycle) et à ignorer
+        # un nœud entier et ses invités. Une liste de nœuds en config est une hypothèse ;
+        # tant qu'elle n'est pas confrontée au cluster, elle vieillit en silence.
+        reels = set(cl.get("online") or {})
+        if reels:                                   # /cluster/status a bien répondu
+            fantomes = sorted(set(nodes) - reels)
+            oublies = sorted(reels - set(nodes))
+            if fantomes != (s.get("fantomes") or []):
+                if not fantomes or await self._send_alert(
+                        first, f"🔴 **cluster Aveyron** : {', '.join(f'`{n}`' for n in fantomes)} "
+                               f"— configuré(s) dans `AVY_NODES` mais **absent(s) du "
+                               f"cluster**. Chaque lecture part dans le vide."):
+                    s["fantomes"] = fantomes
+            if oublies != (s.get("oublies") or []):
+                if not oublies or await self._send_alert(
+                        first, f"🟠 **cluster Aveyron** : {', '.join(f'`{n}`' for n in oublies)} "
+                               f"— présent(s) dans le cluster mais **non supervisé(s)** "
+                               f"(absent(s) d'`AVY_NODES`), leurs invités aussi."):
+                    s["oublies"] = oublies
 
         # même règle que _alerts : le curseur/verrou ne bouge que si l'annonce est partie
         q, prev_q = cl.get("quorate"), s.get("quorate")

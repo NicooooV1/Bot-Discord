@@ -44,6 +44,9 @@ AVY_BACKOFF = 120
 # vivant : dans cet intervalle, un échec isolé (un nœud, un stockage) n'arme plus le
 # coupe-circuit partagé. Cf. Pve._avy_maybe_trip (2026-08-14).
 AVY_ALIVE_WINDOW = 60
+# Fenêtre du coupe-circuit PAR NŒUD : un nœud qui ne répond plus est court-circuité
+# pendant ce délai, sans que ses voisins ni le cluster en pâtissent (2026-08-14).
+AVY_NODE_BACKOFF = 300
 
 
 def _mk_client(cfg, token_id, secret):
@@ -55,7 +58,7 @@ def _mk_client(cfg, token_id, secret):
         verify_ssl=cfg.pve_verify_ssl, timeout=15)
 
 
-def _mk_remote_client(cfg, token_id, secret):
+def _mk_remote_client(cfg, token_id, secret, timeout=30):
     from proxmoxer import ProxmoxAPI
     user, name = cfg.split_token(token_id)
     # timeout 30 s (vs 15 côté R820) : l'énumération du stockage CIFS nas-backup prend
@@ -64,7 +67,7 @@ def _mk_remote_client(cfg, token_id, secret):
     return ProxmoxAPI(
         cfg.avy_host, port=cfg.avy_port, user=user,
         token_name=name, token_value=secret,
-        verify_ssl=cfg.avy_verify_ssl, timeout=30)
+        verify_ssl=cfg.avy_verify_ssl, timeout=timeout)
 
 
 def _parse_agent_info(agent):
@@ -133,6 +136,13 @@ class _RemoteCluster:
         self._nodes_ts = 0.0
         self._local_cache = None        # nœud servi SANS tunnel inter-nœuds (cf. _local_node)
         self._local_ts = 0.0
+        self._node_fail = {}            # nœud -> instant jusqu'auquel on le court-circuite
+        # Client de SONDE : même hôte, même jeton, mais timeout court. Il ne sert qu'à
+        # trancher « lien mort ou ressource morte ? » quand une lecture expire — question
+        # à laquelle on ne peut pas répondre avec un client dont le timeout EST la panne
+        # qu'on essaie de qualifier (cf. Pve._avy_maybe_trip).
+        self._probe = _mk_remote_client(cfg, cfg.avy_token_id, cfg.avy_token_secret,
+                                        timeout=5)
 
     @property
     def actions_enabled(self):
@@ -190,8 +200,55 @@ class _RemoteCluster:
         agent = self._ro.nodes(self.node_of(vmid)).qemu(vmid).agent
         return _parse_agent_info(agent)
 
+    def alive(self):
+        """Le lien répond-il VITE ? Sonde `/version` avec le client à timeout court.
+
+        Sert d'arbitre à `Pve._avy_maybe_trip` : une lecture qui expire ne dit pas si
+        c'est le LIEN ou la RESSOURCE qui est morte, et le client normal (30 s) ne peut
+        pas répondre — son timeout est précisément la panne à qualifier."""
+        try:
+            self._probe.version.get()
+            return True
+        except Exception:  # noqa: BLE001 — toute erreur = pas de preuve de vie
+            return False
+
+    def _node_guard(self, node, fn, *a, **kw):
+        """Coupe-circuit PAR NŒUD (2026-08-14).
+
+        Un nœud peut être muet pendant que ses voisins répondent en 0,13 s : le 14/08,
+        `nas` était bloqué par un partage CIFS démonté et chacune de ses lectures coûtait
+        30 s de timeout, à chaque cycle, pour rien. On mémorise donc le nœud fautif et on
+        échoue INSTANTANÉMENT pour lui pendant AVY_NODE_BACKOFF, sans toucher aux autres.
+
+        L'erreur réseau est convertie en `AvyNodeUnreachable` — qui n'est PAS un OSError :
+        c'est ce qui empêche `Pve._avy_read` d'armer le coupe-circuit du CLUSTER pour la
+        panne d'un seul nœud. La supervision, elle, voit un nœud injoignable et l'annonce
+        déjà (`_alerts` : « 🔴 nœud injoignable » après 2 cycles, « 🟢 rétabli » ensuite).
+        """
+        now = time.time()
+        if now < self._node_fail.get(node, 0):
+            raise AvyNodeUnreachable(
+                f"nœud {node} muet (coupe-circuit {AVY_NODE_BACKOFF}s)")
+        try:
+            r = fn(*a, **kw)
+        except OSError as e:
+            self._node_fail[node] = now + AVY_NODE_BACKOFF
+            log.warning("cluster %s : nœud %s muet (%s) — ses lectures sont "
+                        "court-circuitées %ds, les autres nœuds continuent",
+                        self.key, node, e, AVY_NODE_BACKOFF)
+            raise AvyNodeUnreachable(f"nœud {node} : {e}") from None
+        if self._node_fail.pop(node, None) is not None:
+            log.info("cluster %s : nœud %s de nouveau joignable", self.key, node)
+        return r
+
+    def degraded_nodes(self):
+        """Nœuds actuellement court-circuités (pour l'affichage : un trou dans la
+        supervision doit se VOIR, pas se deviner)."""
+        now = time.time()
+        return sorted(n for n, until in self._node_fail.items() if now < until)
+
     def node_status(self, node):
-        return self._ro.nodes(node).status.get()
+        return self._node_guard(node, self._ro.nodes(node).status.get)
 
     # ---- lectures riches (graphes, matériel, cluster, config) ----
     def guest_rrd(self, vmid, gtype, timeframe):
@@ -200,13 +257,15 @@ class _RemoteCluster:
         return ep.rrddata.get(timeframe=timeframe)
 
     def node_rrd(self, node, timeframe):
-        return self._ro.nodes(node).rrddata.get(timeframe=timeframe)
+        return self._node_guard(node, self._ro.nodes(node).rrddata.get,
+                                timeframe=timeframe)
 
     def disks(self, node):
-        return self._ro.nodes(node).disks.list.get()
+        return self._node_guard(node, self._ro.nodes(node).disks.list.get)
 
     def smart(self, node, devpath):
-        return self._ro.nodes(node).disks.smart.get(disk=devpath)
+        return self._node_guard(node, self._ro.nodes(node).disks.smart.get,
+                                disk=devpath)
 
     def cluster_status(self):
         return self._ro.cluster.status.get()
@@ -215,7 +274,7 @@ class _RemoteCluster:
         return self._ro.cluster.log.get(max=maxn)
 
     def certificates(self, node):
-        return self._ro.nodes(node).certificates.info.get()
+        return self._node_guard(node, self._ro.nodes(node).certificates.info.get)
 
     def backup_jobs(self):
         return self._ro.cluster.backup.get()
@@ -232,13 +291,13 @@ class _RemoteCluster:
         return (time.perf_counter() - t0) * 1000
 
     def node_storages(self, node):
-        return self._ro.nodes(node).storage.get()
+        return self._node_guard(node, self._ro.nodes(node).storage.get)
 
     def node_tasks(self, node, limit=20, source=None):
         kw = {"limit": limit}
         if source is not None:
             kw["source"] = source
-        return self._ro.nodes(node).tasks.get(**kw)
+        return self._node_guard(node, self._ro.nodes(node).tasks.get, **kw)
 
     def backup_node(self, node, mode, notes, exclude=""):
         """vzdump all=1 du nœud (bouton 💾 du salon hyperviseur AVY-*)."""
@@ -358,6 +417,18 @@ class AvyUnreachable(RuntimeError):
     (Pve._avy_read) sans re-payer le timeout réseau tant que le lien est coupé. Sous-classe
     d'Exception : tous les appelants qui font déjà `except Exception` la capturent, la
     supervision affiche « injoignable » et le bot cesse de re-sonder un lien mort chaque cycle."""
+
+
+class AvyNodeUnreachable(AvyUnreachable):
+    """UN nœud du cluster secondaire ne répond plus — le cluster, lui, va bien.
+
+    Levée par `_RemoteCluster._node_guard`. Sous-classe d'AvyUnreachable (tous les
+    appelants la traitent déjà comme « lecture distante indisponible »), mais surtout
+    **pas un OSError** : c'est ce qui empêche `Pve._avy_read` d'armer le coupe-circuit du
+    CLUSTER pour la panne d'un seul nœud. Distinction née de l'incident du 2026-08-14,
+    où le nœud `nas` (partage CIFS démonté) faisait déclarer tout Aveyron injoignable —
+    d'abord par intermittence, puis en permanence : chaque fenêtre « half-open » du
+    coupe-circuit retombait sur une lecture de ce nœud, qui la ré-armait aussitôt."""
 
 
 class _LlmBridge:
@@ -807,6 +878,16 @@ class Pve:
             log.debug("cluster %s : échec isolé (une lecture a réussi il y a moins de "
                       "%ds) — coupe-circuit NON armé", self.avy_key or "AVEYRON",
                       AVY_ALIVE_WINDOW)
+            return
+        # Preuve indirecte trop vieille : on DEMANDE au lien. Les boucles de supervision
+        # tournent toutes les 2 à 4 min, donc en début de cycle le dernier succès a
+        # presque toujours plus d'AVY_ALIVE_WINDOW — la seule fenêtre de récence ne
+        # suffisait pas (mesuré le 2026-08-14 : le coupe-circuit se ré-armait quand même,
+        # jusqu'à rester ouvert en continu). La sonde tranche en 5 s au plus.
+        if self._avy is not None and self._avy.alive():
+            self._avy_ok_ts = time.time()
+            log.debug("cluster %s : sonde OK — échec local, coupe-circuit NON armé",
+                      self.avy_key or "AVEYRON")
             return
         self._avy_trip()
 

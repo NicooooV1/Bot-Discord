@@ -599,6 +599,52 @@ class TestCoupeCircuitAveyron(unittest.TestCase):
         with self.assertRaises(AvyUnreachable):
             p._avy_soft_read(lambda: "jamais appelé")   # court-circuitée aussi
 
+    def test_sonde_arbitre_quand_la_recence_ne_suffit_pas(self):
+        """Les boucles tournent toutes les 2-4 min : en début de cycle, le dernier succès
+        a presque toujours plus de 60 s. Sans sonde, le coupe-circuit se ré-armait quand
+        même — et restait ouvert en continu (mesuré le 14/08)."""
+        from bot.core.pve import AVY_ALIVE_WINDOW, AvyUnreachable
+
+        class FauxAvy:
+            key = "AVEYRON"
+            def __init__(self, vivant): self.vivant = vivant
+            def alive(self): return self.vivant
+
+        for vivant, arme in ((True, False), (False, True)):
+            p = self._pve()
+            p._avy = FauxAvy(vivant)
+            p._avy_ok_ts = time.time() - AVY_ALIVE_WINDOW - 1   # récence épuisée
+            with self.assertRaises(AvyUnreachable):
+                p._avy_read(lambda: (_ for _ in ()).throw(TimeoutError("muet")))
+            self.assertEqual(bool(p._avy_fail_ts), arme,
+                             f"sonde vivante={vivant} -> armement attendu {arme}")
+
+    def test_coupe_circuit_par_noeud(self):
+        """Un nœud muet ne doit coûter son timeout qu'UNE fois, et ne pas contaminer
+        ses voisins ni le cluster."""
+        from bot.core.pve import AvyNodeUnreachable, AvyUnreachable, _RemoteCluster
+        c = _RemoteCluster.__new__(_RemoteCluster)
+        c.key, c._node_fail = "AVEYRON", {}
+
+        def muet():
+            raise TimeoutError("Read timed out. (read timeout=30)")
+
+        with self.assertRaises(AvyNodeUnreachable):
+            c._node_guard("nas", muet)
+        self.assertIn("nas", c.degraded_nodes())
+        appels = []
+        with self.assertRaises(AvyNodeUnreachable):      # 2e appel : plus de timeout payé
+            c._node_guard("nas", lambda: appels.append(1))
+        self.assertEqual(appels, [], "le nœud muet doit être court-circuité")
+        self.assertEqual(c._node_guard("ms01", lambda: "ok"), "ok",
+                         "les voisins ne doivent pas être touchés")
+        # non-OSError : c'est ce qui protège le coupe-circuit du CLUSTER
+        self.assertTrue(issubclass(AvyNodeUnreachable, AvyUnreachable))
+        self.assertFalse(issubclass(AvyNodeUnreachable, OSError))
+        c._node_fail["nas"] = 0                          # fenêtre écoulée
+        self.assertEqual(c._node_guard("nas", lambda: "revenu"), "revenu")
+        self.assertEqual(c.degraded_nodes(), [])
+
     def test_any_node_prefere_le_noeud_local(self):
         """Viser un autre nœud fait passer l'appel par le tunnel inter-nœuds, qui ne rend
         pas l'erreur d'un stockage HS : il expire à ~30 s (596)."""
