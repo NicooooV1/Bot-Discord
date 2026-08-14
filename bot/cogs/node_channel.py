@@ -463,7 +463,7 @@ class NodeControlView(GatedView):
         if cog is None:
             await itx.response.send_message("Terminal non activé.", ephemeral=True)
             return
-        await cog.open_node_for(itx)
+        await cog.prompt_open_node(itx)
 
 
 async def setup(bot):

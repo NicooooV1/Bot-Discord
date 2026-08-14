@@ -67,12 +67,34 @@ try:
 except Exception:                       # pragma: no cover
     _HAS_PYTE = False
 
+# sentinelle des pré-contrôles : « refus 2FA » se répond par deny_2fa (bouton /2fa), pas
+# par un simple message — cf. Terminal._refuse
+_NEED_2FA = object()
+
 _ANSI = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-9;?]*[ -/]*[@-~]")
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _fence(s: str) -> str:
     return (s or "").replace("```", "`​``")
+
+
+_DUREE = re.compile(r"^(?:(?P<h>\d{1,3})\s*h\s*(?P<hm>\d{1,2})?|(?P<m>\d{1,4})\s*(?:m(?:in)?)?)$",
+                    re.I)
+
+
+def _parse_minutes(raw: str) -> int:
+    """« 45 », « 45m », « 45 min », « 2h », « 1h30 » -> minutes. ValueError sinon.
+
+    Les bornes (1..plafond) ne sont PAS appliquées ici : l'appelant les connaît (guest ou
+    nœud) et doit pouvoir citer la valeur refusée dans son message.
+    """
+    m = _DUREE.match((raw or "").strip())
+    if not m:
+        raise ValueError(raw)
+    if m.group("h") is not None:
+        return int(m.group("h")) * 60 + int(m.group("hm") or 0)
+    return int(m.group("m"))
 
 
 class PveConsole:
@@ -416,6 +438,64 @@ class TextModal(GatedView, discord.ui.Modal, title="Terminal — saisir du texte
         await sess.send_input(text + "\r", itx.user, text or "<Entrée>")
 
 
+class IdleModal(GatedView, discord.ui.Modal, title="Terminal — inactivité"):
+    """Demande la période d'inactivité AVANT d'ouvrir la console (2026-08-14).
+
+    Avant, le délai venait uniquement de la conf (`TERMINAL_IDLE_MIN` / `NODE_...`) : une
+    session de travail long (compilation, `claude` qui réfléchit) mourait à 10 min, et
+    remonter le défaut global aurait rallongé TOUTES les consoles root — l'inverse de ce
+    qu'on veut. Le choix est donc par session, borné par un plafond de conf.
+
+    Porte : `gate = None` volontairement. Ouvrir la modale ne fait RIEN de sensible ; la
+    console n'est ouverte que par `open_for`/`open_node_for`, qui refont l'intégralité des
+    contrôles (tier, session 2FA, exclusions, quotas) sur l'interaction de SOUMISSION —
+    seule qui compte, une modale pouvant être soumise longtemps après son ouverture.
+    """
+
+    gate = None
+    gate_reason = ("ouvrir la modale n'ouvre aucune console ; open_for/open_node_for "
+                   "refont tous les contrôles (tier + 2FA + quotas) sur la soumission")
+
+    minutes = discord.ui.TextInput(
+        label="Fermeture auto après (minutes)",
+        style=discord.TextStyle.short,
+        required=False, max_length=5)
+
+    def __init__(self, cog, name, *, node=False, default=10, maximum=120):
+        super().__init__()
+        self.cog = cog
+        self.name = name
+        self.node = node
+        self.default = default
+        self.maximum = maximum
+        # les enfants sont deepcopy'és par instance (discord.py `_init_children`) :
+        # personnaliser ici n'affecte pas les autres modales
+        self.minutes.default = str(default)
+        self.minutes.placeholder = f"{1} à {maximum} — vide = défaut ({default})"
+
+    async def on_submit(self, itx: discord.Interaction):
+        raw = str(self.minutes.value or "").strip()
+        if not raw:
+            idle = self.default
+        else:
+            try:
+                idle = _parse_minutes(raw)
+            except ValueError:
+                await itx.response.send_message(
+                    f"⏱️ Durée invalide : `{raw[:30]}`. Attendu un nombre de minutes "
+                    f"(1 à {self.maximum}), ou `1h30`.", ephemeral=True)
+                return
+            if not 1 <= idle <= self.maximum:
+                await itx.response.send_message(
+                    f"⏱️ Durée hors bornes : **{idle} min** (autorisé 1 à "
+                    f"{self.maximum} min).", ephemeral=True)
+                return
+        if self.node:
+            await self.cog.open_node_for(itx, idle_min=idle)
+        else:
+            await self.cog.open_for(itx, self.name, idle_min=idle)
+
+
 class TerminalView(GatedView):
     """Boutons-touches de l'écran d'une console LXC.
 
@@ -620,30 +700,55 @@ class Terminal(commands.Cog):
         roles = self.cfg.terminal_owner_role_ids
         return bool(roles and ({r.id for r in getattr(itx.user, "roles", [])} & set(roles)))
 
-    async def open_for(self, itx: discord.Interaction, name):
-        from ..core.permissions import session_2fa_ok, deny_2fa
+    def _precheck(self, itx, name):
+        """Contrôles d'ouverture d'une console LXC, SANS aucune I/O (donc utilisables
+        avant l'ACK des 3 s d'une interaction). Retourne None si tout passe, `_NEED_2FA`,
+        ou le message de refus. Rejoués par `open_for` sur l'interaction de soumission de
+        la modale : entre l'affichage de celle-ci et son envoi, le 2FA peut expirer, un
+        rôle être retiré ou les 3 sessions être prises."""
+        from ..core.permissions import session_2fa_ok
         if not getattr(self.cfg, "terminal_ready", False):
-            await itx.response.send_message("Terminal non configuré.", ephemeral=True)
-            return
+            return "Terminal non configuré."
         if not self._may_open(itx):
-            await itx.response.send_message(
-                "🔒 Terminal réservé aux gestionnaires (rôle Gestion) ou au propriétaire.",
-                ephemeral=True)
-            return
+            return ("🔒 Terminal réservé aux gestionnaires (rôle Gestion) ou au "
+                    "propriétaire.")
         if not session_2fa_ok(itx):
-            await deny_2fa(itx)
-            return
+            return _NEED_2FA
         if not name:
-            await itx.response.send_message("VM/conteneur introuvable.", ephemeral=True)
-            return
+            return "VM/conteneur introuvable."
         if name.lower() in self.cfg.terminal_excluded_guests:
-            await itx.response.send_message(
-                f"⛔ Terminal désactivé sur **{name}** (guest sensible).", ephemeral=True)
-            return
+            return f"⛔ Terminal désactivé sur **{name}** (guest sensible)."
         if len(self.sessions) + self._pending >= self._max:
-            await itx.response.send_message(
-                "Trop de terminaux ouverts — ferme-en un.", ephemeral=True)
+            return "Trop de terminaux ouverts — ferme-en un."
+        return None
+
+    async def _refuse(self, itx, err):
+        from ..core.permissions import deny_2fa
+        if err is _NEED_2FA:
+            await deny_2fa(itx)
+        else:
+            await itx.response.send_message(err, ephemeral=True)
+
+    async def prompt_open(self, itx: discord.Interaction, name):
+        """Point d'entrée du bouton 🖥️ : demande la durée d'inactivité, puis ouvre.
+
+        ⚠️ `send_modal` DOIT être la première réponse à l'interaction — d'où des
+        pré-contrôles sans I/O ici (le bouton n'a pas de defer, cf. ct_channels)."""
+        err = self._precheck(itx, name)
+        if err is not None:
+            await self._refuse(itx, err)
             return
+        await itx.response.send_modal(IdleModal(
+            self, name, default=self.cfg.terminal_idle_min,
+            maximum=self.cfg.terminal_idle_max_min))
+
+    async def open_for(self, itx: discord.Interaction, name, idle_min=None):
+        err = self._precheck(itx, name)
+        if err is not None:
+            await self._refuse(itx, err)
+            return
+        idle_min = min(max(1, int(idle_min or self.cfg.terminal_idle_min)),
+                       self.cfg.terminal_idle_max_min)
         self._pending += 1
         reserved = True
         try:
@@ -695,14 +800,16 @@ class Terminal(commands.Cog):
                     ephemeral=True)
                 return
 
-            sess = TerminalSession(self, thread, vmid, name, itx.user.id, console)
+            sess = TerminalSession(self, thread, vmid, name, itx.user.id, console,
+                                   idle_min=idle_min)
             emb = discord.Embed(
                 title=f"🖥️ Terminal — {name}",
                 description=("Console **root** interactive (vmid %s). Écran ci-dessous, mis à "
                              "jour en direct. Boutons = touches ; **⌨️ Texte** pour saisir une "
                              "ligne (Entrée ajoutée). Idéal pour piloter une appli plein-écran "
-                             "(claude, top…).\nFermeture auto après **%d min** d'inactivité."
-                             % (vmid, self.cfg.terminal_idle_min)),
+                             "(claude, top…).\nFermeture auto après **%d min** d'inactivité "
+                             "(choisi à l'ouverture)."
+                             % (vmid, idle_min)),
                 color=0xED4245)
             emb.set_footer(text="least-priv botconsole@pve · saisies journalisées")
             # même ordre critique que open_node_for : publier la session AVANT son UI
@@ -729,7 +836,7 @@ class Terminal(commands.Cog):
             self._pending -= 1
             reserved = False
             self.bot.audit.record(user=f"{itx.user}({itx.user.id})", action="terminal-open",
-                                  target=name, result="ok")
+                                  target=name, result=f"ok (inactivité {idle_min} min)")
             await console.force_redraw()        # capture l'écran complet dès l'ouverture
             await itx.followup.send(f"✅ Terminal ouvert : {thread.mention}", ephemeral=True)
         finally:
@@ -749,42 +856,56 @@ class Terminal(commands.Cog):
         o = getattr(self.cfg, "node_owner_role_id", 0)
         return bool(o and o in {r.id for r in getattr(itx.user, "roles", [])})
 
-    async def open_node_for(self, itx: discord.Interaction):
-        """Ouvre un shell root sur l'hyperviseur (nœud PVE) via SSH (cf. core/nodeshell)."""
-        from ..core.nodeshell import NodeShell
-
+    def _precheck_node(self, itx):
+        """Idem `_precheck`, pour le shell root de l'hyperviseur. Sans I/O."""
+        from ..core.permissions import session_2fa_ok
         if not getattr(self.cfg, "node_terminal_ready", False):
-            await itx.response.send_message(
-                "Terminal du nœud non configuré (`NODE_TERMINAL_ENABLED` / clé SSH).",
-                ephemeral=True)
-            return
+            return "Terminal du nœud non configuré (`NODE_TERMINAL_ENABLED` / clé SSH)."
         if not self._may_open_node(itx):
-            await itx.response.send_message(
-                "🔒 Console de l'hyperviseur réservée au propriétaire.", ephemeral=True)
-            return
+            return "🔒 Console de l'hyperviseur réservée au propriétaire."
         # Root shell sur l'hyperviseur : la session 2FA est exigée EN PLUS (même pour le
         # propriétaire) — cf. « le 2FA protège l'ensemble des usages » + catégorie Lock.
-        from ..core.permissions import session_2fa_ok, deny_2fa
         if not session_2fa_ok(itx):
-            await deny_2fa(itx)
-            return
+            return _NEED_2FA
         # asymétrie assumée avec les guests (qui dégradent vers un buffer texte) : piloter
         # un shell root sur l'hyperviseur avec un rendu approximatif est trop risqué.
         if not _HAS_PYTE:
-            await itx.response.send_message("Émulateur `pyte` absent.", ephemeral=True)
-            return
+            return "Émulateur `pyte` absent."
         # Une seule console de nœud à la fois. Le drapeau `_node_pending` est indispensable :
         # `self.sessions` n'est peuplé qu'APRÈS l'ouverture SSH (~1 s), donc un second clic
         # pendant cette fenêtre passerait le test et ouvrirait un DEUXIÈME shell root.
-        # Test + réservation sans `await` entre les deux -> atomique en asyncio.
+        # Test + réservation sans `await` entre les deux -> atomique en asyncio (le test
+        # ci-dessous et la pose du drapeau dans open_node_for restent dans le MÊME bloc
+        # synchrone ; ce pré-contrôle-ci, joué avant la modale, ne réserve rien).
         if self._node_pending or any(s.vmid is None for s in self.sessions.values()):
-            await itx.response.send_message(
-                "Une console du nœud est déjà ouverte — ferme-la d'abord.", ephemeral=True)
-            return
+            return "Une console du nœud est déjà ouverte — ferme-la d'abord."
         if len(self.sessions) + self._pending >= self._max:
-            await itx.response.send_message(
-                "Trop de terminaux ouverts — ferme-en un.", ephemeral=True)
+            return "Trop de terminaux ouverts — ferme-en un."
+        return None
+
+    async def prompt_open_node(self, itx: discord.Interaction):
+        """Point d'entrée du bouton 🖥️ du salon nœud : durée d'inactivité puis ouverture."""
+        err = self._precheck_node(itx)
+        if err is not None:
+            await self._refuse(itx, err)
             return
+        await itx.response.send_modal(IdleModal(
+            self, self.cfg.pve_node, node=True,
+            default=self.cfg.node_terminal_idle_min,
+            maximum=self.cfg.node_terminal_idle_max_min))
+
+    async def open_node_for(self, itx: discord.Interaction, idle_min=None):
+        """Ouvre un shell root sur l'hyperviseur (nœud PVE) via SSH (cf. core/nodeshell)."""
+        from ..core.nodeshell import NodeShell
+
+        err = self._precheck_node(itx)
+        if err is not None:
+            await self._refuse(itx, err)
+            return
+        # le plafond de conf est déjà borné par node_terminal_max_min (cf. config.py) :
+        # promettre plus d'inactivité que la durée de vie absolue n'aurait aucun sens
+        idle_min = min(max(1, int(idle_min or self.cfg.node_terminal_idle_min)),
+                       self.cfg.node_terminal_idle_max_min)
 
         self._pending += 1
         self._node_pending = True
@@ -823,7 +944,7 @@ class Terminal(commands.Cog):
 
             # vmid=None est le MARQUEUR « session nœud » (cf. le test d'unicité ci-dessus)
             sess = TerminalSession(self, thread, None, self.cfg.pve_node, itx.user.id,
-                                   console, idle_min=self.cfg.node_terminal_idle_min,
+                                   console, idle_min=idle_min,
                                    max_min=self.cfg.node_terminal_max_min)
             emb = discord.Embed(
                 title=f"🖥️ Terminal — HYPERVISEUR {self.cfg.pve_node}",
@@ -831,8 +952,10 @@ class Terminal(commands.Cog):
                     "⚠️ Console **root sur l'hôte Proxmox lui-même** — pas un conteneur. "
                     "Tout ce qui est tapé ici s'exécute sur la machine qui fait tourner "
                     "toutes les VM/conteneurs.\nBoutons = touches ; **⌨️ Texte** pour saisir une "
-                    f"ligne. Fermeture auto après **{self.cfg.node_terminal_idle_min} min** "
-                    "d'inactivité."),
+                    f"ligne. Fermeture auto après **{idle_min} min** d'inactivité "
+                    "(choisi à l'ouverture)"
+                    + (f", durée de vie maximale **{self.cfg.node_terminal_max_min} min**."
+                       if self.cfg.node_terminal_max_min else ".")),
                 color=0xED4245)
             emb.set_footer(text="SSH clé dédiée · propriétaire uniquement · ouverture "
                                 "auditée (bot + sshd de l'hôte)")
@@ -863,7 +986,8 @@ class Terminal(commands.Cog):
             reserved = False
             self.bot.audit.record(user=f"{itx.user}({itx.user.id})",
                                   action="terminal-node-open",
-                                  target=f"noeud/{self.cfg.pve_node}", result="ok")
+                                  target=f"noeud/{self.cfg.pve_node}",
+                                  result=f"ok (inactivité {idle_min} min)")
             await console.force_redraw()
             await itx.followup.send(f"✅ Terminal nœud ouvert : {thread.mention}", ephemeral=True)
         finally:

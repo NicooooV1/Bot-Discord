@@ -796,7 +796,9 @@ class CtControlView(GatedView):
         if cog is None:
             await itx.response.send_message("Terminal non activé.", ephemeral=True)
             return
-        await cog.open_for(itx, name)
+        # modale « durée d'inactivité » d'abord (elle DOIT être la première réponse à
+        # l'interaction — d'où l'absence de defer sur ce bouton), puis open_for
+        await cog.prompt_open(itx, name)
 
 
 async def setup(bot):

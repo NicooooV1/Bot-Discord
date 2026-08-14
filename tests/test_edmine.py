@@ -473,5 +473,44 @@ class TestFiletDesBoucles(unittest.TestCase):
                          "restart() est un no-op après échec — utiliser start()")
 
 
+# ------------------------------------------------- durée d'inactivité d'un terminal
+class TestDureeInactiviteTerminal(unittest.TestCase):
+    """La durée est saisie à l'ouverture (modale) : elle vient de l'utilisateur, donc
+    elle doit être analysée strictement et BORNÉE — un shell root avec « 100000 min »
+    d'inactivité serait un shell root permanent."""
+
+    def test_parse(self):
+        from bot.cogs.terminal import _parse_minutes
+        for brut, attendu in (("45", 45), ("45m", 45), ("45 min", 45),
+                              ("2h", 120), ("1h30", 90), (" 90 ", 90)):
+            self.assertEqual(_parse_minutes(brut), attendu, brut)
+        for brut in ("", "abc", "-5", "10 jours", "1h30m", "1e3"):
+            with self.assertRaises(ValueError, msg=brut):
+                _parse_minutes(brut)
+
+    def test_plafond_jamais_sous_le_defaut(self):
+        cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "1",
+                          "TERMINAL_IDLE_MIN": "30", "TERMINAL_IDLE_MAX_MIN": "10"})
+        self.assertEqual(cfg.terminal_idle_max_min, 30,
+                         "un plafond sous le défaut refuserait le défaut lui-même")
+
+    def test_plafond_noeud_borne_par_la_duree_de_vie(self):
+        cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "1",
+                          "NODE_TERMINAL_IDLE_MAX_MIN": "600",
+                          "NODE_TERMINAL_MAX_MIN": "120"})
+        self.assertEqual(cfg.node_terminal_idle_max_min, 120,
+                         "promettre plus d'inactivité que la durée de vie absolue")
+
+    def test_session_utilise_la_valeur_choisie(self):
+        from bot.cogs.terminal import TerminalSession
+
+        class FauxCog:
+            cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "1"})
+
+        sess = TerminalSession.__new__(TerminalSession)
+        TerminalSession.__init__(sess, FauxCog(), None, 106, "ct", 1, None, idle_min=45)
+        self.assertEqual(sess.idle_min, 45)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

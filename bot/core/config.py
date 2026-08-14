@@ -225,6 +225,12 @@ class Config:
             x.strip().lower() for x in
             g("TERMINAL_EXCLUDED_GUESTS", "vaultwarden,mailserver,bdd").split(",") if x.strip()}
         self.terminal_idle_min = max(1, _int(g("TERMINAL_IDLE_MIN", "10"), 10))
+        # plafond de la valeur SAISIE à l'ouverture (modale « inactivité ») : la valeur
+        # par défaut ci-dessus reste ce qui s'applique si rien n'est saisi. Le plafond
+        # n'est jamais inférieur au défaut, sinon une conf incohérente rendrait le défaut
+        # lui-même refusé.
+        self.terminal_idle_max_min = max(
+            self.terminal_idle_min, _int(g("TERMINAL_IDLE_MAX_MIN", "120"), 120))
         self.pve_console_user = g("PVE_CONSOLE_USER", "botconsole@pve")
         self.pve_console_password = g("PVE_CONSOLE_PASSWORD").strip()
 
@@ -249,6 +255,14 @@ class Config:
         self.node_backup_exclude = g("NODE_BACKUP_EXCLUDE", "200").strip()
         # durée de vie ABSOLUE d'une console du nœud, même active (0 = illimité)
         self.node_terminal_max_min = max(0, _int(g("NODE_TERMINAL_MAX_MIN", "120"), 120))
+        # plafond de l'inactivité SAISIE pour le shell root de l'hyperviseur. Défaut plus
+        # bas que celui des guests (shell root sur l'hôte) et, quand une durée de vie
+        # absolue est posée, borné par elle : autoriser « 4 h d'inactivité » alors que la
+        # session est tuée à 2 h dans tous les cas ne serait qu'un mensonge d'interface.
+        self.node_terminal_idle_max_min = max(
+            self.node_terminal_idle_min,
+            min(_int(g("NODE_TERMINAL_IDLE_MAX_MIN", "60"), 60),
+                self.node_terminal_max_min or 10 ** 9))
 
         # --- Live log stream ---
         self.live_log_bind_addr = g("LIVE_LOG_BIND_ADDR", "0.0.0.0")
