@@ -127,6 +127,8 @@ class _RemoteCluster:
         self._gnodes = {}
         self._nodes_cache = None
         self._nodes_ts = 0.0
+        self._local_cache = None        # nœud servi SANS tunnel inter-nœuds (cf. _local_node)
+        self._local_ts = 0.0
 
     @property
     def actions_enabled(self):
@@ -285,16 +287,53 @@ class _RemoteCluster:
             raise last
         return out
 
+    def _local_node(self, ttl=300):
+        """Nom du nœud qui répond DIRECTEMENT à l'adresse configurée (`local: 1` de
+        /cluster/status), ou None si on n'a pas pu le déterminer.
+
+        ⚠️ POURQUOI C'EST DÉCISIF (mesuré le 2026-08-14). pveproxy ne traite localement
+        que les requêtes visant SON nœud : viser un AUTRE nœud fait passer l'appel par un
+        tunnel entre nœuds. Quand la ressource demandée est en panne côté distant, ce
+        tunnel ne renvoie PAS l'erreur — il reste muet puis expire (HTTP 596) au bout de
+        ~30 s, soit exactement le timeout du client. Avec le stockage `nas-backup` HS :
+        nœud LOCAL = erreur 500 explicite en 3 s ; nœud distant = 30 s de silence. Le
+        second faisait déclarer tout le cluster injoignable (coupe-circuit armé sur un
+        timeout) alors que le lien WireGuard répondait en 30 ms — 287 bascules
+        « injoignable / de nouveau joignable » dans la seule journée du 14.
+
+        Cache long (5 min) : le nœud d'entrée ne change que si l'adresse configurée change.
+        """
+        now = time.time()
+        if self._local_cache is None or now - self._local_ts > ttl:
+            try:
+                st = self._ro.cluster.status.get() or []
+                self._local_cache = next(
+                    (n.get("name") for n in st
+                     if n.get("type") == "node" and n.get("local") and n.get("name")), "")
+            except Exception as e:  # noqa: BLE001 — simple optimisation : sans elle on
+                # retombe sur nodes_online()[0], le comportement d'avant
+                log.debug("cluster %s : nœud local indéterminé (%s)", self.key, e)
+                self._local_cache = ""      # "" = cherché sans succès (pas de re-essai avant ttl)
+            self._local_ts = now
+        return self._local_cache or None
+
     def _any_node(self):
-        """Un nœud en ligne quelconque — le stockage de sauvegarde est PARTAGÉ (CIFS sur
-        tous les nœuds), n'importe lequel répond. Liste vide = cluster entier hors ligne :
-        on lève au lieu d'un `[0]` -> IndexError « list index out of range » incompréhensible
-        côté Discord (2026-08-11). AvyUnreachable est définie plus bas dans le module : la
-        résolution du nom se fait à l'appel, pas à la définition."""
+        """Le nœud à qui adresser une lecture NON liée à un invité (stockage de
+        sauvegarde partagé : n'importe lequel sait répondre).
+
+        On privilégie le nœud LOCAL de l'API contactée — pas pour la vitesse, mais pour
+        ne pas dépendre du tunnel inter-nœuds, qui transforme une panne de stockage en
+        timeout de 30 s (cf. _local_node). À défaut, premier nœud en ligne, comme avant.
+
+        Liste vide = cluster entier hors ligne : on lève au lieu d'un `[0]` -> IndexError
+        « list index out of range » incompréhensible côté Discord (2026-08-11).
+        AvyUnreachable est définie plus bas dans le module : la résolution du nom se fait
+        à l'appel, pas à la définition."""
         nodes = self.nodes_online()
         if not nodes:
             raise AvyUnreachable(f"aucun nœud en ligne sur {self.key}")
-        return nodes[0]
+        local = self._local_node()
+        return local if local in nodes else nodes[0]
 
     def pbs_content(self, vmid=None):
         items = self._ro.nodes(self._any_node()).storage(self.storage).content.get()
@@ -695,8 +734,11 @@ class Pve:
 
     def avy_pbs_content(self):
         """Contenu COMPLET du stockage de sauvegarde Aveyron (l'énumération CIFS prend
-        ~16 s : UNE lecture par cycle, répartie ensuite par nœud via le vmid)."""
-        return self._avy_read(self._avy.pbs_content)
+        ~16 s : UNE lecture par cycle, répartie ensuite par nœud via le vmid).
+
+        `_avy_soft_read` : la seule lecture assez lente pour expirer toute seule, donc la
+        seule qui ne doit pas pouvoir déclarer le cluster mort (cf. _avy_soft_read)."""
+        return self._avy_soft_read(self._avy.pbs_content)
 
     def avy_backup_node(self, node, mode="snapshot"):
         """vzdump all=1 d'UN nœud Aveyron (bouton 💾 du salon hyperviseur AVY-*). ACTION
@@ -761,13 +803,37 @@ class Pve:
         Sinon on tente : un échec réseau (OSError — dont les ConnectionError/Timeout de
         requests, qui en héritent) arme le coupe-circuit et lève AvyUnreachable ; toute
         autre exception (5xx PVE, LookupError…) remonte telle quelle pour rester visible."""
+        return self._avy_guarded(fn, a, kw, arm=True)
+
+    def _avy_soft_read(self, fn, *a, **kw):
+        """Lecture distante qui OBÉIT au coupe-circuit sans jamais l'ARMER (2026-08-14).
+
+        Réservé aux lectures à la fois LENTES et ISOLÉES — aujourd'hui la seule
+        énumération du stockage de sauvegarde, qui prend ~16 s en marche normale (CIFS) et
+        expire quand le partage est démonté côté Aveyron. Un timeout sur CET appel ne dit
+        rien du lien : le prendre pour une panne de cluster coupait pendant 120 s toutes
+        les autres lectures — supervision, métriques, graphes — alors que le tunnel
+        répondait en 30 ms. Il reste COURT-CIRCUITÉ quand le lien est réellement connu
+        coupé : on ne re-paie pas son timeout à chaque cycle d'une vraie panne.
+
+        Contrepartie assumée : une panne qui ne se manifesterait QUE sur cette lecture
+        n'arme plus rien — c'est voulu, un stockage mort n'est pas un cluster mort.
+        """
+        return self._avy_guarded(fn, a, kw, arm=False)
+
+    def _avy_guarded(self, fn, a, kw, *, arm):
         if time.time() - getattr(self, "_avy_fail_ts", 0) < AVY_BACKOFF:
             raise AvyUnreachable(f"{self.avy_key or 'AVEYRON'} injoignable (coupe-circuit)")
         try:
             r = fn(*a, **kw)
         except OSError as e:
-            self._avy_trip()
+            if arm:
+                self._avy_trip()
+                raise AvyUnreachable(str(e) or "réseau") from None
+            # pas d'_avy_trip ET pas d'_avy_ok : cet appel ne tranche RIEN sur l'état du
+            # lien, ni dans un sens ni dans l'autre. L'appelant voit un échec normal.
             raise AvyUnreachable(str(e) or "réseau") from None
+        # succès : lui, prouve bien que le lien est là — il referme le coupe-circuit.
         self._avy_ok()
         return r
 

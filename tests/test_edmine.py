@@ -536,6 +536,63 @@ class TestFiletDesBoucles(unittest.TestCase):
                          "restart() est un no-op après échec — utiliser start()")
 
 
+# ------------------------------------------- coupe-circuit du cluster secondaire
+class TestCoupeCircuitAveyron(unittest.TestCase):
+    """2026-08-14 : 287 bascules « injoignable / de nouveau joignable » en une journée,
+    tunnel WireGuard parfaitement sain (0 % de perte, 34 ms). Une SEULE lecture — le
+    contenu du stockage de sauvegarde, dont le partage CIFS était démonté côté Aveyron —
+    expirait à 30 s et faisait déclarer tout le cluster mort pendant 120 s."""
+
+    def _pve(self):
+        from bot.core.pve import Pve
+        p = Pve.__new__(Pve)               # pas d'__init__ : aucun réseau, aucune conf
+        p._avy = None                      # `avy_key` est une property : elle le lit
+        p._avy_fail_ts = 0.0
+        p._avy_warned = False
+        return p
+
+    def test_lecture_lente_n_arme_pas_le_coupe_circuit(self):
+        from bot.core.pve import AvyUnreachable
+        p = self._pve()
+
+        def expire():
+            raise TimeoutError("Read timed out. (read timeout=30)")
+
+        with self.assertRaises(AvyUnreachable):
+            p._avy_soft_read(expire)
+        self.assertEqual(p._avy_fail_ts, 0.0,
+                         "un stockage mort n'est pas un cluster mort")
+        # les autres lectures doivent continuer de passer
+        self.assertEqual(p._avy_read(lambda: "ok"), "ok")
+
+    def test_lecture_normale_arme_toujours(self):
+        from bot.core.pve import AvyUnreachable
+        p = self._pve()
+
+        def coupe():
+            raise ConnectionError("lien coupé")
+
+        with self.assertRaises(AvyUnreachable):
+            p._avy_read(coupe)
+        self.assertGreater(p._avy_fail_ts, 0.0, "une vraie panne doit armer")
+        with self.assertRaises(AvyUnreachable):
+            p._avy_soft_read(lambda: "jamais appelé")   # court-circuitée aussi
+
+    def test_any_node_prefere_le_noeud_local(self):
+        """Viser un autre nœud fait passer l'appel par le tunnel inter-nœuds, qui ne rend
+        pas l'erreur d'un stockage HS : il expire à ~30 s (596)."""
+        from bot.core.pve import _RemoteCluster
+        c = _RemoteCluster.__new__(_RemoteCluster)
+        c.key = "AVEYRON"
+        c._nodes_cache, c._nodes_ts = ["llm", "nas", "ms01"], time.time() + 10 ** 6
+        c._local_cache, c._local_ts = "nas", time.time() + 10 ** 6
+        self.assertEqual(c._any_node(), "nas")
+        c._local_cache = ""                # nœud local indéterminé -> comportement d'avant
+        self.assertEqual(c._any_node(), "llm")
+        c._local_cache = "absent"          # nœud local hors ligne -> on ne l'impose pas
+        self.assertEqual(c._any_node(), "llm")
+
+
 # ------------------------------------------------- durée d'inactivité d'un terminal
 class TestDureeInactiviteTerminal(unittest.TestCase):
     """La durée est saisie à l'ouverture (modale) : elle vient de l'utilisateur, donc
