@@ -285,9 +285,23 @@ class Avy(commands.Cog):
         try:
             items = self.bot.pve.avy_pbs_content() or []
             gm = self.bot.pve.guest_map()
-        except Exception:
-            log.warning("supervision Aveyron: contenu nas-backup indisponible ce cycle",
-                        exc_info=True)
+        except Exception as e:  # noqa: BLE001
+            # Stockage DÉSACTIVÉ à la main côté PVE (`pvesm set … --disable 1`) : ce n'est
+            # pas une panne, c'est une décision — un avertissement + sa trace à chaque
+            # cycle (toutes les 4 min) noierait les vraies. On le dit UNE fois, puis on se
+            # tait tant que ça ne change pas. 2026-08-14 : cas rencontré le jour même, le
+            # partage CIFS mort ayant fini par être désactivé côté Aveyron.
+            desactive = "disabled" in str(e).lower()
+            if not desactive:
+                self._pbs_off = False
+                log.warning("supervision Aveyron: contenu %s indisponible ce cycle",
+                            self.bot.cfg.avy_storage, exc_info=True)
+            elif not getattr(self, "_pbs_off", False):
+                self._pbs_off = True
+                log.info("supervision Aveyron: stockage %s DÉSACTIVÉ côté PVE — plus "
+                         "aucune sauvegarde distante listée (régler AVY_PVE_STORAGE sur "
+                         "le stockage réellement utilisé pour rétablir la vue)",
+                         self.bot.cfg.avy_storage)
             return {}
         vmid_node = {str((i.get("vmid") or 0) % 1_000_000): i.get("node")
                      for n, i in gm.items() if self.bot.pve.is_avy_name(n)}
