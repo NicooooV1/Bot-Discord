@@ -548,8 +548,29 @@ class TestCoupeCircuitAveyron(unittest.TestCase):
         p = Pve.__new__(Pve)               # pas d'__init__ : aucun réseau, aucune conf
         p._avy = None                      # `avy_key` est une property : elle le lit
         p._avy_fail_ts = 0.0
+        p._avy_ok_ts = 0.0                 # aucune preuve de vie récente du lien
         p._avy_warned = False
         return p
+
+    def test_echec_isole_n_arme_pas_si_une_lecture_vient_de_reussir(self):
+        """Un nœud malade (CIFS démonté sur `nas`) ne doit pas faire déclarer morts les
+        deux autres, qui répondent en 0,13 s."""
+        from bot.core.pve import AvyUnreachable
+        p = self._pve()
+        p._avy_read(lambda: "ms01 ok")      # preuve de vie du lien, à l'instant
+        with self.assertRaises(AvyUnreachable):
+            p._avy_read(lambda: (_ for _ in ()).throw(TimeoutError("nas muet")))
+        self.assertEqual(p._avy_fail_ts, 0.0, "lien prouvé vivant : échec LOCAL au nœud")
+
+    def test_arme_quand_plus_rien_ne_repond(self):
+        """Vraie coupure : la fenêtre de preuve se vide, le coupe-circuit reprend son rôle."""
+        from bot.core.pve import AVY_ALIVE_WINDOW, AvyUnreachable
+        p = self._pve()
+        p._avy_read(lambda: "ok")
+        p._avy_ok_ts = time.time() - AVY_ALIVE_WINDOW - 1     # succès devenu trop vieux
+        with self.assertRaises(AvyUnreachable):
+            p._avy_read(lambda: (_ for _ in ()).throw(ConnectionError("lien coupé")))
+        self.assertGreater(p._avy_fail_ts, 0.0)
 
     def test_lecture_lente_n_arme_pas_le_coupe_circuit(self):
         from bot.core.pve import AvyUnreachable

@@ -40,6 +40,10 @@ AVY_STALE_MAX = 900
 # un timeout ; la 1re lecture passée ce délai re-sonde le lien (motif « half-open »). Cadré
 # sur la boucle avy_metrics (2 min) : au plus une sonde réelle par cycle, le reste instantané.
 AVY_BACKOFF = 120
+# Fenêtre pendant laquelle une lecture distante RÉUSSIE vaut preuve que le lien est
+# vivant : dans cet intervalle, un échec isolé (un nœud, un stockage) n'arme plus le
+# coupe-circuit partagé. Cf. Pve._avy_maybe_trip (2026-08-14).
+AVY_ALIVE_WINDOW = 60
 
 
 def _mk_client(cfg, token_id, secret):
@@ -782,6 +786,30 @@ class Pve:
         return self._avy_read(self._avy.ping_ms)
 
     # ---------- coupe-circuit partagé du cluster secondaire ----------
+    def _avy_maybe_trip(self):
+        """Arme le coupe-circuit SAUF si une autre lecture distante vient de réussir.
+
+        ⚠️ Le coupe-circuit protège d'un LIEN mort — pas d'une ressource morte. Or il
+        était armé par n'importe quel timeout, y compris celui d'un seul nœud malade :
+        le 2026-08-14, le nœud Aveyron `nas` était bloqué par un partage CIFS démonté
+        (`/nodes/nas/...` = 30 s de silence puis 596) pendant que `ms01` et `llm`
+        répondaient en 0,13 s — et tout le cluster était déclaré injoignable 120 s à
+        chaque cycle (287 fois dans la journée).
+
+        Preuve utilisée, sans aucun trafic supplémentaire : une lecture distante RÉUSSIE
+        il y a moins d'AVY_ALIVE_WINDOW secondes. Le lien est alors démontré vivant, donc
+        l'échec est LOCAL à ce qu'on lisait. Sur une vraie coupure, plus rien ne réussit :
+        la fenêtre se vide et le premier échec suivant arme normalement — au pire on paie
+        les timeouts d'un cycle de retard, ce qui est exactement le prix d'un diagnostic
+        honnête.
+        """
+        if time.time() - getattr(self, "_avy_ok_ts", 0) <= AVY_ALIVE_WINDOW:
+            log.debug("cluster %s : échec isolé (une lecture a réussi il y a moins de "
+                      "%ds) — coupe-circuit NON armé", self.avy_key or "AVEYRON",
+                      AVY_ALIVE_WINDOW)
+            return
+        self._avy_trip()
+
     def _avy_trip(self):
         """Arme le coupe-circuit (une seule alerte par épisode d'indisponibilité)."""
         self._avy_fail_ts = time.time()
@@ -792,7 +820,11 @@ class Pve:
             self._avy_warned = True
 
     def _avy_ok(self):
-        """Ferme le coupe-circuit après une lecture réussie (journalise le retour une fois)."""
+        """Ferme le coupe-circuit après une lecture réussie (journalise le retour une fois).
+
+        Horodate aussi la dernière PREUVE de vie du lien, sur laquelle _avy_maybe_trip
+        s'appuie pour ne pas confondre « une ressource est morte » et « le lien est mort »."""
+        self._avy_ok_ts = time.time()
         if self._avy_warned:
             log.info("cluster %s de nouveau joignable", self.avy_key or "AVEYRON")
             self._avy_warned = False
@@ -828,7 +860,7 @@ class Pve:
             r = fn(*a, **kw)
         except OSError as e:
             if arm:
-                self._avy_trip()
+                self._avy_maybe_trip()
                 raise AvyUnreachable(str(e) or "réseau") from None
             # pas d'_avy_trip ET pas d'_avy_ok : cet appel ne tranche RIEN sur l'état du
             # lien, ni dans un sens ni dans l'autre. L'appelant voit un échec normal.
@@ -846,7 +878,7 @@ class Pve:
         try:
             r = fn(*a, **kw)
         except OSError as e:
-            self._avy_trip()
+            self._avy_maybe_trip()
             raise LlmExecError(f"assistant IA injoignable ({e})") from None
         self._avy_ok()
         return r
@@ -876,7 +908,9 @@ class Pve:
                 self._avy_last, self._avy_last_ts = cur, now
                 self._avy_ok()
             except Exception:
-                self._avy_trip()
+                # lecture À L'ÉCHELLE DU CLUSTER (pas d'un nœud) : si elle échoue alors
+                # que rien d'autre ne répond, c'est bien le lien — d'où maybe_trip.
+                self._avy_maybe_trip()
                 if self._avy_last is None or now - self._avy_last_ts > AVY_STALE_MAX:
                     return []
                 cur = self._avy_last
