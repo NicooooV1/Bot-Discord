@@ -294,6 +294,69 @@ class TestAntiRejeuTOTP(unittest.TestCase):
         tf = TwoFA(os.path.join(self.dir, "jamais-cree.json"), session_min=15)
         self.assertFalse(tf.degraded, "aucun inscrit = état normal, pas dégradé")
 
+    # --- durée des sessions (2026-08-14) : heures et illimité -------------------
+    def test_session_illimitee_survit_au_redemarrage(self):
+        """0 minute = session SANS expiration, et la sentinelle doit traverser le fichier.
+
+        Le piège que ce test verrouille : `_load_sessions` filtrait sur `exp > now`, ce
+        qu'une expiration négative (NEVER) ne passe pas — un redémarrage aurait donc
+        refermé précisément les sessions déclarées éternelles.
+        """
+        from bot.core.twofa import TwoFA
+        self.tf.open_session(7, 0)
+        self.assertTrue(self.tf.trusted(7))
+        self.assertEqual(self.tf.session_left(7), -1, "-1 = illimité, distinct de 0")
+        self.assertEqual(self.tf.expire_stale(), [], "une session illimitée n'expire pas")
+        rechargee = TwoFA(os.path.join(self.dir, "2fa.json"), session_min=15)
+        self.assertTrue(rechargee.trusted(7), "session illimitée perdue au redémarrage")
+
+    def test_duree_choisie_a_l_ouverture_et_reglage_persiste(self):
+        from bot.core.twofa import TwoFA
+        self.tf.open_session(7, 120)                    # 2 h pour CETTE session
+        self.assertGreater(self.tf.session_left(7), 110 * 60)
+        self.tf.set_session_min(0)                      # réglage GLOBAL -> illimité
+        self.assertGreater(self.tf.session_left(7), 0,
+                           "changer le réglage ne doit pas toucher aux sessions ouvertes")
+        rechargee = TwoFA(os.path.join(self.dir, "2fa.json"), session_min=15)
+        self.assertEqual(rechargee.session_min, 0, "réglage /2fa duree non persisté")
+        self.assertEqual(rechargee.default_session_min, 15,
+                         "la valeur de config.env doit rester disponible en repli")
+
+    def test_open_session_zero_nest_pas_confondu_avec_defaut(self):
+        """`minutes or self.session_min` aurait fait de « illimité » un simple défaut."""
+        self.tf.set_session_min(30)
+        self.tf.open_session(7, 0)
+        self.assertEqual(self.tf.session_left(7), -1)
+
+
+class TestDurations(unittest.TestCase):
+    """L'analyseur partagé par la modale du terminal et le 2FA (core/durations.py)."""
+
+    def test_formes_acceptees(self):
+        from bot.core.durations import parse_duration
+        for brut, attendu in [("45", 45), ("45m", 45), ("45 min", 45), ("2h", 120),
+                              ("1h30", 90), ("1 h 30", 90), ("0", 0), ("illimité", 0),
+                              ("ILLIMITE", 0), ("∞", 0), ("indéfini", 0), ("jamais", 0)]:
+            self.assertEqual(parse_duration(brut), attendu, brut)
+        for brut in ("bonjour", "", "12x", "1h2h"):
+            with self.assertRaises(ValueError, msg=brut):
+                parse_duration(brut)
+
+    def test_clamp_distingue_absence_de_choix_et_illimite(self):
+        from bot.core.durations import clamp_duration
+        self.assertEqual(clamp_duration(None, 10, 120), 10)   # rien saisi -> défaut
+        self.assertEqual(clamp_duration(0, 10, 120), 120)     # illimité refusé -> plafond
+        self.assertEqual(clamp_duration(0, 10, 0), 0)         # plafond levé -> illimité
+        self.assertEqual(clamp_duration(999, 10, 120), 120)   # rabote, pas de refus
+        self.assertEqual(clamp_duration(45, 10, 0), 45)       # sans plafond, valeur libre
+
+    def test_rendu_francais(self):
+        from bot.core.durations import fmt_duration
+        self.assertEqual(fmt_duration(0), "illimité")
+        self.assertEqual(fmt_duration(45), "45 min")
+        self.assertEqual(fmt_duration(120), "2 h")
+        self.assertEqual(fmt_duration(90), "1 h 30")
+
 
 # -------------------------------------------------------------------------- syslog
 class TestParsingSyslog(unittest.TestCase):

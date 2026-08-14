@@ -43,6 +43,7 @@ import discord
 from discord.ext import commands
 
 from ..core import bg
+from ..core.durations import bounds_hint, clamp_duration, fmt_duration, parse_duration
 from ..core.gates import GatedView
 
 log = logging.getLogger("discord-bot.terminal")
@@ -79,22 +80,9 @@ def _fence(s: str) -> str:
     return (s or "").replace("```", "`​``")
 
 
-_DUREE = re.compile(r"^(?:(?P<h>\d{1,3})\s*h\s*(?P<hm>\d{1,2})?|(?P<m>\d{1,4})\s*(?:m(?:in)?)?)$",
-                    re.I)
-
-
-def _parse_minutes(raw: str) -> int:
-    """« 45 », « 45m », « 45 min », « 2h », « 1h30 » -> minutes. ValueError sinon.
-
-    Les bornes (1..plafond) ne sont PAS appliquées ici : l'appelant les connaît (guest ou
-    nœud) et doit pouvoir citer la valeur refusée dans son message.
-    """
-    m = _DUREE.match((raw or "").strip())
-    if not m:
-        raise ValueError(raw)
-    if m.group("h") is not None:
-        return int(m.group("h")) * 60 + int(m.group("hm") or 0)
-    return int(m.group("m"))
+# L'analyse des durées vit dans core/durations.py depuis le 2026-08-14 : elle est
+# maintenant partagée avec le 2FA, et elle sait dire « illimité » (0 minute).
+_parse_minutes = parse_duration
 
 
 class PveConsole:
@@ -226,8 +214,11 @@ class TerminalSession:
         self.name = name
         self.owner_id = owner_id
         self.console = console
-        # le nœud a son propre délai d'inactivité (défaut = celui des guests)
-        self.idle_min = idle_min or cog.cfg.terminal_idle_min
+        # le nœud a son propre délai d'inactivité (défaut = celui des guests).
+        # ⚠️ `is None` et non `or` : depuis le 2026-08-14, **0 = inactivité illimitée**
+        # est un choix explicite de l'utilisateur — `or` le confondrait avec « rien de
+        # demandé » et rétablirait silencieusement le délai par défaut.
+        self.idle_min = cog.cfg.terminal_idle_min if idle_min is None else max(0, int(idle_min))
         # durée de vie absolue (0/None = illimitée) : posée pour la console du nœud
         self.max_min = max_min or 0
         self.msg = None                 # message "écran" édité en direct
@@ -340,8 +331,11 @@ class TerminalSession:
             # TimeoutError remontaient bruts, tuaient la tâche en silence et emportaient
             # avec eux le timeout d'inactivité ET le plafond absolu du shell root.
             try:
-                # inactivité = pas de SAISIE (et non « pas de sortie ») — cf. __init__
-                if time.monotonic() - self.last_input > idle_s:
+                # inactivité = pas de SAISIE (et non « pas de sortie ») — cf. __init__.
+                # `idle_s` nul = inactivité ILLIMITÉE demandée à l'ouverture : plus de
+                # fermeture sur silence. Le plafond absolu ci-dessous, lui, s'applique
+                # toujours (c'est ce qui borne réellement un shell root du nœud).
+                if idle_s and time.monotonic() - self.last_input > idle_s:
                     await self.cog._end(
                         self.thread.id, f"inactivité (> {self.idle_min} min)")
                     return
@@ -446,6 +440,14 @@ class IdleModal(GatedView, discord.ui.Modal, title="Terminal — inactivité"):
     remonter le défaut global aurait rallongé TOUTES les consoles root — l'inverse de ce
     qu'on veut. Le choix est donc par session, borné par un plafond de conf.
 
+    2026-08-14 (bis) : la saisie accepte les HEURES (`2h`, `1h30`) et l'ILLIMITÉ
+    (« illimité », `∞`, `0`). L'illimité n'est proposé que si le plafond de conf le permet
+    (`TERMINAL_IDLE_MAX_MIN=0` / `NODE_TERMINAL_IDLE_MAX_MIN=0`) — sinon il est ramené AU
+    PLAFOND, et l'utilisateur en est prévenu à l'ouverture plutôt que de croire sa console
+    éternelle. Pour la console du NŒUD, la durée de vie absolue `NODE_TERMINAL_MAX_MIN`
+    continue de s'appliquer même en inactivité illimitée : c'est elle le vrai garde-fou du
+    shell root de l'hyperviseur.
+
     Porte : `gate = None` volontairement. Ouvrir la modale ne fait RIEN de sensible ; la
     console n'est ouverte que par `open_for`/`open_node_for`, qui refont l'intégralité des
     contrôles (tier, session 2FA, exclusions, quotas) sur l'interaction de SOUMISSION —
@@ -457,9 +459,9 @@ class IdleModal(GatedView, discord.ui.Modal, title="Terminal — inactivité"):
                    "refont tous les contrôles (tier + 2FA + quotas) sur la soumission")
 
     minutes = discord.ui.TextInput(
-        label="Fermeture auto après (minutes)",
+        label="Fermeture auto après (min, 2h, illimité)",
         style=discord.TextStyle.short,
-        required=False, max_length=5)
+        required=False, max_length=16)
 
     def __init__(self, cog, name, *, node=False, default=10, maximum=120):
         super().__init__()
@@ -470,8 +472,8 @@ class IdleModal(GatedView, discord.ui.Modal, title="Terminal — inactivité"):
         self.maximum = maximum
         # les enfants sont deepcopy'és par instance (discord.py `_init_children`) :
         # personnaliser ici n'affecte pas les autres modales
-        self.minutes.default = str(default)
-        self.minutes.placeholder = f"{1} à {maximum} — vide = défaut ({default})"
+        self.minutes.default = fmt_duration(default)
+        self.minutes.placeholder = bounds_hint(default, maximum)
 
     async def on_submit(self, itx: discord.Interaction):
         raw = str(self.minutes.value or "").strip()
@@ -482,14 +484,17 @@ class IdleModal(GatedView, discord.ui.Modal, title="Terminal — inactivité"):
                 idle = _parse_minutes(raw)
             except ValueError:
                 await itx.response.send_message(
-                    f"⏱️ Durée invalide : `{raw[:30]}`. Attendu un nombre de minutes "
-                    f"(1 à {self.maximum}), ou `1h30`.", ephemeral=True)
+                    f"⏱️ Durée invalide : `{raw[:30]}`. Attendu des minutes (`45`), des "
+                    f"heures (`2h`, `1h30`) ou `illimité`"
+                    + (f" — plafond {fmt_duration(self.maximum)}." if self.maximum
+                       else "."), ephemeral=True)
                 return
-            if not 1 <= idle <= self.maximum:
-                await itx.response.send_message(
-                    f"⏱️ Durée hors bornes : **{idle} min** (autorisé 1 à "
-                    f"{self.maximum} min).", ephemeral=True)
-                return
+            # Hors bornes = on RABOTE au plafond au lieu de refuser (2026-08-14). Refuser
+            # renvoyait rouvrir la modale pour retaper une valeur que le bot connaissait
+            # déjà. ⚠️ Aucun message ici : `open_for`/`open_node_for` commencent par
+            # `itx.response.defer()` et une réponse consommée les ferait échouer. La durée
+            # RÉELLEMENT appliquée est écrite dans l'embed d'ouverture — l'écart s'y voit.
+            idle = clamp_duration(idle, self.default, self.maximum)
         if self.node:
             await self.cog.open_node_for(itx, idle_min=idle)
         else:
@@ -747,8 +752,10 @@ class Terminal(commands.Cog):
         if err is not None:
             await self._refuse(itx, err)
             return
-        idle_min = min(max(1, int(idle_min or self.cfg.terminal_idle_min)),
-                       self.cfg.terminal_idle_max_min)
+        # 0 = illimité : clamp_duration distingue « rien demandé » (None -> défaut) d'un
+        # illimité explicite, que le plafond de conf autorise ou rabote (cf. durations.py).
+        idle_min = clamp_duration(idle_min, self.cfg.terminal_idle_min,
+                                  self.cfg.terminal_idle_max_min)
         self._pending += 1
         reserved = True
         try:
@@ -807,9 +814,13 @@ class Terminal(commands.Cog):
                 description=("Console **root** interactive (vmid %s). Écran ci-dessous, mis à "
                              "jour en direct. Boutons = touches ; **⌨️ Texte** pour saisir une "
                              "ligne (Entrée ajoutée). Idéal pour piloter une appli plein-écran "
-                             "(claude, top…).\nFermeture auto après **%d min** d'inactivité "
-                             "(choisi à l'ouverture)."
-                             % (vmid, idle_min)),
+                             "(claude, top…).\n%s"
+                             % (vmid,
+                                f"Fermeture auto après **{fmt_duration(idle_min)}** "
+                                "d'inactivité (choisi à l'ouverture)." if idle_min else
+                                "⚠️ Inactivité **illimitée** (choisie à l'ouverture) : cette "
+                                "console root ne se fermera **pas** toute seule — ferme-la "
+                                "avec le bouton ✖️.")),
                 color=0xED4245)
             emb.set_footer(text="least-priv botconsole@pve · saisies journalisées")
             # même ordre critique que open_node_for : publier la session AVANT son UI
@@ -836,7 +847,7 @@ class Terminal(commands.Cog):
             self._pending -= 1
             reserved = False
             self.bot.audit.record(user=f"{itx.user}({itx.user.id})", action="terminal-open",
-                                  target=name, result=f"ok (inactivité {idle_min} min)")
+                                  target=name, result=f"ok (inactivité {fmt_duration(idle_min)})")
             await console.force_redraw()        # capture l'écran complet dès l'ouverture
             await itx.followup.send(f"✅ Terminal ouvert : {thread.mention}", ephemeral=True)
         finally:
@@ -904,8 +915,8 @@ class Terminal(commands.Cog):
             return
         # le plafond de conf est déjà borné par node_terminal_max_min (cf. config.py) :
         # promettre plus d'inactivité que la durée de vie absolue n'aurait aucun sens
-        idle_min = min(max(1, int(idle_min or self.cfg.node_terminal_idle_min)),
-                       self.cfg.node_terminal_idle_max_min)
+        idle_min = clamp_duration(idle_min, self.cfg.node_terminal_idle_min,
+                                  self.cfg.node_terminal_idle_max_min)
 
         self._pending += 1
         self._node_pending = True
@@ -952,10 +963,15 @@ class Terminal(commands.Cog):
                     "⚠️ Console **root sur l'hôte Proxmox lui-même** — pas un conteneur. "
                     "Tout ce qui est tapé ici s'exécute sur la machine qui fait tourner "
                     "toutes les VM/conteneurs.\nBoutons = touches ; **⌨️ Texte** pour saisir une "
-                    f"ligne. Fermeture auto après **{idle_min} min** d'inactivité "
-                    "(choisi à l'ouverture)"
-                    + (f", durée de vie maximale **{self.cfg.node_terminal_max_min} min**."
-                       if self.cfg.node_terminal_max_min else ".")),
+                    "ligne. "
+                    + (f"Fermeture auto après **{fmt_duration(idle_min)}** d'inactivité "
+                       "(choisi à l'ouverture)" if idle_min else
+                       "⚠️ Inactivité **illimitée** (choisie à l'ouverture)")
+                    + (f", durée de vie maximale "
+                       f"**{fmt_duration(self.cfg.node_terminal_max_min)}**."
+                       if self.cfg.node_terminal_max_min
+                       else " et **aucune** durée de vie maximale : ce shell root reste "
+                            "ouvert jusqu'à fermeture manuelle.")),
                 color=0xED4245)
             emb.set_footer(text="SSH clé dédiée · propriétaire uniquement · ouverture "
                                 "auditée (bot + sshd de l'hôte)")
@@ -987,7 +1003,7 @@ class Terminal(commands.Cog):
             self.bot.audit.record(user=f"{itx.user}({itx.user.id})",
                                   action="terminal-node-open",
                                   target=f"noeud/{self.cfg.pve_node}",
-                                  result=f"ok (inactivité {idle_min} min)")
+                                  result=f"ok (inactivité {fmt_duration(idle_min)})")
             await console.force_redraw()
             await itx.followup.send(f"✅ Terminal nœud ouvert : {thread.mention}", ephemeral=True)
         finally:

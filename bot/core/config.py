@@ -224,13 +224,18 @@ class Config:
         self.terminal_excluded_guests = {
             x.strip().lower() for x in
             g("TERMINAL_EXCLUDED_GUESTS", "vaultwarden,mailserver,bdd").split(",") if x.strip()}
-        self.terminal_idle_min = max(1, _int(g("TERMINAL_IDLE_MIN", "10"), 10))
+        # 0 = inactivité ILLIMITÉE par défaut (2026-08-14). Assumé : c'est une console root,
+        # mais c'est un choix explicite de conf, et la modale d'ouverture reste maîtresse.
+        self.terminal_idle_min = max(0, _int(g("TERMINAL_IDLE_MIN", "10"), 10))
         # plafond de la valeur SAISIE à l'ouverture (modale « inactivité ») : la valeur
         # par défaut ci-dessus reste ce qui s'applique si rien n'est saisi. Le plafond
         # n'est jamais inférieur au défaut, sinon une conf incohérente rendrait le défaut
         # lui-même refusé.
-        self.terminal_idle_max_min = max(
-            self.terminal_idle_min, _int(g("TERMINAL_IDLE_MAX_MIN", "120"), 120))
+        # **0 = AUCUN plafond** -> « illimité » devient saisissable dans la modale. Le test
+        # `if _cap else` est indispensable : passer 0 dans le `max()` le ferait remonter au
+        # défaut, donc rétablirait silencieusement un plafond que l'admin vient de lever.
+        _cap = max(0, _int(g("TERMINAL_IDLE_MAX_MIN", "120"), 120))
+        self.terminal_idle_max_min = max(self.terminal_idle_min, _cap) if _cap else 0
         self.pve_console_user = g("PVE_CONSOLE_USER", "botconsole@pve")
         self.pve_console_password = g("PVE_CONSOLE_PASSWORD").strip()
 
@@ -246,7 +251,7 @@ class Config:
         self.node_ssh_user = g("NODE_SSH_USER", "root")
         self.node_ssh_key = g("NODE_SSH_KEY", "/etc/discord-bot/node_ed25519")
         self.node_ssh_known_hosts = g("NODE_SSH_KNOWN_HOSTS", "/etc/discord-bot/node_known_hosts")
-        self.node_terminal_idle_min = max(1, _int(g("NODE_TERMINAL_IDLE_MIN", "10"), 10))
+        self.node_terminal_idle_min = max(0, _int(g("NODE_TERMINAL_IDLE_MIN", "10"), 10))
         # salon « 🔒 Lock » + dashboard live du nœud
         self.node_channel_enabled = _bool(g("NODE_CHANNEL_ENABLED"), True)
         # bouton 💾 Sauvegarder du salon nœud = vzdump de TOUS les invités
@@ -259,10 +264,16 @@ class Config:
         # bas que celui des guests (shell root sur l'hôte) et, quand une durée de vie
         # absolue est posée, borné par elle : autoriser « 4 h d'inactivité » alors que la
         # session est tuée à 2 h dans tous les cas ne serait qu'un mensonge d'interface.
-        self.node_terminal_idle_max_min = max(
-            self.node_terminal_idle_min,
-            min(_int(g("NODE_TERMINAL_IDLE_MAX_MIN", "60"), 60),
-                self.node_terminal_max_min or 10 ** 9))
+        # 0 = pas de plafond -> « illimité » saisissable… MAIS seulement si la durée de vie
+        # absolue est elle-même levée : sinon on continue de borner par elle (promettre une
+        # inactivité infinie sur une session tuée à 2 h serait un mensonge d'interface).
+        _ncap = max(0, _int(g("NODE_TERMINAL_IDLE_MAX_MIN", "60"), 60))
+        if not _ncap:
+            self.node_terminal_idle_max_min = self.node_terminal_max_min  # 0 si illimitée
+        else:
+            self.node_terminal_idle_max_min = max(
+                self.node_terminal_idle_min,
+                min(_ncap, self.node_terminal_max_min or 10 ** 9))
 
         # --- Live log stream ---
         self.live_log_bind_addr = g("LIVE_LOG_BIND_ADDR", "0.0.0.0")
@@ -315,7 +326,16 @@ class Config:
         # --- /docker (conteneurs CT120 via ytgrab) — kill-switch DOCKER_CTL_ENABLED=false
         self.docker_ctl_enabled = _bool(g("DOCKER_CTL_ENABLED"), True)
         self.twofa_enabled = g("TWOFA_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-        self.twofa_session_min = int(g("TWOFA_SESSION_MIN", "15") or 15)
+        # Durée par défaut d'une session de confiance, en minutes — **0 = illimitée**
+        # (2026-08-14). C'est un simple point de départ : `/2fa duree` la change à chaud et
+        # le réglage est persisté à côté des sessions ; cette valeur reprend la main si ce
+        # fichier disparaît (repli borné, jamais « illimité par surprise »).
+        self.twofa_session_min = max(0, _int(g("TWOFA_SESSION_MIN", "15"), 15))
+        # Plafond de ce que `/2fa duree` et la modale de déverrouillage peuvent demander.
+        # **0 = aucun plafond** -> « illimité » devient possible. Défaut 0 : Nico est le
+        # seul administrateur du bot et a demandé explicitement l'option illimitée ; la
+        # borne reste disponible pour qui voudrait la reposer.
+        self.twofa_session_max_min = max(0, _int(g("TWOFA_SESSION_MAX_MIN", "0"), 0))
         # Secrets à part de state.json : même dossier (écrit par le bot) mais fichier 0600.
         self.twofa_path = g("TWOFA_PATH", os.path.join(state_dir, "2fa.json"))
         self.audit_path = os.path.join(state_dir, "audit.log")

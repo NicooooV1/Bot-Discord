@@ -16,7 +16,9 @@ import qrcode
 from discord import app_commands
 from discord.ext import commands
 
+from ..core.durations import clamp_duration, fmt_duration, parse_duration
 from ..core.gates import GatedView
+from ..core.permissions import deny_2fa, is_admin, session_2fa_ok
 from ..core.twofa import TwoFAStoreError
 from ..views.twofa_view import CodeModal
 
@@ -108,19 +110,80 @@ class TwoFACog(commands.Cog):
                 "🔐 Pas encore inscrit — lance **`/2fa setup`**.", ephemeral=True)
             return
 
-        async def done(i: discord.Interaction, code: str):
-            if tf.verify(i.user.id, code):
+        async def done(i: discord.Interaction, code: str, minutes=None):
+            if tf.verify(i.user.id, code, minutes):
+                mins = tf.session_min if minutes is None else minutes
                 await i.response.send_message(
-                    f"✅ Session ouverte pour **{tf.session_min} min**.", ephemeral=True)
-                log.info("2fa: session ouverte par %s", i.user)
-                await _audit_2fa(self.bot, i.user, "Déverrouillage (session ouverte)")
+                    f"✅ Session ouverte pour **{fmt_duration(mins)}**." if mins else
+                    "✅ Session ouverte **sans limite de durée** — elle restera ouverte "
+                    "jusqu'à `/2fa lock`… ou jusqu'à ce que quelqu'un mette la main sur "
+                    "ton Discord. À n'utiliser que sur un appareil que tu contrôles.",
+                    ephemeral=True)
+                log.info("2fa: session ouverte par %s (%s)", i.user, fmt_duration(mins))
+                await _audit_2fa(self.bot, i.user,
+                                 f"Déverrouillage (session {fmt_duration(mins)})")
             else:
                 await i.response.send_message(
                     "❌ Code invalide ou déjà utilisé.", ephemeral=True)
                 log.warning("2fa: code refusé pour %s", i.user)
                 await _audit_2fa(self.bot, i.user, "⚠️ Code refusé (déverrouillage)")
 
-        await itx.response.send_modal(CodeModal("Déverrouiller Edmine", done))
+        await itx.response.send_modal(CodeModal(
+            "Déverrouiller Edmine", done, duration=True,
+            default_min=tf.session_min, maximum=self.bot.cfg.twofa_session_max_min))
+
+    # ------------------------------------------------------------------ durée
+    @grp.command(name="duree",
+                 description="Changer la durée par défaut des sessions 2FA (ex: 2h, illimité).")
+    @app_commands.describe(duree="minutes (45), heures (2h, 1h30) ou « illimité ». "
+                                 "Vide = afficher le réglage courant.")
+    async def duree(self, itx: discord.Interaction, duree: str = None):
+        """Réglage GLOBAL de la durée des prochaines sessions.
+
+        ⚠️ Porte explicite. La famille `/2fa` est exemptée de 2FA (TWOFA_EXEMPT) parce
+        qu'elle est la seule porte d'entrée — mais ALLONGER la durée des sessions est un
+        acte d'administration : sans le contrôle ci-dessous, n'importe quel membre du
+        serveur, non inscrit et sans session, pourrait passer toutes les sessions du bot
+        en « illimité ». On exige donc admin **et** une session de confiance ouverte.
+        """
+        tf = self.bot.twofa
+        if not is_admin(self.bot.cfg, itx):
+            await itx.response.send_message(
+                "⛔ Réservé à l'administrateur du bot.", ephemeral=True)
+            return
+        if duree is None:
+            await itx.response.send_message(
+                f"⏱️ Durée par défaut des sessions 2FA : **{fmt_duration(tf.session_min)}** "
+                f"(plafond {fmt_duration(self.bot.cfg.twofa_session_max_min)}, "
+                f"valeur de config.env {fmt_duration(tf.default_session_min)}).",
+                ephemeral=True)
+            return
+        if not session_2fa_ok(itx):
+            await deny_2fa(itx)
+            return
+        try:
+            wanted = parse_duration(duree)
+        except ValueError:
+            await itx.response.send_message(
+                f"⏱️ Durée invalide : `{duree[:30]}`. Attendu `45`, `2h`, `1h30` "
+                "ou `illimité`.", ephemeral=True)
+            return
+        applied = clamp_duration(wanted, tf.session_min,
+                                 self.bot.cfg.twofa_session_max_min)
+        tf.set_session_min(applied)
+        note = ("" if applied == wanted else
+                f" (demandé {fmt_duration(wanted)}, ramené au plafond "
+                f"`TWOFA_SESSION_MAX_MIN`)")
+        extra = ("\n⚠️ **Sans limite** : les prochaines sessions — et les rôles qu'elles "
+                 "portent (« 2FA Complet », « O … ») — ne se fermeront plus d'elles-mêmes."
+                 if not applied else "")
+        await itx.response.send_message(
+            f"⏱️ Durée par défaut des sessions 2FA : **{fmt_duration(applied)}**{note}. "
+            "Les sessions déjà ouvertes gardent leur échéance." + extra, ephemeral=True)
+        log.warning("2fa: duree des sessions passee a %s par %s",
+                    fmt_duration(applied), itx.user)
+        await _audit_2fa(self.bot, itx.user,
+                         f"Durée des sessions -> {fmt_duration(applied)}")
 
     # ------------------------------------------------------------------ status
     @grp.command(name="status", description="État de ton 2FA et de ta session.")
@@ -136,14 +199,39 @@ class TwoFACog(commands.Cog):
         else:
             left = tf.session_left(itx.user.id)
             emb.add_field(name="Toi", value="✅ inscrit", inline=True)
-            emb.add_field(name="Session",
-                          value=f"🔓 {left // 60} min {left % 60} s restantes" if left
-                          else "🔒 fermée — `/2fa unlock`", inline=True)
+            # -1 = session SANS limite (cf. TwoFA.session_left) : à ne pas confondre avec
+            # 0 (« pas de session »), que le même champ affichait avant.
+            if left < 0:
+                sess_txt = "🔓 **illimitée** — `/2fa lock` pour la fermer"
+            elif left:
+                sess_txt = f"🔓 {left // 60} min {left % 60} s restantes"
+            else:
+                sess_txt = "🔒 fermée — `/2fa unlock`"
+            emb.add_field(name="Session", value=sess_txt, inline=True)
+            emb.add_field(name="Durée par défaut",
+                          value=fmt_duration(tf.session_min) + " (`/2fa duree`)",
+                          inline=True)
             n = tf.backup_left(itx.user.id)
             emb.add_field(name="Codes de secours",
                           value=f"{n}/8 restants" + (" ⚠️ pense à te réinscrire" if n <= 2 else ""),
                           inline=False)
         await itx.response.send_message(embed=emb, ephemeral=True)
+
+    # ------------------------------------------------------------------ lock
+    @grp.command(name="lock", description="Fermer tout de suite ta session de confiance.")
+    async def lock(self, itx: discord.Interaction):
+        """Contrepartie indispensable des sessions illimitées (2026-08-14) : sans elle,
+        une session ouverte « sans limite » ne se refermait qu'au prochain redémarrage du
+        bot. Aucune porte : fermer SA PROPRE session ne retire que des droits."""
+        tf = self.bot.twofa
+        if not tf.trusted(itx.user.id):
+            await itx.response.send_message("🔒 Aucune session ouverte.", ephemeral=True)
+            return
+        tf.close_session(itx.user.id)      # retire aussi les rôles de session (on_change)
+        await itx.response.send_message(
+            "🔒 Session fermée. `/2fa unlock` pour en rouvrir une.", ephemeral=True)
+        log.info("2fa: session fermee a la demande de %s", itx.user)
+        await _audit_2fa(self.bot, itx.user, "Verrouillage (session fermée)")
 
     # ------------------------------------------------------------------ disable
     @grp.command(name="disable", description="Se désinscrire du 2FA (code requis).")
@@ -153,7 +241,10 @@ class TwoFACog(commands.Cog):
             await itx.response.send_message("Tu n'es pas inscrit.", ephemeral=True)
             return
 
-        async def done(i: discord.Interaction, code: str):
+        async def done(i: discord.Interaction, code: str, minutes=None):
+            # `minutes` ignoré : cette modale n'a pas de champ durée (duration=False) et
+            # une désinscription n'ouvre aucune session. Le paramètre n'est là que pour
+            # respecter la signature de rappel commune de CodeModal.
             if not tf.verify(i.user.id, code):
                 await i.response.send_message("❌ Code invalide ou déjà utilisé.",
                                               ephemeral=True)
@@ -204,8 +295,8 @@ class _ConfirmView(GatedView):
     async def confirm(self, itx: discord.Interaction, _b: discord.ui.Button):
         tf = itx.client.twofa
 
-        async def done(i: discord.Interaction, code: str):
-            try:
+        async def done(i: discord.Interaction, code: str, minutes=None):
+            try:                        # `minutes` : cf. CodeModal (aucun champ durée ici)
                 backup = tf.confirm_enroll(i.user.id, code)
             except TwoFAStoreError as e:
                 # NE PAS dire « code invalide » : l'utilisateur irait régler l'heure de son

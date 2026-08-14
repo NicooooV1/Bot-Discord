@@ -2,8 +2,10 @@
 
 Choix de Nico (2026-07-16) : **toutes** les commandes sont protégées. Le tree refuse
 l'exécution tant que l'utilisateur n'a pas ouvert une **session de confiance** avec un
-code TOTP ; la session dure `TWOFA_SESSION_MIN` minutes et vit en MÉMOIRE (un
-redémarrage du bot la ferme — c'est voulu).
+code TOTP ; la session dure `TWOFA_SESSION_MIN` minutes par défaut — durée modifiable à
+chaud par `/2fa duree` (heures acceptées, `illimité` possible) et choisissable session par
+session dans la modale de déverrouillage (2026-08-14). Les sessions sont persistées à côté
+du magasin pour survivre à un redémarrage du bot.
 
 ANTI-VERROUILLAGE — critique, puisque le 2FA barre TOUT :
 - Les sous-commandes `/2fa` sont TOUJOURS exemptes : sans ça, personne ne pourrait
@@ -34,6 +36,13 @@ import pyotp
 ISSUER = "Edmine"
 BACKUP_COUNT = 8
 
+# Expiration d'une session SANS limite de durée (2026-08-14). Une sentinelle négative
+# plutôt que `math.inf` : elle traverse json.dump/load sans produire le littéral
+# `Infinity`, que le JSON strict de la norme n'accepte pas (Python le tolère, mais le
+# fichier est aussi lu à l'œil et par des outils tiers). Tous les tests d'expiration la
+# traitent explicitement — un `exp < now` naïf fermerait la session immédiatement.
+NEVER = -1.0
+
 
 class TwoFAStoreError(RuntimeError):
     """Le magasin de secrets n'a PAS pu être écrit (disque plein, droits, ou magasin
@@ -49,7 +58,12 @@ def _hash(code):
 class TwoFA:
     def __init__(self, path, session_min=15, log=None):
         self.path = path
-        self.session_min = max(1, int(session_min))
+        # Durée par défaut d'une session, en minutes — **0 = illimitée** (2026-08-14).
+        # Modifiable à chaud par `/2fa duree` (voir set_session_min) : la valeur de
+        # config.env n'est plus qu'un point de départ, elle reprend la main si le réglage
+        # persisté est perdu (fichier de sessions effacé) — repli volontairement borné.
+        self.default_session_min = max(0, int(session_min))
+        self.session_min = self.default_session_min
         self.log = log
         self._data = {"users": {}}
         self._pending = {}      # uid -> secret en cours d'inscription (jamais persisté)
@@ -158,9 +172,14 @@ class TwoFA:
             now = time.time()
             if isinstance(d, dict) and isinstance(d.get("sessions"), dict):
                 raw, steps = d["sessions"], (d.get("last_step") or {})
+                if d.get("session_min") is not None:
+                    self.session_min = max(0, int(d["session_min"]))
             else:
                 raw, steps = d, {}
-            self._sessions = {str(k): float(v) for k, v in raw.items() if float(v) > now}
+            # `== NEVER` avant la comparaison à `now` : une session illimitée porte une
+            # expiration NÉGATIVE, qu'un simple `> now` jetterait au redémarrage.
+            self._sessions = {str(k): float(v) for k, v in raw.items()
+                              if float(v) == NEVER or float(v) > now}
             self._last_step = {str(k): int(v) for k, v in steps.items()}
         except Exception:  # noqa: BLE001 — fichier absent/corrompu/JSON non-dict : des
             # sessions perdues se rouvrent d'un /2fa unlock, un boot qui crashe non
@@ -175,7 +194,8 @@ class TwoFA:
             tmp = self._sessions_path + ".tmp"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
-                json.dump({"sessions": self._sessions, "last_step": self._last_step}, f)
+                json.dump({"sessions": self._sessions, "last_step": self._last_step,
+                           "session_min": self.session_min}, f)
             os.replace(tmp, self._sessions_path)
         except OSError as e:
             if self.log:
@@ -278,8 +298,12 @@ class TwoFA:
                 return s
         return None
 
-    def verify(self, uid, code):
-        """Accepte un code TOTP ou un code de secours (à usage unique)."""
+    def verify(self, uid, code, minutes=None):
+        """Accepte un code TOTP ou un code de secours (à usage unique).
+
+        `minutes` : durée de la session ouverte en cas de succès (None = réglage courant,
+        0 = illimitée). Choisie à la volée dans la modale de déverrouillage.
+        """
         uid = str(uid)
         u = self._data["users"].get(uid)
         if not u:
@@ -291,7 +315,7 @@ class TwoFA:
             if step is None:
                 return False
             self._last_step[uid] = step
-            self.open_session(uid)      # persiste aussi _last_step (même fichier)
+            self.open_session(uid, minutes)  # persiste aussi _last_step (même fichier)
             return True
 
         h = _hash(code)
@@ -308,7 +332,7 @@ class TwoFA:
                 if self.log:
                     self.log.error("2fa: code de secours consommé en mémoire seulement "
                                    "(magasin non écrit) — session ouverte malgré tout")
-            self.open_session(uid)
+            self.open_session(uid, minutes)
             return True
         return False
 
@@ -340,27 +364,55 @@ class TwoFA:
         sans balayage actif, une session expirée resterait dans le dict (et les rôles sur
         le membre) tant que personne n'appellerait trusted() pour cet uid."""
         now = time.time()
-        stale = [u for u, exp in self._sessions.items() if exp <= now]
+        stale = [u for u, exp in self._sessions.items() if exp != NEVER and exp <= now]
         for u in stale:
             self._expire(u)
         return stale
 
-    def open_session(self, uid):
-        self._sessions[str(uid)] = time.time() + self.session_min * 60
+    def set_session_min(self, minutes):
+        """Change la durée par défaut des PROCHAINES sessions (0 = illimitée).
+
+        Ne touche PAS aux sessions déjà ouvertes : elles gardent l'échéance calculée à leur
+        ouverture. Raccourcir le réglage ne doit pas fermer d'un coup les sessions en cours
+        (ce serait un verrouillage surprise en pleine commande), et l'allonger ne doit pas
+        prolonger rétroactivement une session que son propriétaire croit bornée.
+        """
+        self.session_min = max(0, int(minutes))
+        self._save_sessions()          # best-effort : repli sur config.env si non écrit
+        return self.session_min
+
+    def open_session(self, uid, minutes=None):
+        """Ouvre une session de confiance. `minutes` : None = réglage courant, 0 = illimitée.
+
+        ⚠️ `minutes is None` et non `minutes or ...` : 0 est un choix VALIDE (illimité) que
+        `or` confondrait avec « pas de choix ».
+        """
+        m = self.session_min if minutes is None else max(0, int(minutes))
+        self._sessions[str(uid)] = NEVER if m == 0 else time.time() + m * 60
         self._save_sessions()          # survit à un redémarrage du bot
         self._fire(uid)                # rôles de session remis sans attendre la boucle
+        return m
 
     def trusted(self, uid):
         exp = self._sessions.get(str(uid))
-        if not exp:
+        if exp is None:
             return False
-        if exp < time.time():
+        if exp == NEVER:
+            return True                # session illimitée : jamais échue
+        if not exp or exp < time.time():
             self._expire(uid)
             return False
         return True
 
     def session_left(self, uid):
+        """Secondes restantes ; **-1 = session illimitée**, 0 = pas de session.
+
+        La sentinelle -1 oblige l'appelant à distinguer les deux cas : rendre 0 pour une
+        session infinie afficherait « fermée » alors qu'elle est ouverte pour toujours.
+        """
         exp = self._sessions.get(str(uid))
+        if exp == NEVER:
+            return -1
         return max(0, int(exp - time.time())) if exp else 0
 
     def close_session(self, uid):

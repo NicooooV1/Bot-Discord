@@ -205,7 +205,7 @@ c'est elle qui fait foi, pas ce tableau. 🔒 = réservé aux tiers M/O.
 - Docker & torrents : `/docker` 🔒 `/torrents` 🔒
 - Téléchargements : `/yt` `/tw` `/musique` `/dl` `/yt-config`
 - Assistant IA locale : `/assistant`
-- Sécurité & accès : `/2fa setup|unlock|status|disable` · `/gestion add|remove|list` 🔒
+- Sécurité & accès : `/2fa setup|unlock|lock|duree|status|disable` · `/gestion add|remove|list` 🔒
 - Actions : `/ctctl start|stop|restart` 🔒 · `/backup create|delete` 🔒 · `/audit` 🔒
 - Divers : `/whoami` `/help`
 
