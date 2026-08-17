@@ -368,6 +368,86 @@ from(bucket:"{self._b}")
         rows.sort(key=lambda r: (r.get("age_seconds") or 0), reverse=True)
         return rows
 
+    # --- débits réseau (par invité + WAN routeur) ---
+    async def net_rates(self, rng="1h"):
+        """Débits réseau par invité (moyenne ET pic) sur la période.
+
+        `netin`/`netout` remontés par PVE sont des COMPTEURS CUMULÉS depuis le
+        démarrage de l'invité : sans `derivative()` on afficherait des octets totaux,
+        pas un débit. `nonNegative` écarte les remises à zéro lors d'un redémarrage,
+        qui produiraient sinon un pic négatif aberrant.
+
+        ⚠️ Ce sont les débits TOTAUX de l'interface : LAN et Internet confondus.
+        Seul `wan_rates()` mesure réellement ce qui sort vers Internet.
+
+        Renvoie [{name, vmid, object, in_avg, in_max, out_avg, out_max}, …].
+        """
+        rng = self._rng(rng)
+
+        def flux(agg):
+            return f'''
+from(bucket:"{self._b}")
+  |> range(start:-{rng})
+  |> filter(fn:(r)=> r._measurement=="system"
+        and (r.object=="lxc" or r.object=="qemu" or r.object=="nodes")
+        and (r._field=="netin" or r._field=="netout"))
+  |> derivative(unit:1s, nonNegative:true)
+  |> group(columns:["host","vmid","object","_field"])
+  |> {agg}()'''
+
+        acc = {}
+        for agg, suffix in (("mean", "avg"), ("max", "max")):
+            for r in await self.aq(flux(agg)):
+                host = r.get("host")
+                if not host:
+                    continue
+                e = acc.setdefault(host, {"name": host, "vmid": r.get("vmid"),
+                                          "object": r.get("object")})
+                direction = "in" if r.get("_field") == "netin" else "out"
+                try:
+                    e[f"{direction}_{suffix}"] = float(r.get("_value") or 0)
+                except (TypeError, ValueError):
+                    e[f"{direction}_{suffix}"] = 0.0
+        rows = list(acc.values())
+        for e in rows:
+            for k in ("in_avg", "in_max", "out_avg", "out_max"):
+                e.setdefault(k, 0.0)
+        rows.sort(key=lambda e: e["in_avg"] + e["out_avg"], reverse=True)
+        return rows
+
+    async def wan_rates(self, rng="1h", ifname="sfp-sfpplus1"):
+        """Débit réel vers Internet, mesuré sur l'interface WAN du MikroTik.
+
+        Même logique de dérivée que net_rates : `in_octets`/`out_octets` sont des
+        compteurs SNMP cumulés. `ifname` par défaut = l'uplink vers la Box.
+        Attention au sens : `in_octets` sur le WAN = ce qui DESCEND depuis Internet.
+        """
+        rng = self._rng(rng)
+        safe_if = _esc(ifname)
+
+        def flux(agg):
+            return f'''
+from(bucket:"{self._b}")
+  |> range(start:-{rng})
+  |> filter(fn:(r)=> r._measurement=="mikrotik_interface"
+        and r.ifname=="{safe_if}"
+        and (r._field=="in_octets" or r._field=="out_octets"))
+  |> derivative(unit:1s, nonNegative:true)
+  |> group(columns:["_field"])
+  |> {agg}()'''
+
+        out = {"ifname": ifname}
+        for agg, suffix in (("mean", "avg"), ("max", "max")):
+            for r in await self.aq(flux(agg)):
+                direction = "down" if r.get("_field") == "in_octets" else "up"
+                try:
+                    out[f"{direction}_{suffix}"] = float(r.get("_value") or 0)
+                except (TypeError, ValueError):
+                    out[f"{direction}_{suffix}"] = 0.0
+        for k in ("down_avg", "down_max", "up_avg", "up_max"):
+            out.setdefault(k, 0.0)
+        return out
+
     # --- time series (for graphs) ---
     async def ct_series(self, host, field, rng="24h"):
         if field not in _FIELDS:
