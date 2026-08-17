@@ -35,6 +35,7 @@ relit pour les autres cogs, jamais l'inverse.
 """
 import asyncio
 import logging
+import time
 
 import discord
 from discord.ext import commands, tasks
@@ -82,6 +83,12 @@ class Provision(commands.Cog):
     # PVE avant d'être supprimé. 3 -> ~15 min : assez pour absorber une lecture PVE
     # partielle ou un nœud qui redémarre, assez court pour que le ménage suive.
     GHOST_DELETE_CYCLES = 3
+    # …ET au moins ce délai depuis la PREMIÈRE fois qu'on l'a vu orphelin. Les deux
+    # conditions, parce que « cycle » n'est pas une durée : au démarrage, `on_ready` et
+    # la boucle `reconcile` déclenchent deux réconciliations dans la même seconde — on
+    # a vu les compteurs passer de 1/3 à 2/3 sans qu'une minute s'écoule. Sans cette
+    # borne de temps, trois redémarrages rapprochés suffiraient à supprimer un salon.
+    GHOST_DELETE_MIN_S = 600
 
     def __init__(self, bot):
         self.bot = bot
@@ -841,8 +848,9 @@ class Provision(commands.Cog):
           2. par catégorie, il faut avoir vu au moins un invité VIVANT du serveur
              correspondant : un nœud Aveyron injoignable ne peut pas vider sa catégorie ;
           3. seuls les salons en forme d'invité sont candidats (_salon_est_un_invite) ;
-          4. hystérésis de GHOST_DELETE_CYCLES cycles CONSÉCUTIFS (5 min chacun) : un
-             compteur remis à zéro dès que l'invité reparaît.
+          4. hystérésis DOUBLE : GHOST_DELETE_CYCLES constats consécutifs ET
+             GHOST_DELETE_MIN_S secondes écoulées depuis le premier — un compteur remis
+             à zéro dès que l'invité reparaît.
         Chaque suppression est auditée (donc reprise dans #journaux-live)."""
         if not guests:
             return
@@ -865,11 +873,17 @@ class Provision(commands.Cog):
                     compteurs.pop(str(ch.id), None)
                     continue
                 vus_ce_cycle.add(str(ch.id))
-                n = compteurs.get(str(ch.id), 0) + 1
-                compteurs[str(ch.id)] = n
-                if n < self.GHOST_DELETE_CYCLES:
-                    log.info("salon #%s sans invité PVE (%d/%d) — suppression si ça dure",
-                             ch.name, n, self.GHOST_DELETE_CYCLES)
+                vu = compteurs.get(str(ch.id))
+                # tolère l'ancien format (un entier nu) laissé par une version d'avant
+                n, depuis = (vu, time.time()) if isinstance(vu, (int, float)) \
+                    else (vu[0], vu[1]) if vu else (0, time.time())
+                n += 1
+                compteurs[str(ch.id)] = [n, depuis]
+                assez_vieux = (time.time() - depuis) >= self.GHOST_DELETE_MIN_S
+                if n < self.GHOST_DELETE_CYCLES or not assez_vieux:
+                    log.info("salon #%s sans invité PVE (%d/%d, %.0f s) — suppression "
+                             "si ça dure", ch.name, n, self.GHOST_DELETE_CYCLES,
+                             time.time() - depuis)
                     continue
                 try:
                     await ch.delete(reason="invité supprimé côté Proxmox "

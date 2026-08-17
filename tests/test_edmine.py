@@ -742,6 +742,7 @@ class TestMenageSalonsFantomes(unittest.IsolatedAsyncioTestCase):
         cog = Provision.__new__(Provision)
         cog.bot = self.FauxBot()
         cog.prov = {"ct": {}, "archived": {}, "ghost_chan": {}}
+        cog.GHOST_DELETE_MIN_S = 0     # la borne de TEMPS a son propre test
         return cog
 
     async def _cycles(self, cog, cat, guests, n, avy=None):
@@ -783,6 +784,16 @@ class TestMenageSalonsFantomes(unittest.IsolatedAsyncioTestCase):
         avy = {"AVY-NAS": self.FauxCategorie([ch])}
         await self._cycles(cog, None, {"jellyfin": (105, None)}, 10, avy=avy)
         self.assertFalse(ch.supprime, "catégorie d'un serveur muet vidée")
+
+    async def test_borne_de_temps_bloque_les_cycles_trop_rapproches(self):
+        """Au démarrage, deux réconciliations tombent dans la même seconde : les
+        constats seuls ne suffisent pas, il faut aussi que le temps soit passé."""
+        from bot.cogs.provision import Provision
+        ch = self.FauxSalon("🟢-fronote-tamper", 1)
+        cog = self._cog()
+        cog.GHOST_DELETE_MIN_S = Provision.GHOST_DELETE_MIN_S
+        await self._cycles(cog, self.FauxCategorie([ch]), {"jellyfin": (105, None)}, 10)
+        self.assertFalse(ch.supprime, "supprimé sans qu'une seule minute s'écoule")
 
     async def test_salon_fait_main_jamais_supprime(self):
         """Garde-fou 3 : ni emoji de statut ni entrée dans prov['ct'] = pas un invité."""
