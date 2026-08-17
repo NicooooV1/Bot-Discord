@@ -36,6 +36,27 @@ import logging
 log = logging.getLogger("discord-bot.nodeshell")
 
 
+async def run_readonly(cfg, commande, timeout=25):
+    """Exécute UNE commande sur l'hyperviseur et renvoie sa sortie standard.
+
+    Même clé, même host key épinglée et même compte que la console du nœud : cette
+    fonction n'ouvre AUCUN privilège nouveau (la clé donne déjà un shell root). Elle
+    existe pour que les boucles de fond n'aient pas à instancier une session
+    interactive — et pour qu'un appelant ne puisse pas, par construction, laisser une
+    connexion ouverte : elle est refermée par le `async with`.
+
+    ⚠️ Réservée à des lectures. Rien ici ne le CONTRAINT techniquement (c'est root au
+    bout), mais tout appel qui écrirait doit passer par un chemin audité, pas par ce
+    raccourci de supervision."""
+    import asyncssh
+    async with asyncssh.connect(
+            cfg.node_ssh_host, port=cfg.node_ssh_port, username=cfg.node_ssh_user,
+            client_keys=[cfg.node_ssh_key], known_hosts=cfg.node_ssh_known_hosts,
+            connect_timeout=timeout) as conn:
+        r = await asyncio.wait_for(conn.run(commande, check=False), timeout=timeout)
+        return r.stdout or ""
+
+
 class NodeShell:
     """Shell root sur le nœud PVE via SSH. Même contrat que PveConsole."""
 

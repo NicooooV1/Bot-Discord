@@ -408,10 +408,6 @@ class _RemoteCluster:
         return self._action_api.nodes(self._any_node()).storage(self.storage).content(volid).delete()
 
 
-class LlmExecError(RuntimeError):
-    """Échec de l'exécution dans la VM (timeout, exitcode≠0, JSON invalide)."""
-
-
 class AvyUnreachable(RuntimeError):
     """Cluster secondaire (AVEYRON) injoignable — levée par le coupe-circuit partagé
     (Pve._avy_read) sans re-payer le timeout réseau tant que le lien est coupé. Sous-classe
@@ -429,176 +425,6 @@ class AvyNodeUnreachable(AvyUnreachable):
     où le nœud `nas` (partage CIFS démonté) faisait déclarer tout Aveyron injoignable —
     d'abord par intermittence, puis en permanence : chaque fenêtre « half-open » du
     coupe-circuit retombait sur une lecture de ce nœud, qui la ré-armait aussitôt."""
-
-
-class _LlmBridge:
-    """Pont vers le serveur LiteLLM (port 4000) tournant DANS la VM ubuntu-llm
-    (nœud llm, cluster Aveyron) — un Qwen 35B local sur RTX 3090 passthrough.
-
-    Aucune route réseau directe (le VLAN de la VM n'est pas routé par le tunnel WG) :
-    chaque appel passe par l'API PVE -> guest-agent -> `exec curl localhost:4000` à
-    l'INTÉRIEUR de la VM, avec un jeton discordbot@pve!llm scopé À CETTE SEULE VM
-    (ACL /vms/<vmid>, PAS /vms) — même en cas de fuite du jeton, le pire cas reste une
-    exécution de commande dans cette VM précise, jamais sur le reste du cluster."""
-
-    # Concurrence des CONVERSATIONS (2026-08-11). Chaque appel occupe un thread jusqu'à
-    # 90 s (sondage exec-status à travers le tunnel WG) et /assistant comme #chat-ia
-    # lancent une conversation PAR MESSAGE, jusqu'à 3 tours, sans file ni anti-rebond :
-    # huit questions d'affilée immobilisaient huit workers du pool PARTAGÉ d'asyncio
-    # (~6-8 dans le CT106), donc AUSSI les lectures PVE/Influx des boucles de fond —
-    # embeds épinglés figés et boutons hors du budget de 3 s, sans rien dans les logs.
-    # On REFUSE au-delà de la limite au lieu d'attendre : attendre immobiliserait
-    # justement le worker qu'on cherche à libérer. Le moniteur périodique (monitor(),
-    # 1 appel / 5 min) n'est PAS compté — le refuser afficherait « IA locale
-    # injoignable » à tort dans le salon AVY-LLM.
-    _MAX_CHATS_INFLIGHT = 2
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.node = cfg.avy_llm_node
-        self.vmid = cfg.avy_llm_vmid
-        self._api = _mk_remote_client(cfg, cfg.avy_llm_token_id, cfg.avy_llm_token_secret)
-        self._chat_sem = threading.BoundedSemaphore(self._MAX_CHATS_INFLIGHT)
-
-    @staticmethod
-    def _fix_mojibake(s):
-        """L'API PVE renvoie out-data/err-data en UTF-8 réinterprété comme Latin-1
-        (« Prêt » -> « PrÃªt », vérifié 2026-07-18) — le ré-encodage restaure les
-        accents. Repli silencieux sur le texte brut si ce n'est pas le cas (contenu
-        déjà correct, ou binaire non-UTF8) plutôt que de planter dessus."""
-        try:
-            return s.encode("latin1").decode("utf8")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            return s
-
-    def _exec(self, argv):
-        """Lance argv (liste, PAS de shell — execve direct par le guest-agent) et
-        attend la fin. Renvoie (stdout, stderr, exitcode).
-
-        Le sondage part court puis ralentit (0,3 s -> plafond 2 s) : une réponse rapide
-        revient en ~0,3 s au lieu de 1,5 s, et une réponse lente coûte ~48 requêtes au
-        lieu de 60 sur le tunnel WG (2026-08-11 ; chiffre recompté à la relecture — le
-        plafond de 2 s ne divise pas le nombre de sondages par 3, c'est la LATENCE des
-        réponses courtes qui gagne, pas le volume)."""
-        ep = self._api.nodes(self.node).qemu(self.vmid).agent
-        r = ep.exec.post(command=argv)
-        pid = r["pid"]
-        deadline = time.time() + 90
-        delay = 0.3
-        while time.time() < deadline:
-            st = ep("exec-status").get(pid=pid)
-            if st.get("exited"):
-                out = self._fix_mojibake(st.get("out-data", ""))
-                err = self._fix_mojibake(st.get("err-data", ""))
-                return out, err, st.get("exitcode")
-            time.sleep(delay)
-            delay = min(2.0, delay * 1.6)
-        raise LlmExecError("timeout (90s) en attente de la réponse du modèle")
-
-    def chat(self, messages, tools=None, max_tokens=700, temperature=0.3):
-        """Appelle /v1/chat/completions du LiteLLM local. Renvoie le message complet
-        de l'API (dict avec 'content' et éventuellement 'tool_calls')."""
-        payload = {"model": self.cfg.avy_llm_model, "messages": messages,
-                   "max_tokens": max_tokens, "temperature": temperature}
-        if tools:
-            payload["tools"] = tools
-        argv = ["curl", "-s", "--max-time", "80", "-X", "POST",
-                f"http://localhost:{self.cfg.avy_llm_port}/v1/chat/completions",
-                "-H", "Content-Type: application/json",
-                "--data-binary", json.dumps(payload)]
-        # refus immédiat au-delà de _MAX_CHATS_INFLIGHT (cf. commentaire de classe) :
-        # l'appelant affiche le message tel quel, personne n'attend en occupant un worker
-        if not self._chat_sem.acquire(blocking=False):
-            raise LlmExecError(
-                f"trop de demandes en cours ({self._MAX_CHATS_INFLIGHT} au maximum) "
-                f"— réessaie dans un instant")
-        try:
-            out, err, code = self._exec(argv)
-        finally:
-            self._chat_sem.release()
-        if not out:
-            raise LlmExecError(f"réponse vide (exitcode={code}, err={err[:200]})")
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError as e:
-            raise LlmExecError(f"réponse non-JSON : {out[:200]}") from e
-        if "error" in data:
-            raise LlmExecError(str(data["error"])[:300])
-        return data["choices"][0]["message"]
-
-    # Script exécuté DANS la VM (un seul aller-retour guest-agent au lieu de ~8) :
-    # GPU (nvidia_gpu_exporter:9835), 4 services systemd, disque racine, 3 health
-    # checks, infos modèle, charge (node_exporter:9100). Testé de bout en bout
-    # 2026-07-18. `python3 -c <script>` en UN SEUL argv -> zéro souci d'échappement
-    # (execve direct par le guest-agent, pas de shell).
-    _MONITOR_SCRIPT = r'''
-import json, subprocess, urllib.request, shutil
-
-def get(url, timeout=3):
-    try:
-        return urllib.request.urlopen(url, timeout=timeout).read().decode()
-    except Exception:
-        return None
-
-def metric(text, name):
-    if not text:
-        return None
-    for line in text.splitlines():
-        if line.startswith(name + "{") or line.startswith(name + " "):
-            try:
-                return float(line.rsplit(" ", 1)[-1])
-            except ValueError:
-                return None
-    return None
-
-out = {}
-gpu_txt = get("http://localhost:9835/metrics")
-out["gpu"] = {
-    "temp": metric(gpu_txt, "nvidia_smi_temperature_gpu"),
-    "mem_used": metric(gpu_txt, "nvidia_smi_memory_used_bytes"),
-    "mem_total": metric(gpu_txt, "nvidia_smi_memory_total_bytes"),
-    "util": metric(gpu_txt, "nvidia_smi_utilization_gpu_ratio"),
-    "power": metric(gpu_txt, "nvidia_smi_power_draw_watts"),
-    "fan": metric(gpu_txt, "nvidia_smi_fan_speed_ratio"),
-}
-services = {}
-for s in ("llama-server", "litellm", "llm-router", "llama-server-small"):
-    r = subprocess.run(["systemctl", "is-active", s], capture_output=True, text=True)
-    services[s] = r.stdout.strip()
-out["services"] = services
-
-du = shutil.disk_usage("/")
-out["disk"] = {"total": du.total, "used": du.used, "free": du.free}
-
-out["llama_health"] = get("http://localhost:8080/health")
-out["litellm_alive"] = get("http://localhost:4000/health/liveliness")
-out["router_health"] = get("http://localhost:8000/health")
-
-models_txt = get("http://localhost:8080/v1/models")
-try:
-    m = json.loads(models_txt)["data"][0]["meta"]
-    out["model"] = {"n_ctx": m.get("n_ctx"), "n_params": m.get("n_params"),
-                    "size_bytes": m.get("size")}
-except Exception:
-    out["model"] = None
-
-load_txt = get("http://localhost:9100/metrics")
-out["load1"] = metric(load_txt, "node_load1")
-
-print(json.dumps(out))
-'''
-
-    def monitor(self):
-        """Un instantané complet du stack IA (GPU/services/disque/santé/modèle).
-        Lève LlmExecError si le script échoue ou renvoie du JSON invalide."""
-        argv = ["python3", "-c", self._MONITOR_SCRIPT]
-        out, err, code = self._exec(argv)
-        if not out:
-            raise LlmExecError(f"monitor: sortie vide (exitcode={code}, err={err[:200]})")
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError as e:
-            raise LlmExecError(f"monitor: JSON invalide : {out[:200]}") from e
 
 
 class Pve:
@@ -630,67 +456,6 @@ class Pve:
                          cfg.avy_key, cfg.avy_host)
             except Exception:
                 log.exception("init du client du cluster %s", cfg.avy_key)
-        self._llm = None
-        self._llm_pool = None       # pool dédié, créé à la 1re utilisation (_llm_executor)
-        if getattr(cfg, "avy_llm_enabled", False):
-            try:
-                self._llm = _LlmBridge(cfg)
-                log.info("assistant IA local: pont initialisé (VM %s sur %s)",
-                         cfg.avy_llm_vmid, cfg.avy_llm_node)
-            except Exception:
-                log.exception("init du pont assistant IA local")
-
-    @property
-    def llm_enabled(self):
-        return self._llm is not None
-
-    def llm_chat(self, messages, tools=None, max_tokens=700, temperature=0.3):
-        """Chat/function-calling via le Qwen local (voir _LlmBridge). Lève
-        LlmExecError si indisponible/en échec — à l'appelant de décider du message
-        d'erreur affiché."""
-        if self._llm is None:
-            raise LlmExecError("assistant IA local non configuré")
-        return self._llm_guarded(self._llm.chat, messages, tools=tools,
-                                 max_tokens=max_tokens, temperature=temperature)
-
-    def llm_monitor(self):
-        """Instantané complet du stack IA locale (GPU/services/disque/santé/modèle)."""
-        if self._llm is None:
-            raise LlmExecError("assistant IA local non configuré")
-        return self._llm_guarded(self._llm.monitor)
-
-    def _llm_executor(self):
-        """Pool DÉDIÉ aux appels IA (créé à la première utilisation).
-
-        `asyncio.to_thread` utilise le pool PAR DÉFAUT de la boucle (~6-8 threads ici),
-        partagé avec toutes les lectures PVE/Influx/qBittorrent : un appel IA qui dure
-        90 s y prend une place que les boucles de fond attendent. Ces deux enveloppes
-        sortent l'IA de ce pool — à préférer à `asyncio.to_thread(pve.llm_chat, …)`
-        (2026-08-11).
-
-        Taille = _MAX_CHATS_INFLIGHT + 2, et surtout PAS 2 (relecture 2026-08-11) : la
-        limite de concurrence est le sémaphore de _LlmBridge, qui REFUSE tout de suite
-        au-delà de 2 conversations. Avec un pool de 2, les demandes en trop n'auraient
-        jamais atteint ce refus : elles auraient attendu en file DANS l'exécuteur (file
-        non bornée) jusqu'à 90 s — exactement le comportement « mise en file muette »
-        que le sémaphore existe pour éviter. Les workers libres servent au refus
-        immédiat et au monitor() périodique, qui n'est pas compté par le sémaphore et ne
-        doit pas rester coincé derrière deux conversations."""
-        if self._llm_pool is None:
-            self._llm_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=_LlmBridge._MAX_CHATS_INFLIGHT + 2, thread_name_prefix="llm")
-        return self._llm_pool
-
-    async def allm_chat(self, messages, tools=None, max_tokens=700, temperature=0.3):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._llm_executor(),
-            lambda: self.llm_chat(messages, tools=tools, max_tokens=max_tokens,
-                                  temperature=temperature))
-
-    async def allm_monitor(self):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._llm_executor(), self.llm_monitor)
 
     @property
     def enabled(self):
@@ -732,7 +497,7 @@ class Pve:
 
     @staticmethod
     def avy_server_key(node):
-        """Clé serveur d'un NŒUD Aveyron : pve -> AVY-PVE, nas -> AVY-NAS, llm ->
+        """Clé serveur d'un NŒUD Aveyron : nas -> AVY-NAS, ms01 -> AVY-MS01, llm ->
         AVY-LLM. C'est la clé utilisée dans GESTION_SERVERS (rôles G/M/O) et dans les
         noms de catégories (📊 Supervision AVY-PVE / Gestion AVY-PVE) — Aveyron =
         « trois serveurs différents » (choix Nico 2026-07-17), un tiers complet chacun."""
@@ -947,20 +712,6 @@ class Pve:
             # lien, ni dans un sens ni dans l'autre. L'appelant voit un échec normal.
             raise AvyUnreachable(str(e) or "réseau") from None
         # succès : lui, prouve bien que le lien est là — il referme le coupe-circuit.
-        self._avy_ok()
-        return r
-
-    def _llm_guarded(self, fn, *a, **kw):
-        """Comme _avy_read mais pour le pont IA (même hôte Aveyron) : lève LlmExecError
-        (et non AvyUnreachable) pour que /assistant & #chat-ia l'affichent proprement via
-        leur `except LlmExecError`. Coupe-circuit PARTAGÉ avec les lectures distantes."""
-        if time.time() - getattr(self, "_avy_fail_ts", 0) < AVY_BACKOFF:
-            raise LlmExecError("cluster AVEYRON injoignable")
-        try:
-            r = fn(*a, **kw)
-        except OSError as e:
-            self._avy_maybe_trip()
-            raise LlmExecError(f"assistant IA injoignable ({e})") from None
         self._avy_ok()
         return r
 

@@ -1,4 +1,4 @@
-"""Supervision des serveurs Aveyron (AVY-PVE / AVY-NAS / AVY-LLM).
+"""Supervision des serveurs Aveyron (AVY-NAS / AVY-MS01 / AVY-LLM).
 
 Chaque nœud du cluster Aveyron est traité comme un serveur à part entière (choix Nico
 2026-07-17) : sa catégorie « 📊 Supervision AVY-X » (créée par provision) contient
@@ -20,6 +20,7 @@ ce qu'elles affichent leur arrive en argument) ; ici restent la collecte, les al
 verrou et la boucle. Les SEUILS sont définis là-bas et réimportés ci-dessous — un seul
 endroit où lire « 85 % », pour l'affichage comme pour l'alerte."""
 import asyncio
+import datetime
 import logging
 import re
 import time
@@ -32,14 +33,10 @@ from . import avy_embeds as embeds
 # embeds + sommaire de #alertes qui les documente, et les alertes ci-dessous). Une seule
 # définition, sinon un salon annoncerait « ≥ 85 % » pendant que l'alerte partirait à 90 %.
 from .avy_embeds import (AUTH_FAIL_MIN, CERT_ALERT_DAYS, CERT_CLEAR_DAYS,
-                         DISK_TEMP_ALERT, DISK_TEMP_CLEAR, GPU_TEMP_ALERT,
-                         GPU_TEMP_CLEAR, GPU_VRAM_FREE_ALERT, GPU_VRAM_FREE_CLEAR,
-                         LAT_ALERT_MS, LAT_CLEAR_MS, LLM_CORE_SERVICES,
-                         LLM_DISK_FREE_ALERT, LLM_DISK_FREE_CLEAR, STO_ALERT_PCT,
-                         STO_CLEAR_PCT, WEAROUT_ALERT)
+                         DISK_TEMP_ALERT, DISK_TEMP_CLEAR, LAT_ALERT_MS, LAT_CLEAR_MS,
+                         STO_ALERT_PCT, STO_CLEAR_PCT, WEAROUT_ALERT)
 from ..core import format as fmt
 from ..core.gates import GatedView
-from ..core.pve import LlmExecError
 from ..core.ui import pin_edit
 from ..views.confirm import ConfirmView
 
@@ -603,103 +600,6 @@ class Avy(commands.Cog):
             rows.append((lvl, f"Aveyron — {node}", f"CPU {cpu:.0f} % · RAM {rampct:.0f} %"))
         return rows
 
-    # -------------------------------------------------------- assistant IA locale
-
-    def _llm_channel_id(self):
-        p = self.bot.get_cog("Provision")
-        prov = p.prov if p is not None else (self.bot.state.get("prov", {}) or {})
-        return prov.get("avy_llm_channel")
-
-    async def refresh_llm(self):
-        cid = self._llm_channel_id()
-        if not cid:
-            return None
-        try:
-            mon = await asyncio.to_thread(self.bot.pve.llm_monitor)
-        except LlmExecError:
-            await self._pin_edit(cid, embeds.ia_locale_down())   # attendu : VM/cluster injoignable
-            return None
-        except Exception:
-            log.exception("supervision IA locale")
-            await self._pin_edit(cid, embeds.ia_locale_down())
-            return None
-        # ⚠️ Le rendu de l'embed ne doit pas emporter les ALERTES avec lui : une métrique
-        # inattendue (clé à None, format surprise) faisait remonter l'exception jusqu'au
-        # try du cycle et sautait _llm_alerts — service arrêté, GPU brûlant ou disque
-        # plein n'étaient plus signalés du tout (2026-08-11).
-        try:
-            await self._pin_edit(cid, embeds.ia_locale(mon, self.bot.cfg.avy_llm_model))
-        except Exception:
-            log.exception("supervision IA locale: rendu de l'embed #ia-locale")
-        return mon
-
-    async def _llm_alerts(self, mon, state):
-        # même règle que _alerts : verrou/curseur armés seulement sur envoi confirmé
-        node = self.bot.cfg.avy_llm_node
-        s = state.setdefault("_llm", {})
-        if mon is None:
-            if not s.get("down"):
-                if await self._send_alert(node, "🔴 **assistant IA locale** : VM ou "
-                                                "services injoignables"):
-                    s["down"] = True
-            return
-        if s.get("down"):
-            if await self._send_alert(
-                    node, "🟢 **assistant IA locale** : de nouveau joignable"):
-                s["down"] = False
-
-        svc = mon.get("services") or {}
-        down_now = {n for n in LLM_CORE_SERVICES if svc.get(n) != "active"}
-        prev_down = set(s.get("svc_down") or [])
-        announced = set(prev_down)      # état réellement annoncé dans Discord
-        for n in down_now - prev_down:
-            if await self._send_alert(node, f"🔴 **assistant IA locale** : service "
-                                            f"`{n}` arrêté"):
-                announced.add(n)
-        for n in prev_down - down_now:
-            if await self._send_alert(node, f"🟢 **assistant IA locale** : service "
-                                            f"`{n}` de nouveau actif"):
-                announced.discard(n)
-        s["svc_down"] = sorted(announced)
-
-        gpu = mon.get("gpu") or {}
-        temp = gpu.get("temp")
-        if temp is not None:
-            if temp >= GPU_TEMP_ALERT and not s.get("temp"):
-                if await self._send_alert(
-                        node, f"🔴 **GPU RTX 3090** à **{temp:.0f} °C**"):
-                    s["temp"] = True
-            elif temp < GPU_TEMP_CLEAR and s.get("temp"):
-                if await self._send_alert(
-                        node, f"🟢 **GPU RTX 3090** redescendue à {temp:.0f} °C"):
-                    s["temp"] = False
-
-        if gpu.get("mem_total"):
-            free = gpu["mem_total"] - (gpu.get("mem_used") or 0)
-            if free < GPU_VRAM_FREE_ALERT and not s.get("vram"):
-                if await self._send_alert(
-                        node, f"🔴 **VRAM RTX 3090** quasi pleine : "
-                              f"{fmt.humanize_bytes(free)} libres"):
-                    s["vram"] = True
-            elif free > GPU_VRAM_FREE_CLEAR and s.get("vram"):
-                if await self._send_alert(
-                        node, "🟢 **VRAM RTX 3090** de nouveau disponible"):
-                    s["vram"] = False
-
-        disk = mon.get("disk") or {}
-        if disk.get("free") is not None:
-            if disk["free"] < LLM_DISK_FREE_ALERT and not s.get("disk"):
-                if await self._send_alert(
-                        node, f"🔴 **disque ubuntu-llm** : "
-                              f"{fmt.humanize_bytes(disk['free'])} libres seulement"):
-                    s["disk"] = True
-            elif disk["free"] > LLM_DISK_FREE_CLEAR and s.get("disk"):
-                if await self._send_alert(
-                        node, "🟢 **disque ubuntu-llm** : espace redevenu confortable"):
-                    s["disk"] = False
-
-    # ------------------------------------------------------------------ boucle
-
     async def refresh_node(self, node):
         """Reconstruit les embeds épinglés d'un nœud (+ alertes). Renvoie data ou None."""
         # La carte des invités est lue UNE fois, hors boucle d'événements : _node_guests()
@@ -718,7 +618,7 @@ class Avy(commands.Cog):
             data = None
         chans = self._sup().get(node, {})
         await self._pin_edit(chans.get("alertes"),
-                             embeds.alertes(node, self.bot.cfg.avy_llm_node))
+                             embeds.alertes(node))
         if data is None:
             await self._pin_edit(chans.get("hyperviseur"), embeds.down(node),
                                  AvyNodeView(self))
@@ -737,7 +637,106 @@ class Avy(commands.Cog):
                              embeds.sauvegardes(node, data, content.get(node) or [],
                                                 guests, sfx, cl))
         await self._pin_edit(chans.get("materiel"), embeds.materiel(node, data))
+        await self._journal(node, data, chans)
         return data
+
+    # ------------------------------------------------- journal des tâches du nœud
+
+    async def _journal(self, node, data, chans):
+        """Publie dans #journaux-<nœud> les tâches Proxmox TERMINÉES depuis le dernier
+        cycle. C'est le seul « journal » disponible pour Aveyron : ses machines n'ont
+        aucun agent qui pousse vers Loki, et il n'y a pas de route pour en ajouter un.
+
+        ⚠️ Curseur SEMÉ au premier passage (aucune publication) : sans ça, le salon
+        naîtrait avec les 20 dernières tâches d'un coup — et pareil à chaque fois qu'on
+        recrée le salon. Le curseur est le `starttime` le plus récent VU, jamais
+        l'heure courante : une tâche encore en cours au moment du relevé sera publiée
+        au cycle où elle se termine, pas perdue."""
+        cid = (chans or {}).get("journaux")
+        ch = self.bot.get_channel(cid) if cid else None
+        if ch is None:
+            return
+        taches = [t for t in (data.get("tasks") or []) if t.get("endtime")]
+        if not taches:
+            return
+        curseurs = dict(self.bot.state.get("avy_journal", {}) or {})
+        vu = curseurs.get(node)
+        recent = max(int(t.get("starttime") or 0) for t in taches)
+        if vu is None:
+            curseurs[node] = recent
+            self.bot.state.set("avy_journal", curseurs)
+            await self._pin_edit(cid, embeds.journal_entete(node))
+            return
+        neuves = sorted((t for t in taches if int(t.get("starttime") or 0) > vu),
+                        key=lambda t: int(t.get("starttime") or 0))
+        if not neuves:
+            return
+        # plafond par cycle : une reprise après une longue coupure ne doit pas déverser
+        # 20 messages d'affilée (limite de débit Discord, salon illisible).
+        trop = max(0, len(neuves) - 10)
+        lignes = []
+        for t in neuves[-10:]:
+            ok = str(t.get("status", "")) == "OK"
+            fin = datetime.datetime.fromtimestamp(int(t["endtime"])).strftime("%H:%M")
+            duree = fmt.humanize_duration(int(t["endtime"]) - int(t.get("starttime") or 0))
+            qui = str(t.get("user") or "").split("@")[0]
+            statut = "" if ok else f" — `{str(t.get('status'))[:120]}`"
+            lignes.append(f"{'✅' if ok else '⚠️'} `{t.get('type')}` "
+                          f"{t.get('id') or ''} · {fin} · {duree}"
+                          + (f" · {qui}" if qui else "") + statut)
+        if trop:
+            lignes.insert(0, f"… {trop} tâches plus anciennes non détaillées")
+        try:
+            await ch.send("\n".join(lignes)[:1900],
+                          allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            # curseur NON avancé : les tâches repartiront au cycle suivant plutôt que
+            # d'être perdues silencieusement.
+            log.warning("journal Aveyron non publié (%s)", node, exc_info=True)
+            return
+        curseurs[node] = max(vu, recent)
+        self.bot.state.set("avy_journal", curseurs)
+
+    async def build_rapport(self, node):
+        """Embed du rapport quotidien d'un nœud (appelé par le cog Reports)."""
+        try:
+            self._cycle_guests = await self.bot.pve.aguest_map()
+        except Exception:
+            log.warning("rapport Aveyron %s : carte des invités indisponible", node,
+                        exc_info=True)
+            self._cycle_guests = None
+        data = await asyncio.to_thread(self._collect, node)
+        cl = self._cluster
+        if cl is None:
+            cl = await asyncio.to_thread(self._cluster_collect)
+        return embeds.rapport(node, data, self._node_guests(node),
+                              "-" + self.bot.cfg.avy_suffix, cl)
+
+    async def post_rapports(self):
+        """Publie le rapport quotidien de CHAQUE nœud dans son #rapports-<nœud>.
+        Renvoie le nombre de rapports réellement envoyés (0 = rien publié : c'est ce
+        que Reports regarde pour ne pas marquer la journée comme faite)."""
+        if not self.bot.pve.avy_enabled or not self._sup():
+            return 0
+        envoyes = 0
+        for node in await asyncio.to_thread(self.bot.pve.avy_nodes):
+            cid = self._sup().get(node, {}).get("rapports")
+            ch = self.bot.get_channel(cid) if cid else None
+            if ch is None:
+                log.warning("rapport quotidien de %s non publié : salon #rapports-%s "
+                            "introuvable (id=%s)", node, node, cid)
+                continue
+            try:
+                emb = await self.build_rapport(node)
+            except Exception:
+                log.exception("rapport quotidien du nœud %s : construction échouée", node)
+                continue
+            try:
+                await ch.send(embed=emb)
+                envoyes += 1
+            except discord.HTTPException:
+                log.warning("rapport quotidien de %s non publié", node, exc_info=True)
+        return envoyes
 
     @tasks.loop(minutes=5)
     async def refresh(self):
@@ -761,12 +760,6 @@ class Avy(commands.Cog):
             await self._cluster_alerts(self._cluster, state)
         except Exception:
             log.exception("supervision Aveyron: alertes cluster")
-        if getattr(self.bot.pve, "llm_enabled", False):
-            try:
-                mon = await self.refresh_llm()
-                await self._llm_alerts(mon, state)
-            except Exception:
-                log.exception("supervision Aveyron: assistant IA locale")
         self.bot.state.set("avy_alerts", state)
 
     @refresh.before_loop

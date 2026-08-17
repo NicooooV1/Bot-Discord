@@ -712,5 +712,152 @@ class TestDureeInactiviteTerminal(unittest.TestCase):
                       "Discord n'accepte QUE ces quatre paliers")
 
 
+# ------------------------------------------------- ménage des salons d'invités
+class TestMenageSalonsFantomes(unittest.IsolatedAsyncioTestCase):
+    """`Provision._sweep_ghost_channels` SUPPRIME des salons Discord — c'est
+    irréversible. Ces tests verrouillent ses quatre garde-fous, parce qu'une seule
+    lecture PVE en échec suffirait sinon à vider toutes les catégories « Gestion »."""
+
+    class FauxSalon:
+        def __init__(self, nom, cid):
+            self.name, self.id, self.supprime = nom, cid, False
+
+        async def delete(self, reason=None):
+            self.supprime = True
+
+    class FauxCategorie:
+        def __init__(self, salons):
+            self.text_channels = salons
+
+    class FauxAudit:
+        def record(self, **kw):
+            pass
+
+    class FauxBot:
+        def __init__(self):
+            self.audit = TestMenageSalonsFantomes.FauxAudit()
+
+    def _cog(self):
+        from bot.cogs.provision import Provision
+        cog = Provision.__new__(Provision)
+        cog.bot = self.FauxBot()
+        cog.prov = {"ct": {}, "archived": {}, "ghost_chan": {}}
+        return cog
+
+    async def _cycles(self, cog, cat, guests, n, avy=None):
+        for _ in range(n):
+            await cog._sweep_ghost_channels(None, guests, cat, avy or {})
+
+    async def test_pve_muet_ne_supprime_rien(self):
+        """Garde-fou 1 : `guests` vide = trou de données, pas « tout a disparu »."""
+        mort = self.FauxSalon("🔴-fronote-test-130", 1)
+        cog = self._cog()
+        await self._cycles(cog, self.FauxCategorie([mort]), {}, 10)
+        self.assertFalse(mort.supprime, "PVE muet a suffi à supprimer un salon")
+
+    async def test_suppression_apres_hysteresis(self):
+        vivant = self.FauxSalon("🟢-jellyfin", 1)
+        mort = self.FauxSalon("🟢-fronote-test-130", 2)
+        cog = self._cog()
+        cat = self.FauxCategorie([vivant, mort])
+        guests = {"jellyfin": (105, None)}
+        await self._cycles(cog, cat, guests, Provision_cycles() - 1)
+        self.assertFalse(mort.supprime, "supprimé AVANT la fin de l'hystérésis")
+        await self._cycles(cog, cat, guests, 1)
+        self.assertTrue(mort.supprime, "jamais supprimé malgré l'hystérésis atteinte")
+        self.assertFalse(vivant.supprime, "salon d'un invité VIVANT supprimé")
+
+    async def test_retour_de_linvite_remet_le_compteur_a_zero(self):
+        ch = self.FauxSalon("🔴-win11", 1)
+        cog = self._cog()
+        cat = self.FauxCategorie([ch])
+        await self._cycles(cog, cat, {"jellyfin": (105, None)}, Provision_cycles() - 1)
+        await self._cycles(cog, cat, {"jellyfin": (105, None), "win11": (111, None)}, 1)
+        await self._cycles(cog, cat, {"jellyfin": (105, None)}, 1)
+        self.assertFalse(ch.supprime, "compteur non remis à zéro au retour de l'invité")
+
+    async def test_serveur_injoignable_epargne_sa_categorie(self):
+        """Garde-fou 2 : aucun invité vu pour AVY-NAS -> on n'y touche pas."""
+        ch = self.FauxSalon("🟢-immich-avy", 1)
+        cog = self._cog()
+        avy = {"AVY-NAS": self.FauxCategorie([ch])}
+        await self._cycles(cog, None, {"jellyfin": (105, None)}, 10, avy=avy)
+        self.assertFalse(ch.supprime, "catégorie d'un serveur muet vidée")
+
+    async def test_salon_fait_main_jamais_supprime(self):
+        """Garde-fou 3 : ni emoji de statut ni entrée dans prov['ct'] = pas un invité."""
+        ch = self.FauxSalon("notes-perso", 1)
+        cog = self._cog()
+        await self._cycles(cog, self.FauxCategorie([ch]), {"jellyfin": (105, None)}, 10)
+        self.assertFalse(ch.supprime, "salon créé à la main supprimé")
+
+    async def test_salon_suivi_sans_emoji_est_candidat(self):
+        ch = self.FauxSalon("vieux-ct", 7)
+        cog = self._cog()
+        cog.prov["ct"]["vieux-ct"] = 7
+        await self._cycles(cog, self.FauxCategorie([ch]), {"jellyfin": (105, None)},
+                           Provision_cycles())
+        self.assertTrue(ch.supprime, "salon suivi mais sans invité PVE : non supprimé")
+        self.assertNotIn("vieux-ct", cog.prov["ct"], "mapping non nettoyé")
+
+
+def Provision_cycles():
+    from bot.cogs.provision import Provision
+    return Provision.GHOST_DELETE_CYCLES
+
+
+# ------------------------------------------------ suivi du transfert média
+class TestSondeTransfert(unittest.TestCase):
+    """`transfert.parse_sonde` lit une sortie shell : elle doit rester bonne face aux
+    deux pièges rencontrés en vrai — un `Type=oneshot` qui dure reste « activating »
+    (le tester avec « active » annonçait « terminé » pendant que rsync tournait), et le
+    pourcentage entier de rsync reste à 0 % pendant des jours sur 2 Tio."""
+
+    SORTIE = ("etat=activating\n"
+              "resultat=success\n"
+              "debut=Tue 2026-08-18 00:01:12 CEST\n"
+              "progres=         14.12G   0%    4.88MB/s  130:18:11  \n"
+              "ligne=2026-08-18 00:02:12 rsync /mnt/media/ -> /mnt/avy-media/\n"
+              "libre=5483426480128\n")
+
+    def setUp(self):
+        from bot.cogs import transfert
+        self.t = transfert
+        self.etat = transfert.parse_sonde(self.SORTIE)
+
+    def test_etat_activating_est_actif(self):
+        self.assertIn(self.etat["etat"], self.t.ETATS_ACTIFS)
+
+    def test_octets_et_eta(self):
+        self.assertAlmostEqual(self.etat["octets"] / 2**30, 14.12, places=2)
+        self.assertEqual(self.etat["eta"], 130 * 3600 + 18 * 60 + 11)
+        self.assertEqual(self.etat["libre"], 5483426480128)
+
+    def test_progression_fine_pas_le_zero_de_rsync(self):
+        self.assertEqual(self.etat["pct"], 0, "le % brut de rsync est bien 0")
+        self.assertGreater(self.etat["pct_fin"], 0.1,
+                           "progression recalculée toujours coincée à 0")
+        self.assertLess(self.etat["pct_fin"], 5)
+
+    def test_sortie_vide_ne_leve_pas(self):
+        vide = self.t.parse_sonde("")
+        self.assertEqual(vide["etat"], "inconnu")
+        self.assertIsNone(vide["octets"])
+        self.assertNotIn(vide["etat"], self.t.ETATS_ACTIFS,
+                         "hôte muet interprété comme « transfert en cours »")
+
+    def test_journal_tronque_sans_progression(self):
+        """Journal sans ligne de progression : on garde l'état, pas de plantage."""
+        e = self.t.parse_sonde("etat=failed\nresultat=exit-code\n")
+        self.assertEqual(e["etat"], "failed")
+        self.assertIsNone(e["pct_fin"])
+
+    def test_barre_bornee(self):
+        self.assertEqual(len(self.t.barre(0)), 20)
+        self.assertEqual(len(self.t.barre(100)), 20)
+        self.assertEqual(len(self.t.barre(None)), 20)
+        self.assertEqual(len(self.t.barre(9999)), 20)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

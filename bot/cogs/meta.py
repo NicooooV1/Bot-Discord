@@ -39,7 +39,6 @@ CATEGORIES = [
     ("🧲 Seedbox & médias", ["ratio", "setratio", "langues", "film", "serie"]),
     ("🐳 Docker & torrents", ["docker", "torrents"]),
     ("📥 Téléchargements YouTube/Twitch", ["yt", "tw", "musique", "yt-config", "dl"]),
-    ("🤖 Assistant IA", ["assistant"]),
     ("🔐 Sécurité & accès", ["2fa", "gestion"]),
     ("🔧 Actions (admin)", ["ctctl", "backup", "audit"]),
     ("🪪 Divers", ["whoami", "help"]),

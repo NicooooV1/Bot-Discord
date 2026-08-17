@@ -196,23 +196,6 @@ class Config:
         self.syno_key = g("SYNO_SERVER_KEY", "SYNO").strip()
         self.syno_host = g("SYNO_HOST", "10.3.10.251").strip()
 
-        # --- Assistant IA local (Qwen sur RTX 3090, nœud llm d'Aveyron) 2026-07-18 ---
-        # Pas de route réseau directe vers la VM (VLAN non routé par le tunnel WG) : les
-        # requêtes passent par l'API PVE -> guest-agent -> exec curl localhost (jeton
-        # discordbot@pve!llm, scopé À CETTE SEULE VM via ACL /vms/<vmid>, jamais /vms).
-        self.avy_llm_node = g("AVY_LLM_NODE", "llm")
-        self.avy_llm_vmid = _int(g("AVY_LLM_VMID", "0"), 0)
-        self.avy_llm_token_id = g("AVY_LLM_TOKEN_ID", "discordbot@pve!llm")
-        self.avy_llm_token_secret = g("AVY_LLM_TOKEN_SECRET").strip()
-        self.avy_llm_model = g("AVY_LLM_MODEL", "qwen35-35b")
-        self.avy_llm_port = _int(g("AVY_LLM_PORT", "4000"), 4000)
-        self.avy_llm_enabled = bool(self.avy_llm_vmid and self.avy_llm_token_secret)
-        # clé serveur du nœud LLM (« AVY-LLM ») — même formule que Pve.avy_server_key,
-        # dupliquée ici pour que le cog assistant.py n'ait pas besoin de l'objet Pve
-        self.avy_llm_server_key = f"AVY-{self.avy_llm_node.upper()}"
-        # salon de chat direct avec l'assistant (câblé par provision._rewire, pas lu
-        # depuis l'environnement — 0 tant que le salon n'est pas encore créé)
-        self.assistant_chat_channel_id = 0
 
         # --- Terminal Discord (console root sur guest LXC via termproxy) ---
         self.terminal_enabled = _bool(g("TERMINAL_ENABLED"), False)
@@ -258,6 +241,19 @@ class Config:
         self.node_backup_enabled = _bool(g("NODE_BACKUP_ENABLED"), True)
         # …sauf ceux-ci (défaut 200 = le PBS lui-même, comme le job pbs-daily-cts)
         self.node_backup_exclude = g("NODE_BACKUP_EXCLUDE", "200").strip()
+        # --- Salon temporaire de suivi du transfert média (2026-08-18) ---
+        # Le premier remplissage du pool distant dure des jours : ce salon PUBLIC en
+        # lecture seule le montre en direct, puis disparaît (cf. cogs/transfert.py).
+        self.transfert_enabled = _bool(g("TRANSFERT_ENABLED"), True)
+        self.transfert_unit = g("TRANSFERT_UNIT", "media-backup.service")
+        self.transfert_log = g("TRANSFERT_LOG", "/var/log/media-backup.log")
+        self.transfert_source = g("TRANSFERT_SOURCE", "/mnt/media")
+        self.transfert_dest = g("TRANSFERT_DEST", "/mnt/avy-media")
+        self.transfert_channel_name = g("TRANSFERT_CHANNEL_NAME", "transfert-medias")
+        self.transfert_poll_sec = max(30, _int(g("TRANSFERT_POLL_SEC", "60"), 60))
+        # temps de grâce avant suppression du salon une fois le transfert fini
+        self.transfert_keep_min = max(0, _int(g("TRANSFERT_KEEP_MIN", "60"), 60))
+
         # durée de vie ABSOLUE d'une console du nœud, même active (0 = illimité)
         self.node_terminal_max_min = max(0, _int(g("NODE_TERMINAL_MAX_MIN", "120"), 120))
         # plafond de l'inactivité SAISIE pour le shell root de l'hyperviseur. Défaut plus

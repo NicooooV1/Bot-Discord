@@ -17,7 +17,7 @@ import time
 from discord.ext import commands, tasks
 
 from .avy import _smart_temp
-from ..core.pve import AvyUnreachable, LlmExecError
+from ..core.pve import AvyUnreachable
 
 log = logging.getLogger("discord-bot.avymetrics")
 
@@ -319,36 +319,6 @@ class AvyMetrics(commands.Cog):
                                       .field("used_bytes", int(used))
                                       .field("total_bytes", int(total)))
 
-        if getattr(pve, "llm_enabled", False):
-            try:
-                mon = pve.llm_monitor()
-                gpu = mon.get("gpu") or {}
-                disk = mon.get("disk") or {}
-                svc = mon.get("services") or {}
-                p = Point("avy_llm")
-                if gpu.get("temp") is not None:
-                    p.field("gpu_temp_c", float(gpu["temp"]))
-                if gpu.get("mem_used") is not None:
-                    p.field("gpu_vram_used_bytes", float(gpu["mem_used"]))
-                if gpu.get("mem_total") is not None:
-                    p.field("gpu_vram_total_bytes", float(gpu["mem_total"]))
-                if gpu.get("util") is not None:
-                    p.field("gpu_util_pct", float(gpu["util"]) * 100)
-                if gpu.get("power") is not None:
-                    p.field("gpu_power_w", float(gpu["power"]))
-                if disk.get("free") is not None:
-                    p.field("disk_free_bytes", int(disk["free"]))
-                    p.field("disk_total_bytes", int(disk.get("total") or 0))
-                if mon.get("load1") is not None:
-                    p.field("load1", float(mon["load1"]))
-                for key, fname in (("llama-server", "llama_up"), ("litellm", "litellm_up"),
-                                  ("llm-router", "router_up")):
-                    p.field(fname, 1 if svc.get(key) == "active" else 0)
-                pts.append(p)
-            except LlmExecError:
-                pass             # IA/cluster injoignable : visibilité assurée par le cog avy.py
-            except Exception:
-                log.exception("métriques Aveyron: assistant IA")
 
         return pts
 

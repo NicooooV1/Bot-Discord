@@ -220,22 +220,6 @@ def twofa_overwrites(guild):
     return _base_ow(guild, manage_channels=True)
 
 
-def assistant_chat_overwrites(guild, cfg):
-    """@everyone deny ; SEUL le rôle O AVY-LLM (+ le bot) voit/écrit ce salon —
-    littéralement, pas M/G AVY-LLM ni aucun rôle R820 (demande explicite de Nico,
-    plus restrictif que /assistant qui reste ouvert à tout M/O de tout serveur)."""
-    srv = (getattr(cfg, "gestion_servers", {}) or {}).get("AVY-LLM", {})
-    owner_id = srv.get("owner", 0)
-    ow = _base_ow(guild, manage_messages=True)
-    if not owner_id or guild.get_role(owner_id) is None:
-        log.warning("rôle O AVY-LLM introuvable — overwrites #chat-ia NON modifiés")
-        return None
-    ow[guild.get_role(owner_id)] = discord.PermissionOverwrite(
-        view_channel=True, send_messages=True, read_message_history=True,
-        embed_links=True, add_reactions=True)
-    return ow
-
-
 def lock_perms_drifted(ch, guild, cfg):
     """True si les overwrites du salon ne sont pas EXACTEMENT ceux du schéma Lock.
 

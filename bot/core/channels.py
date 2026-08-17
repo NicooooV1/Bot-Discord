@@ -24,7 +24,7 @@ Un salon manquant est un désagrément réparé au prochain cycle de provisionin
 public exposant le ratio d'un tracker privé ou les demandes de médias, non.
 
 CLÉS DISPONIBLES (telles que provision les publie — vérifiées sur l'état réel) :
-    lock · supervision · containers · archive · assistant_ia · syno_lock · syno_sup
+    lock · supervision · containers · archive · syno_lock · syno_sup
     avy_sup_<noeud> · avy_gest_<noeud> · avy_lock_<noeud> · containers_avy
 """
 import logging
@@ -36,7 +36,7 @@ log = logging.getLogger("discord-bot.channels")
 # Clés publiées par provision._ensure_category. Une clé absente d'ici est une faute de
 # frappe : `resolve()` la refuse bruyamment au lieu de renvoyer None en silence.
 KNOWN_KEYS = {
-    "lock", "supervision", "containers", "archive", "assistant_ia",
+    "lock", "supervision", "containers", "archive",
     "syno_lock", "syno_sup", "containers_avy",
 }
 

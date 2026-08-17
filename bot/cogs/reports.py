@@ -173,6 +173,20 @@ class Reports(commands.Cog):
             log.exception("failed posting report")
             return False
 
+    async def _post_avy(self):
+        """Rapport quotidien de CHAQUE nœud Aveyron, dans son propre #rapports-<nœud>
+        (Nico 2026-08-18). Isolé du rapport R820 : un cluster distant injoignable ne
+        doit ni empêcher le rapport principal, ni empêcher de marquer la journée."""
+        avy = self.bot.get_cog("Avy")
+        if avy is None:
+            return
+        try:
+            n = await avy.post_rapports()
+            if n:
+                log.info("rapports quotidiens Aveyron publiés : %d", n)
+        except Exception:
+            log.exception("rapports quotidiens Aveyron")
+
     @tasks.loop(time=dt.time(8, 0))
     async def daily(self):
         try:
@@ -180,6 +194,7 @@ class Reports(commands.Cog):
                 self._mark_today()
         except Exception:
             log.exception("daily report failed")
+        await self._post_avy()
 
     def _mark_today(self):
         now = dt.datetime.now(self.tz)
@@ -232,6 +247,7 @@ class Reports(commands.Cog):
         if await self._post("Rapport (rattrapage)"):
             self._mark_today()
             self._catchup_done = True
+            await self._post_avy()
 
     # Un `before_loop` PAR boucle : empiler `@daily.before_loop` et `@catchup.before_loop`
     # sur la même fonction ne « marche » que parce que `Loop.before_loop` renvoie la

@@ -42,14 +42,6 @@ BACKUP_STALE_DAYS = 7  # ⚠️ invité sans sauvegarde récente
 # garde une marge pour les champs fixes de l'embed. (2026-08-11)
 MAX_LIST_FIELDS = 20
 
-# --- assistant IA locale (VM ubuntu-llm, RTX 3090) ---
-GPU_TEMP_ALERT = 80    # °C (réarmé < 70)
-GPU_TEMP_CLEAR = 70
-GPU_VRAM_FREE_ALERT = 512 * 2**20   # < 512 Mio de VRAM libre = plus de marge pour de nouvelles requêtes
-GPU_VRAM_FREE_CLEAR = 1536 * 2**20
-LLM_DISK_FREE_ALERT = 15 * 2**30    # < 15 Gio libres = ~pas de place pour un nouveau modèle
-LLM_DISK_FREE_CLEAR = 25 * 2**30
-LLM_CORE_SERVICES = ("llama-server", "litellm", "llm-router")  # llama-server-small = secondaire, pas alerté
 
 
 def _num(v, unit, scale=1, fmt_spec=".0f"):
@@ -318,12 +310,9 @@ def materiel(node, data):
     return emb
 
 
-def alertes(node, llm_node):
+def alertes(node):
     """Embed épinglé du salon #alertes-<nœud> : sans lui, un salon événementiel
-    vide ressemble à un salon cassé (retour Nico 2026-07-17).
-
-    `llm_node` = nœud qui héberge l'assistant IA (cfg.avy_llm_node) : lui seul liste
-    les alertes GPU/VRAM/services."""
+    vide ressemble à un salon cassé (retour Nico 2026-07-17)."""
     emb = discord.Embed(
         title=f"🚨 Alertes — {node} (Aveyron)",
         description=("Salon **événementiel** : les alertes du serveur apparaissent "
@@ -338,13 +327,132 @@ def alertes(node, llm_node):
                      f"• 🔴 (cluster) certificat TLS expirant sous {CERT_ALERT_DAYS} j\n"
                      f"• 🔴 (cluster) ≥ {AUTH_FAIL_MIN} échecs d'authentification "
                      "PVE sur un cycle\n"
-                     f"• 🔴 (cluster) tunnel WG dégradé (≥ {LAT_ALERT_MS} ms)"
-                     + (f"\n• 🔴 (assistant IA) service arrêté / injoignable\n"
-                        f"• 🔴 (assistant IA) GPU ≥ {GPU_TEMP_ALERT} °C\n"
-                        f"• 🔴 (assistant IA) VRAM ou disque quasi pleins"
-                        if node == llm_node else "")),
+                     f"• 🔴 (cluster) tunnel WG dégradé (≥ {LAT_ALERT_MS} ms)"),
         color=fmt.BLURPLE)
     emb.set_footer(text="surveillance toutes les 5 min")
+    return emb
+
+
+def rapport(node, data, guests, sfx, cluster, fenetre_h=24):
+    """Rapport quotidien d'UN nœud Aveyron — pendant de `Reports.build_report` (R820).
+
+    Mêmes sources que les embeds live du nœud (aucune lecture supplémentaire) : c'est
+    volontaire, un rapport qui interrogerait autre chose que les salons pourrait les
+    contredire. La fenêtre porte sur les TÂCHES : `_collect` en lit 20, donc un nœud
+    très actif peut en avoir plus sur 24 h — le champ le dit plutôt que de laisser
+    croire à un décompte exhaustif."""
+    st = data.get("status") or {}
+    emb = discord.Embed(title=f"📅 Rapport quotidien — {node} (Aveyron)")
+    emb.timestamp = discord.utils.utcnow()
+    worst = 0.0
+
+    mem = st.get("memory") or {}
+    rampct = (mem.get("used") or 0) / mem["total"] * 100 if mem.get("total") else 0
+    worst = max(worst, rampct)
+    ligne = [f"CPU {(st.get('cpu') or 0) * 100:.0f} %", f"RAM {rampct:.0f} %"]
+    la = st.get("loadavg") or []
+    if la:
+        ligne.append(f"charge {la[0]}")
+    if st.get("uptime"):
+        ligne.append(f"uptime {fmt.humanize_duration(st['uptime'])}")
+    emb.add_field(name="Hôte", value=" · ".join(ligne), inline=False)
+
+    up = sum(1 for _, i in guests if i.get("status") == "running")
+    if guests:
+        eteints = [n.removesuffix(sfx) for n, i in guests if i.get("status") != "running"]
+        val = f"{up}/{len(guests)} actifs"
+        if eteints:
+            val += " · éteints : " + ", ".join(eteints[:8])
+        emb.add_field(name="📦 VM/conteneurs", value=val[:1024], inline=False)
+
+    stos = [s for s in (data.get("storages") or []) if s.get("total")]
+    if stos:
+        pire = max(stos, key=lambda s: (s.get("used") or 0) / s["total"])
+        pct = (pire.get("used") or 0) / pire["total"] * 100
+        worst = max(worst, pct)
+        emb.add_field(name="Stockage le + plein",
+                      value=f"{pire.get('storage')} — {fmt.pct_of(pire.get('used'), pire['total'])}")
+
+    taches = data.get("tasks") or []
+    limite = time.time() - fenetre_h * 3600
+    recentes = [t for t in taches if (t.get("starttime") or 0) >= limite]
+    echecs = [t for t in recentes if t.get("status") not in (None, "OK")]
+    sauv = [t for t in recentes if str(t.get("type", "")).startswith("vzdump")]
+    sauv_ko = [t for t in sauv if t.get("status") not in (None, "OK")]
+    if sauv:
+        emb.add_field(name="Sauvegardes",
+                      value=("✅ " if not sauv_ko else "🔴 ")
+                            + f"{len(sauv) - len(sauv_ko)}/{len(sauv)} vzdump OK")
+        if sauv_ko:
+            worst = max(worst, 90)
+    else:
+        emb.add_field(name="Sauvegardes", value="➖ aucune sur la fenêtre")
+    val = f"{len(recentes)} tâches · {len(echecs)} en échec"
+    if len(taches) >= 20:
+        val += " (20 dernières lues)"
+    emb.add_field(name=f"Tâches ({fenetre_h} h)", value=val)
+    if echecs:
+        worst = max(worst, 80)
+        lignes = [f"⚠️ `{t.get('type')}` {t.get('id') or ''} · {t.get('status')}"
+                  for t in echecs[:5]]
+        emb.add_field(name="Échecs", value="\n".join(lignes)[:1024], inline=False)
+
+    disks = data.get("disks") or []
+    temps = [d["temp"] for d in disks if d.get("temp") is not None]
+    usures = [int(d.get("wearout")) for d in disks
+              if str(d.get("wearout", "")).isdigit()]
+    if temps or usures:
+        bouts = []
+        if temps:
+            bouts.append(f"temp max {max(temps):.0f} °C")
+            if max(temps) >= DISK_TEMP_ALERT:
+                worst = max(worst, 85)
+        if usures:
+            bouts.append(f"usure min {min(usures)} %")
+            if min(usures) <= WEAROUT_ALERT:
+                worst = max(worst, 85)
+        ko = [d.get("devpath") for d in disks if d.get("health") not in (None, "OK", "PASSED")]
+        if ko:
+            bouts.append("santé ⚠️ " + ", ".join(str(x) for x in ko[:3]))
+            worst = max(worst, 90)
+        emb.add_field(name=f"💿 Disques ({len(disks)})", value=" · ".join(bouts)[:1024],
+                      inline=False)
+
+    cl = cluster or {}
+    if cl.get("quorate") is not None or cl.get("ping_ms") is not None:
+        bouts = []
+        if cl.get("quorate") is not None:
+            on = sum(1 for v in (cl.get("online") or {}).values() if v)
+            bouts.append(f"quorum {'🟢' if cl['quorate'] else '🔴'} {on}/"
+                         f"{len(cl.get('online') or {}) or 3}")
+            if not cl["quorate"]:
+                worst = max(worst, 95)
+        if cl.get("ping_ms") is not None:
+            bouts.append(f"tunnel WG {cl['ping_ms']:.0f} ms")
+        emb.add_field(name="Cluster", value=" · ".join(bouts), inline=False)
+
+    emb.color = fmt.health_color(worst)
+    emb.set_footer(text=f"rapport quotidien · {node}")
+    return emb
+
+
+def journal_entete(node):
+    """Message épinglé de #journaux-<nœud> : dit ce que le salon contient — et
+    surtout ce qu'il NE contient pas, pour qu'un salon calme ne soit pas pris pour
+    un salon cassé (même raison que l'en-tête de #alertes-<nœud>)."""
+    emb = discord.Embed(
+        title=f"📜 Journal des tâches — {node} (Aveyron)",
+        description=("Salon **événementiel** : chaque tâche Proxmox terminée sur le "
+                     "nœud est publiée ici (démarrages, arrêts, sauvegardes, "
+                     "migrations, mises à jour…).\n\n"
+                     "⚠️ Ce ne sont pas des logs système : les machines d'Aveyron "
+                     "n'envoient rien au collecteur syslog du R820 (#journaux-live). "
+                     "Les tâches de l'API Proxmox sont la seule source disponible "
+                     "d'ici.\n"
+                     "• ✅ tâche terminée normalement\n"
+                     "• ⚠️ tâche terminée en erreur"),
+        color=fmt.BLURPLE)
+    emb.set_footer(text="relevé toutes les 5 min")
     return emb
 
 
@@ -360,79 +468,3 @@ def down(node):
     return emb
 
 
-def ia_locale(mon, model):
-    """`mon` = instantané `Pve.llm_monitor`, `model` = cfg.avy_llm_model."""
-    emb = discord.Embed(title="🤖 Assistant IA locale — ubuntu-llm (Aveyron)",
-                        color=fmt.GREEN)
-    emb.timestamp = discord.utils.utcnow()
-
-    m = mon.get("model") or {}
-    if m:
-        params_b = (m.get("n_params") or 0) / 1e9
-        emb.add_field(
-            name="Modèle",
-            value=(f"{model} · {params_b:.1f} Md paramètres\n"
-                   f"contexte {int((m.get('n_ctx') or 0) / 1024)}k · "
-                   f"{fmt.humanize_bytes(m.get('size_bytes') or 0)} sur disque"),
-            inline=False)
-
-    gpu = mon.get("gpu") or {}
-    if gpu.get("mem_total"):
-        vram_pct = (gpu.get("mem_used") or 0) / gpu["mem_total"] * 100
-        temp = gpu.get("temp")
-        tflag = "🔥 " if (temp or 0) >= GPU_TEMP_ALERT else ""
-        # ⚠️ cf. _num : ces six clés existent TOUJOURS mais valent None quand la
-        # métrique Prometheus manque (2026-08-11)
-        emb.add_field(
-            name="GPU — RTX 3090",
-            value=(f"{tflag}{_num(temp, '°C')} · util {_num(gpu.get('util'), '%', 100)} · "
-                   f"{fmt.humanize_bytes(gpu.get('mem_used') or 0)} / "
-                   f"{fmt.humanize_bytes(gpu['mem_total'])} VRAM ({vram_pct:.0f} %)\n"
-                   f"{_num(gpu.get('power'), 'W')} · "
-                   f"ventilo {_num(gpu.get('fan'), '%', 100)}"),
-            inline=False)
-
-    svc = mon.get("services") or {}
-    lines = []
-    for name in LLM_CORE_SERVICES:
-        st = svc.get(name, "?")
-        lines.append(f"{'🟢' if st == 'active' else '🔴'} {name} ({st})")
-    small = svc.get("llama-server-small", "?")
-    lines.append(f"{'🟢' if small == 'active' else '⚪'} llama-server-small "
-                 f"({small}{' — secondaire, normalement arrêté' if small != 'active' else ''})")
-    emb.add_field(name="Services", value="\n".join(lines), inline=False)
-
-    checks = [("llama.cpp", mon.get("llama_health")), ("LiteLLM", mon.get("litellm_alive")),
-              ("llm-router", mon.get("router_health"))]
-    emb.add_field(
-        name="Santé (endpoints)",
-        value=" · ".join(f"{'✅' if v else '❌'} {n}" for n, v in checks),
-        inline=True)
-
-    disk = mon.get("disk") or {}
-    if disk.get("total"):
-        emb.add_field(
-            name="Disque (modèles)",
-            value=f"{fmt.humanize_bytes(disk['used'])} / {fmt.humanize_bytes(disk['total'])} "
-                  f"· {fmt.humanize_bytes(disk['free'])} libres",
-            inline=True)
-
-    if mon.get("load1") is not None:
-        emb.add_field(name="Charge VM", value=f"{mon['load1']:.2f}", inline=True)
-
-    down_svc = [n for n in LLM_CORE_SERVICES if svc.get(n) != "active"]
-    if down_svc or not all(v for _, v in checks):
-        emb.color = fmt.RED
-    elif (gpu.get("temp") or 0) >= GPU_TEMP_ALERT or (disk.get("free") or 0) < LLM_DISK_FREE_ALERT:
-        emb.color = fmt.YELLOW
-    emb.set_footer(text="rafraîchi toutes les 5 min")
-    return emb
-
-
-def ia_locale_down():
-    emb = discord.Embed(title="🤖 Assistant IA locale — ubuntu-llm (Aveyron)",
-                        description="🔴 **injoignable** (VM éteinte ou guest-agent muet)",
-                        color=fmt.RED)
-    emb.timestamp = discord.utils.utcnow()
-    emb.set_footer(text="rafraîchi toutes les 5 min")
-    return emb

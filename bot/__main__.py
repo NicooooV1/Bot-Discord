@@ -27,8 +27,8 @@ discord.VoiceClient.warn_nacl = False  # voice is never used; silence the PyNaCl
 COGS = ["status", "graphs", "hardware", "storage", "backups", "sysinfo",
         "logs", "lokilogs", "dashboard", "ct_channels", "node_channel", "actions", "alerts",
         "reports", "servarr", "medias", "requests", "youtube", "meta", "provision", "terminal",
-        "heartbeat", "twofa", "docker", "gestion", "rdv", "avy", "assistant", "avy_metrics",
-        "jellyfin_activity", "dist", "netrates"]
+        "heartbeat", "twofa", "docker", "gestion", "rdv", "avy", "avy_metrics",
+        "jellyfin_activity", "dist", "netrates", "transfert"]
 
 # Seule famille de commandes exemptée de 2FA. Sans elle, impossible de s'inscrire ni de
 # déverrouiller : la clé serait enfermée à l'intérieur. NE PAS retirer.
@@ -81,9 +81,9 @@ class GatedTree(app_commands.CommandTree):
 class MonitorBot(commands.Bot):
     def __init__(self, cfg: Config):
         intents = discord.Intents.default()
-        # Intent privilégié MESSAGE CONTENT (portail dev coché par Nico 2026-07-18) :
-        # requis pour que #chat-ia (on_message, assistant.py) lise message.content.
-        intents.message_content = True
+        # Aucun intent privilégié : le bot n'a plus aucun listener on_message depuis
+        # le retrait de l'assistant IA (2026-08-18). MESSAGE CONTENT peut être décoché
+        # côté portail développeur.
         super().__init__(command_prefix=commands.when_mentioned,
                          intents=intents, help_command=None,
                          tree_cls=GatedTree,

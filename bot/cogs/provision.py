@@ -78,6 +78,11 @@ SYNO_SUP_CHANNELS = [
 
 
 class Provision(commands.Cog):
+    # Cycles de `reconcile` (5 min) pendant lesquels un salon doit rester SANS invité
+    # PVE avant d'être supprimé. 3 -> ~15 min : assez pour absorber une lecture PVE
+    # partielle ou un nœud qui redémarre, assez court pour que le ménage suive.
+    GHOST_DELETE_CYCLES = 3
+
     def __init__(self, bot):
         self.bot = bot
         self.cfg = bot.cfg
@@ -91,7 +96,7 @@ class Provision(commands.Cog):
         self.CAT_LOCK = f"🔒 Lock {sk}"
         self.CAT_CONTAINERS = f"Gestion {sk}"
         # cluster Aveyron supervisé par CE bot : TROIS serveurs distincts (un par nœud
-        # pve/nas/llm), chacun avec « 📊 Supervision AVY-X » + « Gestion AVY-X » et les
+        # nas/ms01/llm), chacun avec « 📊 Supervision AVY-X » + « Gestion AVY-X » et les
         # rôles G/M/O de SA clé GESTION_SERVERS (choix Nico 2026-07-17).
         # Salons de supervision par nœud (embeds tenus par le cog Avy) :
         # « hyperviseur » n'est PLUS dans cette liste : ce salon vit désormais dans sa
@@ -102,6 +107,8 @@ class Provision(commands.Cog):
             ("stockage",    "stockage",    "Stockages du nœud : remplissage, état."),
             ("sauvegardes", "sauvegardes", "Sauvegardes vzdump du nœud vers nas-backup."),
             ("materiel",    "materiel",    "Disques physiques du nœud : modèle, santé SMART, usure, température."),
+            ("rapports",    "rapports",    "Rapport quotidien du nœud : charge, invités, stockages, sauvegardes, disques."),
+            ("journaux",    "journaux",    "Journal des tâches Proxmox du nœud (Aveyron ne pousse pas ses logs vers Loki)."),
         ]
         # NAS Synology = serveur à part (demande Nico) : mêmes catégories et mêmes
         # 3 tiers que les autres, mais SANS catégorie « Gestion » — il n'a aucun
@@ -119,10 +126,6 @@ class Provision(commands.Cog):
         self._managed_fn = perms.managed_overwrites_fn(self.cfg)
         self._lock_fn = perms.node_lock_overwrites_fn(self.cfg)
         self._done_once = False
-        # #chat-ia n'est publié à Assistant.on_message que si ses overwrites « O AVY-LLM »
-        # ont bien pu être posés (2026-08-11) : sans ça un salon resté PUBLIC faute de
-        # rôle résolu rendait le listener actif pour tout le guild.
-        self._assistant_chat_ok = False
         self._lock = asyncio.Lock()
         # état persistant : { categories:{}, super:{key:id}, ct:{name:id},
         #                     archived:{name:id}, order:[names] }
@@ -132,6 +135,7 @@ class Provision(commands.Cog):
         self.prov.setdefault("ct", {})
         self.prov.setdefault("archived", {})
         self.prov.setdefault("order", [])
+        self.prov.setdefault("ghost_chan", {})   # {id salon: cycles sans invité}
 
     def _save(self):
         self.bot.state.set("prov", self.prov)
@@ -153,7 +157,7 @@ class Provision(commands.Cog):
         """Adopte (par id persisté puis par nom) ou crée une catégorie. Renvoie l'objet.
 
         `overwrites` n'est utilisé QU'À LA CRÉATION, et uniquement par les catégories
-        privées (Supervision/Gestion/Lock/Assistant) : une catégorie créée sans
+        privées (Supervision/Gestion/Lock) : une catégorie créée sans
         overwrites naît PUBLIQUE et ses salons héritent de cette visibilité, le temps
         que `_enforce_perms` passe — ou pour toujours si les rôles ne se résolvent pas
         (correction 2026-08-11). Une catégorie ADOPTÉE n'est jamais touchée ici : elle
@@ -488,7 +492,7 @@ class Provision(commands.Cog):
                 log.exception("provisioning de la supervision %s",
                               getattr(self.cfg, "server_key", "R820"))
 
-            # 2b) serveurs Aveyron : Supervision + Gestion PAR NŒUD (AVY-PVE/NAS/LLM)
+            # 2b) serveurs Aveyron : Supervision + Gestion PAR NŒUD (AVY-NAS/MS01/LLM)
             avy_cats = {}          # clé serveur -> catégorie Gestion
             if getattr(self.bot.pve, "avy_enabled", False):
                 # acall : sans AVY_NODES statique, avy_nodes() part interroger l'API du
@@ -527,15 +531,6 @@ class Provision(commands.Cog):
                             overwrites=lock_fn(guild) or seed)
                         await self._ensure_avy_sup_channels(guild, node, sup)
                         await self._ensure_avy_lock_hyperviseur(guild, node, lock)
-                        # salon dédié au stack IA locale (GPU/services/santé) — UN SEUL
-                        # salon, sur le nœud qui héberge la VM (AVY_LLM_NODE), pas un
-                        # par nœud comme AVY_SUP_CHANNELS (les autres n'ont pas de GPU)
-                        if (getattr(self.bot.pve, "llm_enabled", False)
-                                and node == self.cfg.avy_llm_node):
-                            await self._ensure_text(
-                                guild, "ia-locale", sup, self.prov, "avy_llm_channel",
-                                topic="Assistant IA local : GPU, modèle, services, santé.",
-                                global_fallback=False)
                         avy_cats[key] = gest
                         await self._enforce_perms(guild, sup, ow_fn)
                         await self._enforce_perms(guild, gest, ow_fn)
@@ -572,15 +567,6 @@ class Provision(commands.Cog):
             except Exception:
                 log.exception("provisioning du salon du nœud")
 
-            # 4b) Salon de chat direct avec l'assistant IA locale (2026-07-18, Nico :
-            #     « nouvelle catégorie, uniquement O-LLM qui y a accès ») — indépendant
-            #     du reste, jamais bloquant pour le reste du provisioning.
-            if getattr(self.bot.pve, "llm_enabled", False):
-                try:
-                    await self._ensure_assistant_chat(guild)
-                except Exception:
-                    log.exception("provisioning du salon de chat IA")
-
             # 5) Recâblage du routage temps réel vers les salons résolus.
             #    ⚠️ Hors de tout `try` d'étape, et TOUJOURS exécuté : c'est _rewire() qui
             #    DÉMARRE les boucles CtChannels.refresh / NodeChannel.refresh /
@@ -596,41 +582,6 @@ class Provision(commands.Cog):
                 self._save()
             except Exception:
                 log.exception("persistance de l'état de provisioning")
-
-    async def _ensure_assistant_chat(self, guild):
-        """⚠️ FAIL-CLOSED (2026-08-11) : rien n'est créé tant que le rôle O AVY-LLM ne
-        se résout pas. Avant, la catégorie et #chat-ia naissaient PUBLICS (créés sans
-        overwrites) et n'étaient JAMAIS refermés dans ce cas — aucun `_enforce_perms` ne
-        balaie ce salon — pendant que `_rewire` publiait quand même son id, rendant
-        `Assistant.on_message` actif dans un salon ouvert à tout le guild."""
-        want = perms.assistant_chat_overwrites(guild, self.cfg)
-        if want is None:
-            self._assistant_chat_ok = False
-            log.error("rôle O AVY-LLM non résolu — #chat-ia NON provisionné "
-                      "(déclarer « AVY-LLM:G:M:O » dans GESTION_SERVERS)")
-            return
-        cat = await self._ensure_category(guild, "🤖 Assistant IA", "assistant_ia",
-                                          overwrites=want)
-        ch = await self._ensure_text(
-            guild, "chat-ia", cat, self.prov, "assistant_chat",
-            topic="Discute directement avec l'assistant IA locale — pas besoin de "
-                  "/assistant, écris simplement ton message.",
-            global_fallback=False, overwrites=want)
-        if ch is None:
-            self._assistant_chat_ok = False
-            return
-        ok = True
-        for target in (cat, ch):
-            if perms.ovw_drifted(target, want):
-                try:
-                    await target.edit(overwrites=want, reason="salon assistant IA : O AVY-LLM uniquement")
-                except discord.HTTPException:
-                    log.warning("permissions #chat-ia non appliquées: %s",
-                               getattr(target, "name", "?"))
-                    ok = False
-        # tant que les droits ne sont pas RÉELLEMENT posés, le salon n'est pas publié
-        # au listener de l'assistant (cf. _rewire).
-        self._assistant_chat_ok = ok
 
     async def _resolve_containers_category(self, guild):
         # a) catégorie persistée
@@ -822,6 +773,9 @@ class Provision(commands.Cog):
                 if await self._apply_order(guild, lst, cat):
                     self.prov[f"order_{key}"] = lst
 
+        # d) ménage : les salons des invités qui n'existent plus sont SUPPRIMÉS
+        await self._sweep_ghost_channels(guild, guests, cont_cat, avy_cats)
+
     def _purge_ghosts(self, guests):
         """Retire de prov['ct'] les invités DISPARUS de PVE (supprimés ou renommés).
 
@@ -831,9 +785,9 @@ class Provision(commands.Cog):
         fetch_channel en 404 si le salon a été supprimé à la main), et le `map.pop()`
         défensif de ct_channels ne survit jamais au cycle suivant. Corrigé 2026-08-11.
 
-        Le salon Discord n'est PAS supprimé (choix de Nico) : il cesse simplement d'être
-        suivi. S'il réapparaît côté PVE, `_ensure_text` le ré-adopte par son nom
-        débarrassé de l'emoji de statut.
+        Le salon Discord lui-même est supprimé par `_sweep_ghost_channels`, qui tourne
+        dans le même cycle avec les mêmes garde-fous (Nico 2026-08-18 : « quand une VM
+        disparaît, on la supprime »). Ici on ne fait que cesser de le SONDER.
 
         ⚠️ DEUX garde-fous, parce qu'une absence n'est pas une disparition :
           - hystérésis de 3 cycles : une réponse PVE partielle ne purge rien ;
@@ -856,10 +810,84 @@ class Provision(commands.Cog):
             misses.pop(name, None)
             cid = self.prov["ct"].pop(name, None)
             log.info("invité %s absent de PVE depuis 3 cycles — salon %s détaché du "
-                     "suivi (salon CONSERVÉ, non supprimé)", name, cid)
+                     "suivi (suppression par _sweep_ghost_channels)", name, cid)
         # entrées de compteur devenues sans objet (invité déjà purgé/renommé)
         for name in [n for n in misses if n not in self.prov["ct"]]:
             misses.pop(name, None)
+
+    @staticmethod
+    def _salon_est_un_invite(nom, cid, suivis):
+        """Un salon est CANDIDAT au ménage s'il a la forme d'un salon d'invité.
+
+        Deux formes acceptées, et seulement elles : le nom préfixé d'un emoji de statut
+        (c'est `ct_channels._sync_channel_emoji` qui les pose, donc c'est bien le bot
+        qui l'a nommé), ou un id déjà présent dans le mapping `prov['ct']`. Un salon
+        rangé à la main dans « Gestion … » n'a ni l'un ni l'autre : il ne sera JAMAIS
+        supprimé, quoi qu'il arrive côté PVE."""
+        return cid in suivis or nom.startswith(fmt.STATUS_EMOJI)
+
+    async def _sweep_ghost_channels(self, guild, guests, cont_cat, avy_cats):
+        """SUPPRIME les salons dont la VM/le conteneur n'existe plus côté PVE.
+
+        Demande explicite de Nico (2026-08-18) : « quand une VM disparaît, on la
+        supprime ». Jusque-là `_purge_ghosts` se contentait de cesser de les sonder, et
+        16 salons morts s'étaient accumulés (6 « fronote-* » de tests, les invités de
+        l'ancien nœud Aveyron `pve`, un « clipper-gpu-avy »…).
+
+        ⚠️ Opération DESTRUCTRICE et irréversible côté Discord (l'historique part avec
+        le salon). Quatre garde-fous, un par panne déjà observée :
+          1. `guests` vide -> on ne conclut RIEN (une lecture PVE en échec fait paraître
+             tout le monde disparu) ;
+          2. par catégorie, il faut avoir vu au moins un invité VIVANT du serveur
+             correspondant : un nœud Aveyron injoignable ne peut pas vider sa catégorie ;
+          3. seuls les salons en forme d'invité sont candidats (_salon_est_un_invite) ;
+          4. hystérésis de GHOST_DELETE_CYCLES cycles CONSÉCUTIFS (5 min chacun) : un
+             compteur remis à zéro dès que l'invité reparaît.
+        Chaque suppression est auditée (donc reprise dans #journaux-live)."""
+        if not guests:
+            return
+        vivants = {fmt.slug(n) for n in guests}
+        # clés serveur RÉELLEMENT vues ce cycle (None = R820) : une catégorie dont le
+        # serveur n'a aucun invité vivant est intégralement épargnée.
+        vues = {key for _, key in guests.values()}
+        suivis = set(self.prov["ct"].values()) | set(self.prov["archived"].values())
+        compteurs = self.prov.setdefault("ghost_chan", {})
+
+        cibles = [(cont_cat, None)] + [(cat, key) for key, cat in (avy_cats or {}).items()]
+        vus_ce_cycle = set()
+        for cat, key in cibles:
+            if cat is None or key not in vues:
+                continue
+            for ch in list(getattr(cat, "text_channels", [])):
+                if not self._salon_est_un_invite(ch.name, ch.id, suivis):
+                    continue
+                if fmt.strip_status_emoji(ch.name) in vivants:
+                    compteurs.pop(str(ch.id), None)
+                    continue
+                vus_ce_cycle.add(str(ch.id))
+                n = compteurs.get(str(ch.id), 0) + 1
+                compteurs[str(ch.id)] = n
+                if n < self.GHOST_DELETE_CYCLES:
+                    log.info("salon #%s sans invité PVE (%d/%d) — suppression si ça dure",
+                             ch.name, n, self.GHOST_DELETE_CYCLES)
+                    continue
+                try:
+                    await ch.delete(reason="invité supprimé côté Proxmox "
+                                           "(absent depuis %d cycles)" % n)
+                except discord.HTTPException as e:
+                    log.warning("suppression du salon #%s impossible (%s)", ch.name, e)
+                    continue
+                compteurs.pop(str(ch.id), None)
+                vus_ce_cycle.discard(str(ch.id))
+                for m in (self.prov["ct"], self.prov["archived"]):
+                    for nom in [k for k, v in m.items() if v == ch.id]:
+                        m.pop(nom, None)
+                log.warning("salon #%s SUPPRIMÉ : plus aucun invité PVE de ce nom", ch.name)
+                self.bot.audit.record(user="system", action="salon-supprime",
+                                      target=ch.name, result="invité disparu de PVE")
+        # compteurs devenus sans objet (salon supprimé à la main, invité revenu)
+        for cid in [c for c in compteurs if c not in vus_ce_cycle]:
+            compteurs.pop(cid, None)
 
     async def _apply_order(self, guild, order, cont_cat):
         """Trie les salons d'une catégorie par VMID. Renvoie True si TOUS les
@@ -921,12 +949,6 @@ class Provision(commands.Cog):
     # ------------------------------------------------------------------ rewiring
 
     def _rewire(self):
-        # #chat-ia n'est publié que si ses overwrites « O AVY-LLM » ont pu être posés
-        # (2026-08-11) : sinon Assistant.on_message répondrait à tout le monde dans un
-        # salon resté public. 0 = listener inerte, il rendra la main au cycle suivant.
-        self.cfg.assistant_chat_channel_id = (
-            self.prov["assistant_chat"]
-            if (self.prov.get("assistant_chat") and self._assistant_chat_ok) else 0)
         s = self.prov["super"]
         if s.get("alertes"):
             self.cfg.alert_channel_id = s["alertes"]
