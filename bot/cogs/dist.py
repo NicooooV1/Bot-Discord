@@ -84,13 +84,17 @@ class RefusedActionView(GatedView):
         return self._cog or itx.client.get_cog("Dist")
 
     async def _finish(self, itx, badge):
-        """Grise les boutons et appose le badge sur le message d'origine."""
-        for c in self.children:
-            c.disabled = True
+        """Appose le badge et RETIRE les boutons du message traité.
+
+        ⚠️ Surtout ne pas griser `self.children` : la vue est UNIQUE et PARTAGÉE entre
+        tous les envois (anti-fuite du view-store, cf. Dist.__init__) — la muter ici
+        faisait poster toutes les notifications SUIVANTES avec des boutons déjà
+        désactivés, jusqu'au redémarrage (revue 2026-08-18). `view=None` retire les
+        composants du message traité sans toucher à l'instance partagée."""
         try:
             emb = itx.message.embeds[0]
             emb.add_field(name="Décision", value=badge, inline=False)
-            await itx.message.edit(embed=emb, view=self)
+            await itx.message.edit(embed=emb, view=None)
         except (discord.HTTPException, IndexError):
             pass
 
@@ -290,12 +294,17 @@ class Dist(commands.Cog):
         postable = chan is not None and hasattr(chan, "send")  # ni None ni catégorie/forum
 
         now = time.time()
+        # UNE lecture de la whitelist pour tout le tick (revue 2026-08-18 : c'était un
+        # appel admin_list PAR IP — N+1 sur un endpoint distant). Whitelist illisible =
+        # on notifie quand même : rater une alerte coûte plus qu'un faux positif.
+        allow = await self.api("GET", "admin_list", timeout=10)
+        allowed = ({x.get("ip") for x in (allow.get("allowlist") or [])}
+                   if allow and allow.get("status") == "ok" else set())
         to_notify = []
         for ip, info in agg.items():
             if self._suppressed(ip, now):
                 continue
-            st = await self.api("GET", "admin_list", params={"ip": ip}, timeout=10)
-            if st and st.get("status") == "ok" and (st.get("ip") or {}).get("allowed"):
+            if ip in allowed:
                 continue                # whitelistée entre-temps : rien à signaler
             to_notify.append((ip, info))
 

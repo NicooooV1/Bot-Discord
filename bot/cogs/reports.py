@@ -38,6 +38,8 @@ class Reports(commands.Cog):
             self.tz = dt.timezone.utc
         self._catchup_done = False
         self._catchup_tries = 0
+        self._avy_tries = 0
+        self._avy_try_day = None
         t = dt.time(hour=bot.cfg.report_hour, minute=bot.cfg.report_minute, tzinfo=self.tz)
         self.daily.change_interval(time=t)
         self.daily.start()
@@ -174,18 +176,31 @@ class Reports(commands.Cog):
             return False
 
     async def _post_avy(self):
-        """Rapport quotidien de CHAQUE nœud Aveyron, dans son propre #rapports-<nœud>
-        (Nico 2026-08-18). Isolé du rapport R820 : un cluster distant injoignable ne
-        doit ni empêcher le rapport principal, ni empêcher de marquer la journée."""
+        """Rapport quotidien de CHAQUE nœud Aveyron, dans son propre #rapports-<nœud>.
+
+        DÉCOUPLÉ du rapport R820 (revue 2026-08-18) : marqueur propre `last_daily_avy`
+        + compteur d'essais propre. Avant, le rattrapage ne publiait Aveyron que si le
+        rapport R820 venait de partir — un salon #rapports R820 cassé privait les trois
+        nœuds de leur rapport alors que leurs salons allaient bien."""
         avy = self.bot.get_cog("Avy")
         if avy is None:
             return
+        today = dt.datetime.now(self.tz).date().isoformat()
+        if self.bot.state.get("last_daily_avy") == today:
+            return
+        if self._avy_try_day != today:
+            self._avy_try_day, self._avy_tries = today, 0
+        if self._avy_tries >= 12:      # même borne que le rattrapage R820
+            return
+        self._avy_tries += 1
         try:
             n = await avy.post_rapports()
-            if n:
-                log.info("rapports quotidiens Aveyron publiés : %d", n)
         except Exception:
             log.exception("rapports quotidiens Aveyron")
+            return
+        if n:
+            self.bot.state.set("last_daily_avy", today)
+            log.info("rapports quotidiens Aveyron publiés : %d", n)
 
     @tasks.loop(time=dt.time(8, 0))
     async def daily(self):
@@ -223,13 +238,18 @@ class Reports(commands.Cog):
         positif permanent sur la surface même qui doit rester digne de confiance
         (2026-08-11). Le tour de boucle coûte un test de drapeau toutes les 5 min.
         """
-        if self._catchup_done:
-            return
         if not self.bot.cfg.report_channel_id:
             return                       # provision._rewire() le renseignera
         now = dt.datetime.now(self.tz)
         sched = now.replace(hour=self.bot.cfg.report_hour,
                             minute=self.bot.cfg.report_minute, second=0, microsecond=0)
+        # Aveyron d'abord, HORS du drapeau _catchup_done : il a son propre marqueur
+        # quotidien et sa propre borne d'essais (cf. _post_avy) — le rattrapage R820
+        # déjà réglé ne doit pas empêcher de retenter les rapports des nœuds.
+        if now >= sched:
+            await self._post_avy()
+        if self._catchup_done:
+            return
         if self.bot.state.get("last_daily") == now.date().isoformat() or now < sched:
             # rien à rattraper : soit c'est déjà publié, soit l'heure n'est pas passée
             # (la boucle `daily` s'en chargera).
@@ -247,7 +267,6 @@ class Reports(commands.Cog):
         if await self._post("Rapport (rattrapage)"):
             self._mark_today()
             self._catchup_done = True
-            await self._post_avy()
 
     # Un `before_loop` PAR boucle : empiler `@daily.before_loop` et `@catchup.before_loop`
     # sur la même fonction ne « marche » que parce que `Loop.before_loop` renvoie la

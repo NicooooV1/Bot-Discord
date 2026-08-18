@@ -59,8 +59,11 @@ class Alerts(commands.Cog):
         self.loop.start()
 
     async def cog_load(self):
-        # boutons Snooze persistants sur les alertes du bot
-        self.bot.add_view(AlertActionView())
+        # UNE vue persistante, réutilisée pour tous les envois : chaque AlertActionView()
+        # passée à send(timeout=None) restait à VIE dans le view-store de discord.py —
+        # même fuite lente que celle corrigée dans dist.py le 12/08 (revue 2026-08-18).
+        self._action_view = AlertActionView()
+        self.bot.add_view(self._action_view)
 
     def cog_unload(self):
         self.loop.cancel()
@@ -94,7 +97,7 @@ class Alerts(commands.Cog):
             color = fmt.RED if level == "crit" else fmt.YELLOW
             emb = discord.Embed(title=title, description=desc, color=color)
             emb.set_footer(text=f"alerte: {key} [{level}]")
-            await ch.send(embed=emb, view=AlertActionView())
+            await ch.send(embed=emb, view=self._action_view)
             self._alerts.set_level(key, level)
         elif not level and prev:
             # Le Snooze doit aussi taire le retour au vert : sinon le dernier message

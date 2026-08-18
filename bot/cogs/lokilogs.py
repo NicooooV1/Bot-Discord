@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..core.loki import _esc, build_logql
-from ..core.permissions import read_check
+from ..core.permissions import is_admin, read_check
 from ..core.ui import ct_autocomplete
 from .logs import journal_response
 
@@ -25,6 +25,26 @@ PLAGES = [
 
 LEVEL_CHOICES = [app_commands.Choice(name=n, value=n) for n in
                  ("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")]
+
+
+def restricted_reason(cfg, itx, requete="", host=""):
+    """Motif de refus pour le tier LECTURE, ou None si la requête est permise.
+
+    Deux surfaces réservées aux gestionnaires (revue 2026-08-18) :
+      - le LogQL BRUT : il contourne build_logql et ses échappements ;
+      - host=grafana : le plugin InfluxDB de Grafana logue des secrets EN CLAIR dans
+        Loki (incident connu, rotation pas encore faite) — laisser le tier lecture
+        les requêter faisait de /logsearch une escalade de privilèges. À lever quand
+        la fuite sera corrigée ET les secrets tournés.
+    """
+    if is_admin(cfg, itx):
+        return None
+    if (requete or "").strip().startswith("{"):
+        return "🔒 Le LogQL brut est réservé aux gestionnaires (rôle Gestion)."
+    if (host or "").strip().lower() == "grafana":
+        return ("🔒 Les journaux de `grafana` sont réservés aux gestionnaires "
+                "(ils peuvent contenir des secrets).")
+    return None
 
 
 def _fmt_lines(rows):
@@ -69,6 +89,10 @@ class LokiLogs(commands.Cog):
                         host: str = "", unit: str = "",
                         level: app_commands.Choice[str] = None, contains: str = "",
                         plage: app_commands.Choice[int] = None):
+        why = restricted_reason(itx.client.cfg, itx, requete, host)
+        if why:
+            await itx.response.send_message(why, ephemeral=True)
+            return
         if not await self._guard(itx):
             return
         minutes = plage.value if plage else 60
@@ -94,6 +118,10 @@ class LokiLogs(commands.Cog):
     async def ctlogs(self, itx: discord.Interaction, ct: str, unit: str = "",
                      level: app_commands.Choice[str] = None,
                      plage: app_commands.Choice[int] = None):
+        why = restricted_reason(itx.client.cfg, itx, host=ct)
+        if why:
+            await itx.response.send_message(why, ephemeral=True)
+            return
         if not await self._guard(itx):
             return
         minutes = plage.value if plage else 60
@@ -111,6 +139,10 @@ class LokiLogs(commands.Cog):
     @read_check()
     async def apperrors(self, itx: discord.Interaction, ct: str,
                         plage: app_commands.Choice[int] = None):
+        why = restricted_reason(itx.client.cfg, itx, host=ct)
+        if why:
+            await itx.response.send_message(why, ephemeral=True)
+            return
         if not await self._guard(itx):
             return
         minutes = plage.value if plage else 60

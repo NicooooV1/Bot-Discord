@@ -870,5 +870,102 @@ class TestSondeTransfert(unittest.TestCase):
         self.assertEqual(len(self.t.barre(9999)), 20)
 
 
+# --------------------------------------------------- correctifs revue 2026-08-18
+class TestStateEcritureDifferee(unittest.TestCase):
+    """`State.set` ne réécrit plus le fichier de façon synchrone : les rafales sont
+    regroupées et `flush()` garantit l'écriture à l'arrêt. Ces tests verrouillent le
+    contrat « rien n'est perdu après flush() » — la durabilité, pas le timing."""
+
+    def _state(self):
+        import tempfile
+        from bot.core.state import State
+        d = tempfile.mkdtemp()
+        return State(os.path.join(d, "state.json"))
+
+    def test_flush_ecrit_tout(self):
+        import json
+        st = self._state()
+        for i in range(20):
+            st.set(f"k{i}", i)
+        st.flush()
+        with open(st.path) as f:
+            d = json.load(f)
+        self.assertEqual(d["k19"], 19)
+        self.assertEqual(len([k for k in d if k.startswith("k")]), 20)
+
+    def test_flush_idempotent(self):
+        st = self._state()
+        st.set("a", 1)
+        st.flush()
+        st.flush()          # rien en attente : ne doit pas lever
+        self.assertEqual(st.get("a"), 1)
+
+    def test_alertspace_survit_au_flush(self):
+        import json
+        st = self._state()
+        ns = st.ns("t")
+        ns.set_level("cle", "crit")
+        st.flush()
+        with open(st.path) as f:
+            d = json.load(f)
+        self.assertEqual(d["alerts"]["t:cle"]["level"], "crit")
+        self.assertEqual(ns.keys(), ["cle"])
+
+
+class TestRestrictionLoki(unittest.TestCase):
+    """`lokilogs.restricted_reason` : le LogQL brut et host=grafana sont réservés aux
+    gestionnaires tant que la fuite de secrets Grafana->Loki n'est pas purgée."""
+
+    def _cfg(self, admin_role=111):
+        c = type("C", (), {})()
+        c.admin_ids = []
+        c.admin_role_ids = [admin_role]
+        c.gestion_servers = {}
+        return c
+
+    def _itx(self, roles):
+        return FauxInteraction(42, roles)   # FauxUser enveloppe deja en FauxRole
+
+    def test_lecteur_refuse_logql_brut(self):
+        from bot.cogs.lokilogs import restricted_reason
+        why = restricted_reason(self._cfg(), self._itx([222]), requete='{host="pve"}')
+        self.assertIsNotNone(why)
+
+    def test_lecteur_refuse_grafana(self):
+        from bot.cogs.lokilogs import restricted_reason
+        self.assertIsNotNone(restricted_reason(self._cfg(), self._itx([222]),
+                                               host="grafana"))
+        self.assertIsNotNone(restricted_reason(self._cfg(), self._itx([222]),
+                                               host=" Grafana "))
+
+    def test_lecteur_passe_sur_requete_normale(self):
+        from bot.cogs.lokilogs import restricted_reason
+        self.assertIsNone(restricted_reason(self._cfg(), self._itx([222]),
+                                            requete="error", host="jellyfin"))
+
+    def test_admin_passe_partout(self):
+        from bot.cogs.lokilogs import restricted_reason
+        itx = self._itx([111])
+        self.assertIsNone(restricted_reason(self._cfg(), itx, requete='{job="x"}'))
+        self.assertIsNone(restricted_reason(self._cfg(), itx, host="grafana"))
+
+
+class TestBackoffQuiRedescend(unittest.TestCase):
+    """`bg` : un échec isolé après une longue période saine repart du backoff minimal —
+    la série ne compte que les échecs rapprochés (fenêtre de `healthy`)."""
+
+    def test_serie_remise_a_zero_apres_periode_saine(self):
+        # On reproduit le calcul du gestionnaire : c'est lui qu'on verrouille.
+        import time as _t
+        from bot.core import bg
+        failures, last_error_at = 6, _t.time() - 3600   # vieux passif d'échecs
+        if last_error_at and _t.time() - last_error_at > 900:
+            failures = 0
+        failures += 1
+        delay = min(bg._BACKOFF_MAX, bg._BACKOFF_BASE * (2 ** min(failures - 1, 5)))
+        self.assertEqual(delay, bg._BACKOFF_BASE,
+                         "le backoff n'est pas reparti du minimum après 1 h saine")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

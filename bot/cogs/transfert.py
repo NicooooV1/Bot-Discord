@@ -23,6 +23,7 @@ utilisée par la console du nœud (`restrict,pty,from=10.3.10.106`, host key ép
 Aucun privilège nouveau : cette clé ouvre déjà un shell root, on ne fait ici qu'y lire
 `systemctl is-active`, la dernière ligne de progression de rsync et l'espace libre.
 """
+import asyncio
 import logging
 import re
 import time
@@ -31,7 +32,6 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
-from ..core.nodeshell import run_readonly
 
 log = logging.getLogger("discord-bot.transfert")
 
@@ -186,6 +186,7 @@ class Transfert(commands.Cog):
         self.enabled = bool(getattr(self.cfg, "transfert_enabled", False)
                             and self.cfg.node_ssh_key)
         self._etat = dict(bot.state.get("transfert", {}) or {})
+        self._ssh = None       # connexion SSH RÉUTILISÉE entre les relevés (cf. _run)
         if self.enabled:
             self.poll.change_interval(seconds=max(30, self.cfg.transfert_poll_sec))
             self.poll.start()
@@ -194,6 +195,12 @@ class Transfert(commands.Cog):
 
     def cog_unload(self):
         self.poll.cancel()
+        if self._ssh is not None:
+            try:
+                self._ssh.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ssh = None
 
     def _save(self):
         self.bot.state.set("transfert", self._etat)
@@ -293,11 +300,42 @@ class Transfert(commands.Cog):
 
     # ------------------------------------------------------------------ boucle
 
+    async def _run(self, cmd, timeout=25):
+        """Exécute `cmd` sur l'hyperviseur en RÉUTILISANT la connexion SSH.
+
+        Une connexion neuve par relevé (revue 2026-08-18) écrivait une paire
+        « Accepted publickey / session closed » par minute dans le journal de l'hôte
+        — donc dans Loki — pendant les ~5 jours du transfert. On garde la connexion
+        ouverte ; si elle est tombée (reboot de l'hôte, sshd rechargé), on la rouvre
+        UNE fois et on réessaie. Même clé et même host key épinglée que la console
+        du nœud : aucun privilège nouveau."""
+        import asyncssh
+        for derniere in (False, True):
+            if self._ssh is None:
+                self._ssh = await asyncssh.connect(
+                    self.cfg.node_ssh_host, port=self.cfg.node_ssh_port,
+                    username=self.cfg.node_ssh_user,
+                    client_keys=[self.cfg.node_ssh_key],
+                    known_hosts=self.cfg.node_ssh_known_hosts,
+                    connect_timeout=timeout)
+            try:
+                r = await asyncio.wait_for(self._ssh.run(cmd, check=False),
+                                           timeout=timeout)
+                return r.stdout or ""
+            except Exception:
+                try:
+                    self._ssh.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ssh = None
+                if derniere:
+                    raise
+
     async def sonde(self):
         cmd = SONDE % {"unite": self.cfg.transfert_unit,
                        "journal": self.cfg.transfert_log,
                        "cible": self.cfg.transfert_dest}
-        return parse_sonde(await run_readonly(self.cfg, cmd))
+        return parse_sonde(await self._run(cmd))
 
     @tasks.loop(seconds=60)
     async def poll(self):

@@ -3,6 +3,7 @@
 Stored under StateDirectory (/var/lib/discord-bot/state.json). Used for the pinned
 dashboard message id, owned-alert de-dup levels, and the last daily-report date.
 """
+import atexit
 import json
 import logging
 import os
@@ -17,10 +18,19 @@ ALERTS_ROOT = "alerts"
 
 
 class State:
+    #: délai de regroupement des écritures (voir _save_soon)
+    FLUSH_DELAY = 1.0
+
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
         self.d = self._load()
+        self._dirty = False
+        self._timer = None
+        # le flush final couvre l'arrêt PROPRE (SIGTERM systemd passe par close() du
+        # bot, qui appelle flush() ; atexit couvre les sorties sys.exit/normales).
+        # Un kill -9 peut perdre au plus FLUSH_DELAY seconde d'état — assumé.
+        atexit.register(self.flush)
 
     def _load(self):
         try:
@@ -62,7 +72,46 @@ class State:
     def set(self, key, value):
         with self._lock:
             self.d[key] = value
+            self._save_soon()
+
+    # --- écriture différée -------------------------------------------------------
+    # POURQUOI (revue 2026-08-18) : chaque set() réécrivait state.json EN ENTIER, de
+    # façon synchrone, souvent depuis la boucle d'événements (mapping des messages
+    # épinglés, curseurs de journaux, de-dup d'alertes). Le fichier grossit à chaque
+    # feature : sur un thin-pool chargé, c'est de la gigue injectée dans la boucle.
+    # Le différé regroupe les rafales (20 set() d'un cycle = 1 seule écriture) et la
+    # sort du chemin critique. flush() garde une écriture immédiate pour l'arrêt.
+
+    def _save_soon(self):
+        """À appeler SOUS self._lock : marque l'état sale, programme UNE écriture."""
+        self._dirty = True
+        if self._timer is None:
+            t = threading.Timer(self.FLUSH_DELAY, self._flush_cb)
+            t.daemon = True
+            self._timer = t
+            t.start()
+
+    def _flush_cb(self):
+        with self._lock:
+            self._timer = None
+            self._flush_locked()
+
+    def _flush_locked(self):
+        if not self._dirty:
+            return
+        try:
             self._save()
+            self._dirty = False
+        except Exception:  # noqa: BLE001 — retenté au prochain set(), jamais fatal
+            log.exception("state.json non écrit (flush différé) — retenté au prochain set")
+
+    def flush(self):
+        """Écriture immédiate de l'état en attente (arrêt du bot, tests)."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._flush_locked()
 
     # --- owned-alert de-dup (edge-triggered), cloisonnée par cog ---
     def ns(self, prefix, adopt=()):
@@ -96,7 +145,7 @@ class State:
                 if changed:
                     log.info("alertes : clés reprises dans l'espace « %s » (migration)",
                              prefix)
-                    self._save()
+                    self._save_soon()
         return space
 
     def alerts_active(self):
@@ -147,7 +196,11 @@ class AlertSpace:
         return f"{self.prefix}:{k}"
 
     def get(self, k, default=None):
-        v = (self._st.d.get(ALERTS_ROOT) or {}).get(self.key(k))
+        # sous verrou (revue 2026-08-18) : lu depuis la boucle asyncio ET des threads
+        # to_thread pendant que d'autres écrivent — une lecture non verrouillée pouvait
+        # croiser une mutation.
+        with self._st._lock:
+            v = (self._st.d.get(ALERTS_ROOT) or {}).get(self.key(k))
         return default if v is None else v
 
     def level(self, k):
@@ -158,7 +211,7 @@ class AlertSpace:
     def set(self, k, value):
         with self._st._lock:
             self._st.d.setdefault(ALERTS_ROOT, {})[self.key(k)] = value
-            self._st._save()
+            self._st._save_soon()
 
     def set_level(self, k, level, value=None):
         self.set(k, {"level": level, "value": value})
@@ -166,7 +219,9 @@ class AlertSpace:
     def keys(self):
         """Clés NUES présentes dans CET espace (jamais celles d'un autre cog)."""
         p = self.prefix + ":"
-        return [k[len(p):] for k in (self._st.d.get(ALERTS_ROOT) or {}) if k.startswith(p)]
+        with self._st._lock:   # itérer un dict pendant qu'un autre thread écrit = RuntimeError
+            return [k[len(p):] for k in list(self._st.d.get(ALERTS_ROOT) or {})
+                    if k.startswith(p)]
 
     def clear(self, k=None):
         """Efface une clé de l'espace, ou l'espace entier si `k` est None."""
@@ -178,4 +233,4 @@ class AlertSpace:
                     d.pop(kk, None)
             else:
                 d.pop(self.key(k), None)
-            self._st._save()
+            self._st._save_soon()

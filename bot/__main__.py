@@ -141,6 +141,11 @@ class MonitorBot(commands.Bot):
                 await closer()
             except Exception:  # noqa: BLE001
                 log.warning("arrêt: fermeture de %s en échec", name, exc_info=True)
+        # l'état différé (state._save_soon) doit toucher le disque avant l'extinction
+        try:
+            self.state.flush()
+        except Exception:  # noqa: BLE001
+            log.warning("état non flushé à l'arrêt", exc_info=True)
         await super().close()
 
     async def setup_hook(self):

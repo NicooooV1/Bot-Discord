@@ -130,6 +130,11 @@ def _attach(loop, name, logger):
         # discord.py appelle le gestionnaire avec (exception,) ou, pour une boucle
         # injectée dans un cog, (cog, exception) : l'exception est toujours en dernier.
         exc = args[-1] if args else None
+        # La série ne compte que les échecs RAPPROCHÉS (même fenêtre que `healthy`) :
+        # sans cette remise à zéro, un incident isolé par semaine finissait, au fil des
+        # mois, par hériter du backoff maximal des pannes d'il y a longtemps (2026-08-18).
+        if state.last_error_at and time.time() - state.last_error_at > 900:
+            state.failures = 0
         state.failures += 1
         state.last_error = f"{type(exc).__name__}: {exc}"[:200]
         state.last_error_at = time.time()

@@ -87,7 +87,10 @@ class Servarr(commands.Cog):
     async def cog_load(self):
         # vue persistante (bouton Rafraîchir survit aux redémarrages)
         self.bot.add_view(self._view())
-        self.bot.add_view(AlertActionView())   # boutons Snooze sur les alertes seedbox
+        # même règle que le bouton Rafraîchir ci-dessus : UNE instance pour tous les
+        # envois, sinon chacune reste à vie dans le view-store (revue 2026-08-18)
+        self._alert_view = AlertActionView()
+        self.bot.add_view(self._alert_view)
 
     def _view(self):
         """L'UNIQUE instance de la vue du message #ratio.
@@ -307,7 +310,7 @@ class Servarr(commands.Cog):
             color = fmt.RED if level == "crit" else fmt.YELLOW
             emb = discord.Embed(title=title, description=desc, color=color)
             emb.set_footer(text=f"alerte: {key} [{level}]")
-            await ch.send(embed=emb, view=AlertActionView())
+            await ch.send(embed=emb, view=self._alert_view)
             self.alerts.set_level(key, level)
         elif not level and prev:
             await ch.send(embed=discord.Embed(

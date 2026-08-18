@@ -150,7 +150,11 @@ class TestCurseurRefus(unittest.TestCase):
             if action == "admin_refused":
                 return {"status": "ok", "refused": refused_rows}
             if action == "admin_list":
-                return {"status": "ok", "ip": {"allowed": allowed}}
+                # nouveau contrat (revue 2026-08-18) : UNE lecture de la whitelist
+                # complete par tick, plus d appel par IP
+                return {"status": "ok",
+                        "allowlist": ([{"ip": r["ip"]} for r in refused_rows]
+                                      if allowed else [])}
             return {"status": "ok"}
         cog.api = fake_api
         cog.bot.get_channel = lambda cid: chan
