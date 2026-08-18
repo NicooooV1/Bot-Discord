@@ -161,12 +161,16 @@ class Dist(commands.Cog):
             secs = getattr(self.bot.cfg, "dist_poll_seconds", 120)
             self.refus_watch.change_interval(seconds=secs)
             self.refus_watch.start()
+            park_secs = getattr(self.bot.cfg, "dist_park_poll_seconds", 900)
+            self.parc_watch.change_interval(seconds=park_secs)
+            self.parc_watch.start()
         else:
             log.warning("DIST_URL/DIST_ADMIN_TOKEN absents : /dist et la veille des "
                         "refus sont inactifs")
 
     async def cog_unload(self):
         self.refus_watch.cancel()
+        self.parc_watch.cancel()
 
     @property
     def enabled(self):
@@ -334,6 +338,146 @@ class Dist(commands.Cog):
     async def _wait_ready(self):
         await self.bot.wait_until_ready()
 
+    # ------------------------------------------------------------------ parc
+    # Seuils (dérivés de la cadence de phone-home) : une instance qui n'a pas parlé depuis
+    # ~2,5× son intervalle attendu est en « silence radio ». Anti-spam : une alerte par
+    # instance par PARK_ALERT_COOLDOWN, et une note de RÉTABLISSEMENT quand elle repart.
+    PARK_ALERT_COOLDOWN = 6 * 3600
+
+    @staticmethod
+    def _fmt_age(seconds):
+        if seconds is None:
+            return "jamais"
+        s = int(seconds)
+        if s < 3600:
+            return f"{s // 60} min"
+        if s < 86400:
+            return f"{s // 3600} h"
+        return f"{s // 86400} j"
+
+    def _park_status(self, inst):
+        """→ (niveau, court_texte). niveau ∈ ok|warn|crit ; sert au tri et aux alertes."""
+        cfg = self.bot.cfg
+        silence_limit = getattr(cfg, "dist_phone_home_hours", 24) * 3600 * 2.5
+        backup_limit = getattr(cfg, "dist_backup_stale_hours", 48) * 3600
+        silence = inst.get("silence_seconds")
+        if silence is not None and silence > silence_limit:
+            return "crit", f"silence radio ({self._fmt_age(silence)})"
+        if int(inst.get("revoked") or 0) == 1:
+            return "warn", "licence révoquée"
+        if inst.get("healthy") == 0:
+            return "warn", "santé dégradée"
+        bage = inst.get("backup_age_seconds")
+        if bage is None or bage > backup_limit:
+            return "warn", "sauvegarde vieillissante" if bage else "aucune sauvegarde"
+        return "ok", "à jour"
+
+    @staticmethod
+    def _park_dot(level):
+        return {"ok": "🟢", "warn": "🟠", "crit": "🔴"}.get(level, "⚪")
+
+    def _push_influx(self, instances):
+        """Une ligne line-protocol par instance → dashboard Grafana « Parc Fronote »."""
+        if not getattr(self.bot, "influx", None) or not self.bot.influx.enabled:
+            return None
+        lines = []
+        for i in instances:
+            aid = int(i.get("activation_id") or 0)
+            ver = str(i.get("app_version") or "?").replace(" ", "_").replace(",", "_")
+            level, _ = self._park_status(i)
+            fields = [
+                f"healthy={1 if i.get('healthy') else 0}i",
+                f"silence_s={int(i.get('silence_seconds') or 0)}i",
+                f"ok={1 if level == 'ok' else 0}i",
+            ]
+            if i.get("backup_age_seconds") is not None:
+                fields.append(f"backup_age_s={int(i['backup_age_seconds'])}i")
+            if i.get("disk_pct") is not None:
+                fields.append(f"disk_pct={int(i['disk_pct'])}i")
+            if i.get("tenants_count") is not None:
+                fields.append(f"tenants={int(i['tenants_count'])}i")
+            if i.get("accounts_count") is not None:
+                fields.append(f"accounts={int(i['accounts_count'])}i")
+            lines.append(f"fronote_park,instance={aid},version={ver} " + ",".join(fields))
+        return "\n".join(lines) if lines else None
+
+    @tasks.loop(seconds=900)
+    async def parc_watch(self):
+        r = await self.api("GET", "admin_park", params={"limit": 500}, timeout=15)
+        if not r or r.get("status") != "ok":
+            return
+        instances = r.get("instances") or []
+        if not instances:
+            return
+
+        # (P3) métriques → InfluxDB (best-effort, jamais bloquant)
+        lp = self._push_influx(instances)
+        if lp:
+            try:
+                await self.bot.influx.write(lp)
+            except Exception as e:  # noqa: BLE001
+                log.warning("push influx parc: %s", e)
+
+        # (P2) alerte silence-radio / souffrance, anti-spam par instance
+        cid = (getattr(self.bot.cfg, "dist_alert_channel_id", 0)
+               or self.bot.cfg.alert_channel_id)
+        chan = self.bot.get_channel(cid) if cid else None
+        if chan is None or not hasattr(chan, "send"):
+            return
+        now = time.time()
+        alerted = dict(self.bot.state.get("dist_park_alerted") or {})
+        changed = False
+        for inst in instances:
+            aid = str(inst.get("activation_id"))
+            level, txt = self._park_status(inst)
+            prev = alerted.get(aid) or {}
+            prev_level = prev.get("level", "ok")
+            if level in ("warn", "crit"):
+                # alerter si nouveau problème, aggravation, ou cooldown écoulé
+                due = (level != prev_level
+                       or now - float(prev.get("ts", 0)) > self.PARK_ALERT_COOLDOWN)
+                if due:
+                    try:
+                        await chan.send(embed=self._park_alert_embed(inst, level, txt))
+                        alerted[aid] = {"level": level, "ts": now}
+                        changed = True
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("alerte parc %s impossible: %s", aid, e)
+            elif prev_level in ("warn", "crit"):
+                # rétablissement
+                try:
+                    host = inst.get("hostname") or f"instance #{aid}"
+                    await chan.send(f"🟢 **{host}** est de nouveau saine "
+                                    f"(vue il y a {self._fmt_age(inst.get('silence_seconds'))}).")
+                except Exception:  # noqa: BLE001
+                    pass
+                alerted.pop(aid, None)
+                changed = True
+        if changed:
+            self.bot.state.set("dist_park_alerted", alerted)
+
+    @parc_watch.before_loop
+    async def _wait_ready_parc(self):
+        await self.bot.wait_until_ready()
+
+    def _park_alert_embed(self, inst, level, txt):
+        host = inst.get("hostname") or f"instance #{inst.get('activation_id')}"
+        color = 0xE01B24 if level == "crit" else 0xE5A50A
+        emb = discord.Embed(
+            title=f"{self._park_dot(level)} Instance Fronote — {txt}",
+            description=f"**{host}** ({inst.get('app_url') or 'URL ?'})",
+            color=color)
+        emb.add_field(name="Version", value=f"`{inst.get('app_version') or '?'}`", inline=True)
+        emb.add_field(name="Dernier contact",
+                      value=f"il y a {self._fmt_age(inst.get('silence_seconds'))}", inline=True)
+        emb.add_field(name="Dernière sauvegarde",
+                      value=f"il y a {self._fmt_age(inst.get('backup_age_seconds'))}", inline=True)
+        note = inst.get("note")
+        if note:
+            emb.add_field(name="Licence", value=str(note)[:200], inline=False)
+        emb.set_footer(text=f"activation #{inst.get('activation_id')} · parc Fronote")
+        return emb
+
     # ------------------------------------------------------------------ commandes
     async def _guard_enabled(self, itx):
         if self.enabled:
@@ -465,6 +609,78 @@ class Dist(commands.Cog):
                           value=f"{info['count']} requête(s) ({kinds})\n"
                                 f"dernière : {info['last']} UTC",
                           inline=True)
+        await itx.followup.send(embed=emb)
+
+    @dist.command(name="licences", description="Licences émises (usage, révocation, expiration).")
+    @admin_check(require_admin_channel=False)
+    async def licences(self, itx: discord.Interaction):
+        if not await self._guard_enabled(itx):
+            return
+        await itx.response.defer()
+        r = await self.api("GET", "admin_licenses", params={"limit": 200})
+        if not r or r.get("status") != "ok":
+            await itx.followup.send(
+                f"❌ Échec : {(r or {}).get('status', 'serveur dist injoignable')}")
+            return
+        rows = r.get("licenses") or []
+        actives = sum(1 for x in rows if not x.get("revoked"))
+        emb = discord.Embed(
+            title="🔑 Licences — serveur de distribution Fronote",
+            description=f"**{len(rows)}** licence(s) émise(s), {actives} active(s). "
+                        "20 plus récentes affichées.",
+            color=0x3584E4)
+        for x in rows[:20]:
+            try:
+                prem = ", ".join(json.loads(x.get("modules_json") or "[]")) or "aucun"
+            except (ValueError, TypeError):
+                prem = "?"
+            state = ("🚫 révoquée" if x.get("revoked")
+                     else f"{x.get('used_count', 0)}/{x.get('max_activations', 1)} utilisée")
+            exp = f" · expire {x['expires_at']}" if x.get("expires_at") else ""
+            emb.add_field(
+                name=f"`{x.get('key_prefix')}…` — {x.get('tier')}",
+                value=f"{state}{exp}\npremium : {prem}\n{x.get('note') or '(sans note)'}",
+                inline=True)
+        await itx.followup.send(embed=emb)
+
+    @dist.command(name="parc", description="État du parc des écoles installées (versions, santé, sauvegardes).")
+    @admin_check(require_admin_channel=False)
+    async def parc(self, itx: discord.Interaction):
+        if not await self._guard_enabled(itx):
+            return
+        await itx.response.defer()
+        r = await self.api("GET", "admin_park", params={"limit": 500})
+        if not r or r.get("status") != "ok":
+            await itx.followup.send(
+                f"❌ Échec : {(r or {}).get('status', 'serveur dist injoignable')}")
+            return
+        instances = r.get("instances") or []
+        if not instances:
+            await itx.followup.send(
+                "📭 Aucune instance ne s'est encore signalée. Les écoles installées "
+                "appellent `/phone-home` une fois par jour (cron) — le parc se remplira "
+                "au premier rapport.")
+            return
+        # pire d'abord (crit > warn > ok), puis par ancienneté de contact
+        order = {"crit": 0, "warn": 1, "ok": 2}
+        ranked = sorted(
+            ((self._park_status(i), i) for i in instances),
+            key=lambda t: (order.get(t[0][0], 3), -(t[1].get("silence_seconds") or 0)))
+        crit = sum(1 for (lvl, _t), _i in ranked if lvl == "crit")
+        warn = sum(1 for (lvl, _t), _i in ranked if lvl == "warn")
+        emb = discord.Embed(
+            title="🏫 Parc Fronote — écoles installées",
+            description=(f"**{len(instances)}** instance(s) · "
+                         f"🔴 {crit} · 🟠 {warn} · 🟢 {len(instances) - crit - warn}"),
+            color=0xE01B24 if crit else (0xE5A50A if warn else 0x26A269))
+        for (level, txt), i in ranked[:20]:
+            host = i.get("hostname") or f"instance #{i.get('activation_id')}"
+            emb.add_field(
+                name=f"{self._park_dot(level)} {host}",
+                value=(f"v`{i.get('app_version') or '?'}` · {txt}\n"
+                       f"vu il y a {self._fmt_age(i.get('silence_seconds'))} · "
+                       f"sauv. {self._fmt_age(i.get('backup_age_seconds'))}"),
+                inline=True)
         await itx.followup.send(embed=emb)
 
 

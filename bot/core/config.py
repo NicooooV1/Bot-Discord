@@ -314,6 +314,15 @@ class Config:
         # salon des notifications « IP refusée » (défaut : le salon d'alertes)
         self.dist_alert_channel_id = _int(g("DIST_ALERT_CHANNEL_ID"))
         self.dist_poll_seconds = max(30, _int(g("DIST_POLL_SECONDS", "120"), 120))
+        # --- Parc d'instances Fronote (phone-home) 2026-08-18 ------------------
+        # Chaque instance installée se signale toutes les DIST_PHONE_HOME_HOURS (le cron
+        # client). La veille du parc relit GET /admin/park à cette cadence, pousse une
+        # métrique par instance dans InfluxDB (dashboard « Parc Fronote ») et alerte en
+        # silence-radio quand une instance dépasse ~2,5× son intervalle attendu.
+        self.dist_park_poll_seconds = max(60, _int(g("DIST_PARK_POLL_SECONDS", "900"), 900))
+        self.dist_phone_home_hours = max(1, _int(g("DIST_PHONE_HOME_HOURS", "24"), 24))
+        # âge de sauvegarde (heures) au-delà duquel une instance est signalée « souffrante »
+        self.dist_backup_stale_hours = max(1, _int(g("DIST_BACKUP_STALE_HOURS", "48"), 48))
 
         # --- 2FA (TOTP) --------------------------------------------------------
         # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les
