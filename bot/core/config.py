@@ -327,6 +327,11 @@ class Config:
         self.dist_phone_home_hours = max(1, _int(g("DIST_PHONE_HOME_HOURS", "24"), 24))
         # âge de sauvegarde (heures) au-delà duquel une instance est signalée « souffrante »
         self.dist_backup_stale_hours = max(1, _int(g("DIST_BACKUP_STALE_HOURS", "48"), 48))
+        # --- Propositions du site vitrine (formulaire dist.nicov1.fr) ---------
+        # Salon où poster les demandes reçues. 0 = le bot crée/adopte #propositions
+        # sous la catégorie Supervision (repli : salon d'alertes).
+        self.dist_proposals_channel_id = _int(g("DIST_PROPOSALS_CHANNEL_ID"))
+        self.dist_proposals_poll_seconds = max(30, _int(g("DIST_PROPOSALS_POLL_SECONDS", "120"), 120))
 
         # --- 2FA (TOTP) --------------------------------------------------------
         # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les

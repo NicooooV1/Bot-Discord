@@ -36,6 +36,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..core.bg import guard_cog_loops
+from ..core.channels import ensure_channel, supervision_category
 from ..core.gates import GatedView
 from ..core.permissions import admin_check
 
@@ -168,6 +169,9 @@ class Dist(commands.Cog):
             park_secs = getattr(self.bot.cfg, "dist_park_poll_seconds", 900)
             self.parc_watch.change_interval(seconds=park_secs)
             self.parc_watch.start()
+            prop_secs = getattr(self.bot.cfg, "dist_proposals_poll_seconds", 120)
+            self.proposals_watch.change_interval(seconds=prop_secs)
+            self.proposals_watch.start()
         else:
             log.warning("DIST_URL/DIST_ADMIN_TOKEN absents : /dist et la veille des "
                         "refus sont inactifs")
@@ -175,6 +179,7 @@ class Dist(commands.Cog):
     async def cog_unload(self):
         self.refus_watch.cancel()
         self.parc_watch.cancel()
+        self.proposals_watch.cancel()
 
     @property
     def enabled(self):
@@ -469,6 +474,93 @@ class Dist(commands.Cog):
     async def _wait_ready_parc(self):
         await self.bot.wait_until_ready()
 
+    # ------------------------------------------------------------------ propositions
+    # Demandes soumises via le formulaire du site vitrine (dist.nicov1.fr) : relues depuis
+    # un curseur persisté (comme refus_watch) et postées dans un salon dédié « propositions ».
+    @staticmethod
+    def _safe(txt, limit=1024):
+        """Neutralise le markdown/mentions Discord d'un champ SAISI PAR LE PUBLIC."""
+        s = str(txt or "").strip()
+        if not s:
+            return ""
+        # coupe les mentions (@, <@…>) et l'échappement des marqueurs markdown
+        s = s.replace("@", "@​").replace("`", "'").replace("](", "] (")
+        for ch in ("*", "_", "~", ">", "|"):
+            s = s.replace(ch, "\\" + ch)
+        return s[:limit]
+
+    async def _proposals_channel(self):
+        """Salon cible : PROPOSALS_CHANNEL_ID, sinon #propositions (créé sous Supervision),
+        sinon le salon d'alertes en dernier recours."""
+        cid = getattr(self.bot.cfg, "dist_proposals_channel_id", 0)
+        if cid:
+            ch = self.bot.get_channel(cid)
+            if ch is not None and hasattr(ch, "send"):
+                return ch
+        guild = self.bot.get_guild(self.bot.cfg.guild_id) if getattr(self.bot.cfg, "guild_id", 0) else None
+        if guild is not None:
+            cat = supervision_category(self.bot, guild)
+            ch = await ensure_channel(self.bot, guild, "propositions", cat,
+                                      topic="Demandes reçues via le site vitrine dist.nicov1.fr",
+                                      reason="salon des propositions Fronote")
+            if ch is not None:
+                return ch
+        cid2 = getattr(self.bot.cfg, "dist_alert_channel_id", 0) or self.bot.cfg.alert_channel_id
+        return self.bot.get_channel(cid2) if cid2 else None
+
+    def _proposal_embed(self, p):
+        emb = discord.Embed(
+            title="📩 Nouvelle proposition — " + (self._safe(p.get("etablissement"), 200) or "établissement non précisé"),
+            description=self._safe(p.get("message"), 2000) or "(pas de message)",
+            color=0xB9772A)
+        if p.get("type"):
+            emb.add_field(name="Type", value=self._safe(p.get("type"), 60), inline=True)
+        if p.get("effectif"):
+            emb.add_field(name="Effectif", value=self._safe(p.get("effectif"), 60), inline=True)
+        if p.get("modules"):
+            emb.add_field(name="Modules d'intérêt", value=self._safe(p.get("modules"), 200), inline=False)
+        contact = []
+        if p.get("contact"):
+            contact.append("👤 " + self._safe(p.get("contact"), 120))
+        if p.get("email"):
+            contact.append("✉️ " + self._safe(p.get("email"), 160))
+        if p.get("telephone"):
+            contact.append("📞 " + self._safe(p.get("telephone"), 40))
+        if contact:
+            emb.add_field(name="Contact", value="\n".join(contact), inline=False)
+        emb.set_footer(text=f"proposition #{p.get('id')} · {p.get('at')} UTC · dist.nicov1.fr")
+        return emb
+
+    @tasks.loop(seconds=120)
+    async def proposals_watch(self):
+        cursor = int(self.bot.state.get("dist_proposals_cursor") or 0)
+        r = await self.api("GET", "admin_proposals",
+                           params={"since_id": cursor, "limit": 50}, timeout=10)
+        if not r or r.get("status") != "ok":
+            return
+        rows = r.get("proposals") or []
+        if not rows:
+            return
+        chan = await self._proposals_channel()
+        if chan is None or not hasattr(chan, "send"):
+            log.warning("propositions à poster mais aucun salon disponible — curseur NON avancé")
+            return
+        posted_max = cursor
+        for p in rows:
+            try:
+                await chan.send(embed=self._proposal_embed(p),
+                                allowed_mentions=discord.AllowedMentions.none())
+                posted_max = max(posted_max, int(p.get("id") or 0))
+            except Exception as e:  # noqa: BLE001
+                log.warning("envoi proposition #%s impossible: %s", p.get("id"), e)
+                break   # on n'avance pas au-delà du dernier réellement posté
+        if posted_max > cursor:
+            self.bot.state.set("dist_proposals_cursor", posted_max)
+
+    @proposals_watch.before_loop
+    async def _wait_ready_props(self):
+        await self.bot.wait_until_ready()
+
     def _park_alert_embed(self, inst, level, txt):
         host = inst.get("hostname") or f"instance #{inst.get('activation_id')}"
         color = 0xE01B24 if level == "crit" else 0xE5A50A
@@ -690,6 +782,36 @@ class Dist(commands.Cog):
                        f"vu il y a {self._fmt_age(i.get('silence_seconds'))} · "
                        f"sauv. {self._fmt_age(i.get('backup_age_seconds'))}"),
                 inline=True)
+        await itx.followup.send(embed=emb)
+
+    @dist.command(name="propositions", description="Dernières demandes reçues via le site vitrine dist.nicov1.fr.")
+    @admin_check(require_admin_channel=False)
+    async def propositions(self, itx: discord.Interaction):
+        if not await self._guard_enabled(itx):
+            return
+        await itx.response.defer()
+        r = await self.api("GET", "admin_proposals", params={"since_id": 0, "limit": 100})
+        if not r or r.get("status") != "ok":
+            await itx.followup.send(
+                f"❌ Échec : {(r or {}).get('status', 'serveur dist injoignable')}")
+            return
+        rows = r.get("proposals") or []
+        if not rows:
+            await itx.followup.send("📭 Aucune proposition reçue pour l'instant.")
+            return
+        rows = sorted(rows, key=lambda p: int(p.get("id") or 0), reverse=True)[:10]
+        emb = discord.Embed(
+            title="📩 Propositions — site vitrine Fronote",
+            description=f"**{len(r.get('proposals') or [])}** demande(s) au total (10 récentes affichées).",
+            color=0xB9772A)
+        for p in rows:
+            who = self._safe(p.get("etablissement"), 80) or "établissement ?"
+            joignable = self._safe(p.get("email") or p.get("telephone") or "?", 60)
+            emb.add_field(
+                name=f"#{p.get('id')} · {who}",
+                value=f"{self._safe(p.get('message'), 120) or '(sans message)'}\n"
+                      f"✉️ {joignable} · {p.get('at')} UTC",
+                inline=False)
         await itx.followup.send(embed=emb)
 
 
