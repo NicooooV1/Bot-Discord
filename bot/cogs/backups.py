@@ -6,6 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..core import format as fmt
+from ..core.pve import PbsPermissionError
 from ..core.permissions import read_check
 
 log = logging.getLogger("discord-bot.backups")
@@ -102,6 +103,10 @@ class Backups(commands.Cog):
                 total = sum(int(i.get("size", 0) or 0) for i in content)
                 emb.set_footer(text=f"PBS « {bot.cfg.pve_pbs_storage} » : {len(content)} snapshots "
                                     f"· {fmt.humanize_bytes(total)}")
+            except PbsPermissionError as e:
+                # déjà journalisé UNE fois par pve.pbs_content : ici on l'affiche à
+                # l'utilisateur au lieu d'un pied de page silencieusement absent
+                emb.set_footer(text=f"⚠️ {e}")
             except Exception:
                 # le pied de page est optionnel, mais un PBS injoignable mérite une trace
                 log.warning("PBS : contenu du datastore illisible", exc_info=True)

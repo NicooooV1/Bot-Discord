@@ -408,6 +408,14 @@ class _RemoteCluster:
         return self._action_api.nodes(self._any_node()).storage(self.storage).content(volid).delete()
 
 
+class PbsPermissionError(RuntimeError):
+    """Le jeton de LECTURE n'a pas Datastore.Audit sur le stockage PBS — l'ACL
+    profonde posée pour le jeton d'action MASQUE le PVEAuditor hérité de « / »
+    (4e occurrence du piège ACL, campagne 2026-08-18). Comme ce n'est PAS une panne
+    mais une configuration, elle est journalisée UNE seule fois par épisode, remède
+    inclus, et les appelants se dégradent sans re-tracer l'exception."""
+
+
 class AvyUnreachable(RuntimeError):
     """Cluster secondaire (AVEYRON) injoignable — levée par le coupe-circuit partagé
     (Pve._avy_read) sans re-payer le timeout réseau tant que le lien est coupé. Sous-classe
@@ -439,6 +447,7 @@ class Pve:
         self._avy_last = None       # dernier instantané resources() distant réussi
         self._avy_last_ts = 0.0
         self._avy_warned = False
+        self._pbs_denied_warned = False   # cf. PbsPermissionError (log unique)
         if cfg.pve_enabled:
             try:
                 self._ro = _mk_client(cfg, cfg.pve_token_id, cfg.pve_token_secret)
@@ -873,7 +882,28 @@ class Pve:
     def pbs_content(self, vmid=None):
         if vmid is not None and self._is_avy(vmid):
             return self._avy.pbs_content(int(vmid) - AVY_OFFSET)
-        items = self._ro.nodes(self.node).storage(self.cfg.pve_pbs_storage).content.get()
+        sto = self.cfg.pve_pbs_storage
+        try:
+            items = self._ro.nodes(self.node).storage(sto).content.get()
+        except Exception as e:
+            # Droit manquant = CONFIGURATION, pas panne : un log par épisode (pas un
+            # traceback par appel), avec le remède exact. Les appelants attrapent
+            # PbsPermissionError et se dégradent sans re-journaliser.
+            if "Permission check failed" in str(e):
+                if not self._pbs_denied_warned:
+                    self._pbs_denied_warned = True
+                    log.warning(
+                        "PBS « %s » : lecture REFUSÉE au jeton de lecture (%s). "
+                        "Dit UNE seule fois — remède : pveum acl modify /storage/%s "
+                        "--roles BotBackupStorage --tokens '%s'",
+                        sto, e, sto, self.cfg.pve_token_id)
+                raise PbsPermissionError(
+                    f"lecture de « {sto} » refusée au jeton du bot "
+                    f"(Datastore.Audit manquant sur /storage/{sto})") from None
+            raise
+        if self._pbs_denied_warned:
+            log.info("PBS « %s » : lecture de nouveau permise", sto)
+            self._pbs_denied_warned = False
         if vmid is not None:
             items = [i for i in items if str(i.get("vmid")) == str(vmid)]
         return items
