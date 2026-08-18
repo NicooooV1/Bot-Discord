@@ -47,7 +47,7 @@ tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' \
   | sed 's/^/progres=/'
 tail -n 200 "$journal" 2>/dev/null | tr '\r' '\n' \
   | grep -E '^(====|[0-9]{4}-[0-9]{2}-[0-9]{2} )' | tail -3 | sed 's/^/ligne=/'
-df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
+timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
 """
 
 #: un `Type=oneshot` qui dure reste dans l'état « activating » de bout en bout —

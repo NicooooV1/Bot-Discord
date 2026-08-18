@@ -718,7 +718,7 @@ class Avy(commands.Cog):
         que Reports regarde pour ne pas marquer la journée comme faite)."""
         if not self.bot.pve.avy_enabled or not self._sup():
             return 0
-        envoyes = 0
+        envoyes, attendus = 0, 0
         for node in await asyncio.to_thread(self.bot.pve.avy_nodes):
             cid = self._sup().get(node, {}).get("rapports")
             ch = self.bot.get_channel(cid) if cid else None
@@ -726,6 +726,7 @@ class Avy(commands.Cog):
                 log.warning("rapport quotidien de %s non publié : salon #rapports-%s "
                             "introuvable (id=%s)", node, node, cid)
                 continue
+            attendus += 1
             try:
                 emb = await self.build_rapport(node)
             except Exception:
@@ -736,7 +737,12 @@ class Avy(commands.Cog):
                 envoyes += 1
             except discord.HTTPException:
                 log.warning("rapport quotidien de %s non publié", node, exc_info=True)
-        return envoyes
+        # COMPLET seulement : un succès partiel (nas en échec, ms01/llm publiés)
+        # marquait la journée « faite » et le nœud raté n'était JAMAIS retenté
+        # (campagne 2026-08-18 : rapport nas de 08:00 perdu). En rendant 0 tant que
+        # tout n'est pas passé, le rattrapage — borné à 12 essais — retente ; les
+        # nœuds déjà servis recevront au pire un doublon, préférable à un trou.
+        return envoyes if (attendus and envoyes == attendus) else 0
 
     @tasks.loop(minutes=5)
     async def refresh(self):
