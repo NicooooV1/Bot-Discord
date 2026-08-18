@@ -340,7 +340,12 @@ class Status(commands.Cog):
     async def ping(self, itx: discord.Interaction):
         await itx.response.defer()
         bot = self.bot
-        lat = round(bot.latency * 1000)
+        # latency vaut NaN tant que le premier heartbeat n est pas acquitte (juste
+        # apres une (re)connexion) : round(NaN) leve ValueError et /ping repondait
+        # « Erreur » precisement au moment ou on veut verifier la connexion (campagne
+        # de test 2026-08-18).
+        import math
+        lat = "?" if math.isnan(bot.latency) else round(bot.latency * 1000)
         pve_ok = await asyncio.to_thread(bot.pve.reachable) if bot.pve.enabled else None
         influx_ok = await asyncio.to_thread(bot.influx.health) if bot.influx.enabled else None
 
