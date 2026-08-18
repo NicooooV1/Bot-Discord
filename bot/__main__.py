@@ -27,7 +27,7 @@ discord.VoiceClient.warn_nacl = False  # voice is never used; silence the PyNaCl
 COGS = ["status", "graphs", "hardware", "storage", "backups", "sysinfo",
         "logs", "lokilogs", "dashboard", "ct_channels", "node_channel", "actions", "alerts",
         "reports", "servarr", "medias", "requests", "youtube", "meta", "provision", "terminal",
-        "heartbeat", "twofa", "docker", "gestion", "rdv", "avy", "avy_metrics",
+        "heartbeat", "twofa", "docker", "gestion", "avy", "avy_metrics",
         "jellyfin_activity", "dist", "netrates", "transfert"]
 
 # Seule famille de commandes exemptée de 2FA. Sans elle, impossible de s'inscrire ni de

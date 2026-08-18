@@ -29,7 +29,6 @@ OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 7878 -log nolog   # Radarr
 OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8989 -log nolog   # Sonarr
 OUT ACCEPT -dest 10.3.20.105 -p tcp -dport 8096 -log nolog   # Jellyfin API (#jellyfin en lecture)
 OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8770 -log nolog   # ytgrab (YouTube /yt)
-OUT ACCEPT -dest 10.3.20.121 -p tcp -dport 8080 -log nolog   # web-e (site RDV : DM des reponses)
 OUT ACCEPT -dest 10.3.20.122 -p tcp -dport 80 -log nolog     # fronote-dist (API admin whitelist /dist)
 
 # --- IN: live log stream UDP/514 from host, router and the LXC fleet (mgmt subnet) ---
