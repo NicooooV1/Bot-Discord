@@ -253,6 +253,10 @@ class Config:
         self.transfert_poll_sec = max(30, _int(g("TRANSFERT_POLL_SEC", "60"), 60))
         # temps de grâce avant suppression du salon une fois le transfert fini
         self.transfert_keep_min = max(0, _int(g("TRANSFERT_KEEP_MIN", "60"), 60))
+        # taille TOTALE connue de la bibliothèque (texte libre, ex. « 3,4 Tio ») :
+        # affichée tant que rsync analyse encore, pour que le total provisoire ne soit
+        # pas pris pour la taille finale (question de Nico 2026-08-18)
+        self.transfert_total_hint = g("TRANSFERT_TOTAL_HINT", "").strip()
 
         # durée de vie ABSOLUE d'une console du nœud, même active (0 = illimité)
         self.node_terminal_max_min = max(0, _int(g("NODE_TERMINAL_MAX_MIN", "120"), 120))

@@ -863,6 +863,15 @@ class TestSondeTransfert(unittest.TestCase):
         self.assertEqual(e["etat"], "failed")
         self.assertIsNone(e["pct_fin"])
 
+    def test_drapeau_analyse(self):
+        """« ir-chk » = analyse en cours (total PROVISOIRE), « to-chk » = fiable."""
+        e = self.t.parse_sonde(self.SORTIE + "chk=ir-chk=1019/1226\n")
+        self.assertIs(e["analyse"], True)
+        e = self.t.parse_sonde(self.SORTIE + "chk=to-chk=88/40210\n")
+        self.assertIs(e["analyse"], False)
+        e = self.t.parse_sonde(self.SORTIE)
+        self.assertIsNone(e["analyse"], "marqueur absent = on ne conclut rien")
+
     def test_barre_bornee(self):
         self.assertEqual(len(self.t.barre(0)), 20)
         self.assertEqual(len(self.t.barre(100)), 20)

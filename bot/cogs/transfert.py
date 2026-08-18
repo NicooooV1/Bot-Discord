@@ -47,6 +47,8 @@ tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' \
   | sed 's/^/progres=/'
 tail -n 200 "$journal" 2>/dev/null | tr '\r' '\n' \
   | grep -E '^(====|[0-9]{4}-[0-9]{2}-[0-9]{2} )' | tail -3 | sed 's/^/ligne=/'
+tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' | grep -o 'ir-chk=[0-9/]*\|to-chk=[0-9/]*' \
+  | tail -1 | sed 's/^/chk=/'
 timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
 """
 
@@ -97,7 +99,8 @@ def parse_sonde(sortie):
     """Sortie brute de SONDE -> dict. Tolère les champs manquants (journal vide,
     montage absent) : c'est justement pendant les ennuis qu'on regarde ce salon."""
     out = {"etat": "inconnu", "resultat": "", "debut": "", "lignes": [],
-           "octets": None, "pct": None, "debit": "", "eta": None, "libre": None}
+           "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
+           "analyse": None}   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
     for ligne in (sortie or "").splitlines():
         cle, _, val = ligne.partition("=")
         val = val.strip()
@@ -111,6 +114,13 @@ def parse_sonde(sortie):
             out["lignes"].append(val)
         elif cle == "libre":
             out["libre"] = int(val) if val.isdigit() else None
+        elif cle == "chk":
+            # rsync affiche « ir-chk » tant que la récursion INCRÉMENTALE analyse encore
+            # l'arborescence : son total (donc notre %) ne couvre que le DÉJÀ-analysé et
+            # grossit au fil du scan. « to-chk » = arborescence entière connue, chiffres
+            # fiables. Sans ce drapeau, l'embed annonçait « 53 % de ~210 Gio » sur une
+            # bibliothèque de 3,4 Tio (question de Nico, 2026-08-18).
+            out["analyse"] = val.startswith("ir-chk")
         elif cle == "progres":
             m = RE_PROGRES.match(val)
             if m:
@@ -151,10 +161,20 @@ def embed_transfert(etat, cfg):
     emb.timestamp = discord.utils.utcnow()
     pct = etat.get("pct_fin")
     if pct is not None:
+        # analyse=None (marqueur pas encore vu) est traité comme « en cours » : au
+        # démarrage rsync n'a encore rien imprimé de fiable.
+        scan_fini = etat.get("analyse") is False
         titre = f"Progression — {pct:.1f} %"
         if etat.get("total"):
-            titre += f" de ~{fmt.humanize_bytes(etat['total'])}"
+            titre += (f" de ~{fmt.humanize_bytes(etat['total'])}" if scan_fini else
+                      f" du volume analysé (~{fmt.humanize_bytes(etat['total'])}, provisoire)")
         emb.add_field(name=titre, value=f"`{barre(pct)}`", inline=False)
+        if not scan_fini and cfg.transfert_total_hint:
+            emb.add_field(
+                name="Bibliothèque complète",
+                value=f"≈ {cfg.transfert_total_hint} — tout part ; rsync analyse encore "
+                      "l'arborescence, l'estimation s'affine (le déjà-copié est sauté, "
+                      "pas renvoyé)", inline=False)
     if etat["octets"] is not None:
         emb.add_field(name="Transféré", value=fmt.humanize_bytes(etat["octets"]))
     if etat["debit"]:
