@@ -35,4 +35,7 @@ OUT ACCEPT -dest 10.3.20.122 -p tcp -dport 80 -log nolog     # fronote-dist (API
 IN ACCEPT -source 10.3.0.0/16 -p udp -dport 514 -log nolog   # host + CTs + CRS305 forwarders
 IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 22 -log nolog    # admin SSH (mgmt LAN)
 IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 9100 -log nolog  # node_exporter (scrape telegraf hôte)
+# --- IN: statuspage (status.nicov1.fr) — service independant du bot, port 8090 ---
+IN ACCEPT -source 10.3.20.116 -p tcp -dport 8090 -log nolog  # Caddy — status.nicov1.fr (statuspage)
+IN ACCEPT -source 10.3.20.123 -p tcp -dport 8090 -log nolog  # Homepage — widget customapi (statuspage)
 IN ACCEPT -p icmp -log nolog
