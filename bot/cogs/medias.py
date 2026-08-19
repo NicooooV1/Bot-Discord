@@ -7,6 +7,7 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -43,6 +44,46 @@ def _eta(s):
     if s < 3600:
         return f"{s // 60}m"
     return f"{s // 3600}h{(s % 3600) // 60:02d}"
+
+
+# Marqueurs de langue des noms de release, du plus précis au plus vague. Les langues
+# parsées par Radarr/Sonarr sont trompeuses : « MULTi.VFF » ressort « Japanese » (langue
+# originale) et « FRENCH » parfois « English ». Le NOM de la release fait foi. VFQ = VF
+# québécoise, à distinguer de la VFF (demande Nico 2026-08-19).
+_LANG_MARKERS = (
+    (re.compile(r"\b(VFF|TRUEFRENCH|VF2|VOF)\b", re.I), "🇫🇷", "VFF"),
+    (re.compile(r"\b(VFQ|VQ)\b|\bFRENCH[ ._-]?CA\b", re.I), "🍁", "VFQ (québécois)"),
+    (re.compile(r"\bFRENCH\b", re.I), "🇫🇷", "VF"),
+    (re.compile(r"\b(VF|VFI|VFO)\b", re.I), "🇫🇷", "VF"),
+    (re.compile(r"\bVOSTFR\b", re.I), "⚠️", "VOSTFR (sous-titres)"),
+)
+_RX_MULTI = re.compile(r"\bMULTI\b", re.I)
+# une liste explicite de langues [En+Hi] / (English-Hindi) SANS marqueur français
+_RX_NOFR_LIST = re.compile(
+    r"[\[(](?![^\])]*\b(?:fr|fre|fra|french|vf|vf2|vff|vfi|vfq|multi)\b)"
+    r"[^\])]*\b(?:en|eng|english|hi|hin|hindi|es|spa|spanish|ita|italian"
+    r"|kor|korean|jap|jpn|japanese|rus|russian|ger|german|de)\b[^\])]*[\])]", re.I)
+
+
+def _release_lang(name, arr_langs):
+    """(emoji, libellé) de la langue d'une release, depuis son NOM d'abord.
+
+    Retombe sur les langues parsées par Radarr/Sonarr seulement si le nom ne porte
+    aucun marqueur — elles servent alors d'indice, pas de verdict (⚠️, pas 🇫🇷).
+    """
+    name = name or ""
+    for rx, emoji, label in _LANG_MARKERS:
+        if rx.search(name):
+            if label != "VOSTFR (sous-titres)" and _RX_MULTI.search(name):
+                label += " · MULTi"
+            return emoji, label
+    if _RX_MULTI.search(name):
+        if _RX_NOFR_LIST.search(name):
+            return "⚠️", "MULTi sans piste FR listée"
+        return "🇫🇷", "MULTi (VF incluse)"
+    if any((l or "").lower() == "french" for l in arr_langs):
+        return "🇫🇷", "/".join(arr_langs[:3])
+    return "⚠️", "/".join(arr_langs[:3]) or "langue inconnue"
 
 
 def _norm_titre(s):
@@ -282,11 +323,11 @@ class Medias(commands.Cog):
                 done = size * prog          # déjà téléchargé
                 left = size - done          # reste à télécharger
                 d = details.get(str(t.get("hash", "")).lower()) or {}
-                extra = ""
+                # la langue se lit dans le NOM de la release (VFF/VFQ/MULTi…), les
+                # langues parsées par Radarr/Sonarr ne servent que de repli
+                fr, langs = _release_lang(t.get("name"), d.get("langs") or [])
+                extra = f" · {fr} {langs}"
                 if d:
-                    langs = "/".join(d["langs"][:3]) or "?"
-                    fr = "🇫🇷" if any(l.lower() == "french" for l in d["langs"]) else "⚠️"
-                    extra = f" · {fr} {langs}"
                     if d.get("score") is not None:
                         extra += f" · score {d['score']}"
                     if d.get("quality"):

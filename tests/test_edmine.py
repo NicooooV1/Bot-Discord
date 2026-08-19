@@ -976,5 +976,64 @@ class TestBackoffQuiRedescend(unittest.TestCase):
                          "le backoff n'est pas reparti du minimum après 1 h saine")
 
 
+
+
+class TestLangueDepuisNomDeRelease(unittest.TestCase):
+    """#telechargements : la langue affichée se lit dans le NOM de la release, pas dans
+    les langues parsées par Radarr/Sonarr (qui sortaient « Japanese » sur un MULTi.VFF
+    et « English » sur un FRENCH — constat Nico 2026-08-19). VFQ ≠ VFF."""
+
+    def _lang(self, name, arr=()):
+        from bot.cogs.medias import _release_lang
+        return _release_lang(name, list(arr))
+
+    def test_multi_vff_prime_sur_langue_parsee(self):
+        emoji, label = self._lang("Film.2024.MULTi.VFF.1080p.BluRay-X", ["Japanese"])
+        self.assertEqual(emoji, "🇫🇷")
+        self.assertIn("VFF", label)
+
+    def test_french_prime_sur_english_parse(self):
+        emoji, label = self._lang("K.O.2025.FRENCH.2160p.WEB-BOUBA", ["English"])
+        self.assertEqual(emoji, "🇫🇷")
+        self.assertIn("VF", label)
+
+    def test_vfq_distinguee_de_la_vff(self):
+        emoji, label = self._lang("Cars.2.2011.MULTi.VFQ.2160p.WEB-ENIGMA")
+        self.assertEqual(emoji, "🍁")
+        self.assertIn("québécois", label)
+
+    def test_french_ca_est_du_quebecois(self):
+        emoji, label = self._lang("Evil.Dead.Burn.2026.FRENCH.CA.2160p.WEB-SUPPLY")
+        self.assertEqual(emoji, "🍁")
+
+    def test_multi_seul_vaut_vf_incluse(self):
+        emoji, label = self._lang("Grimsby.2016.MULTi.1080p.WEB.H264-SiGeRiS", ["English"])
+        self.assertEqual(emoji, "🇫🇷")
+        self.assertIn("MULTi", label)
+
+    def test_multi_avec_liste_sans_fr_est_signale(self):
+        emoji, label = self._lang("Cars.3.2017.Multi.2160p.BluRay.[En+Hi]-DT", ["English"])
+        self.assertEqual(emoji, "⚠️")
+
+    def test_multi_avec_liste_contenant_fr_reste_vf(self):
+        emoji, _ = self._lang("Toy Story 2 1999 Multi Audio [English-French-Spanish]")
+        self.assertEqual(emoji, "🇫🇷")
+
+    def test_vostfr_nest_pas_de_la_vf(self):
+        emoji, label = self._lang("Serie.S01.VOSTFR.1080p.WEB-X")
+        self.assertEqual(emoji, "⚠️")
+        self.assertIn("VOSTFR", label)
+
+    def test_sans_marqueur_retombe_sur_langues_parsees_en_alerte(self):
+        emoji, label = self._lang("Movie.2020.1080p.BluRay-X", ["English"])
+        self.assertEqual(emoji, "⚠️")
+        self.assertIn("English", label)
+
+    def test_le_groupe_de_release_ne_pollue_pas(self):
+        # « ENIGMA » contient « eng », « DE » peut apparaître : bornes de mots obligatoires
+        emoji, _ = self._lang("Film.2024.MULTi.2160p.WEB.H265-ENIGMA")
+        self.assertEqual(emoji, "🇫🇷")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
