@@ -40,7 +40,4 @@ IN ACCEPT -source 10.3.10.0/24 -p udp -dport 514 -log nolog  # syslog : host + C
 IN ACCEPT -source 10.3.20.0/24 -p udp -dport 514 -log nolog  # syslog : CTs VLAN20 (*.warning)
 IN ACCEPT -source 10.3.10.0/24 -p tcp -dport 22 -log nolog   # admin SSH (mgmt LAN uniquement)
 IN ACCEPT -source 10.3.10.0/24 -p tcp -dport 9100 -log nolog # node_exporter (scrape telegraf hote)
-# --- IN: statuspage (status.nicov1.fr) — service independant du bot, port 8090 ---
-IN ACCEPT -source 10.3.20.116 -p tcp -dport 8090 -log nolog  # Caddy — status.nicov1.fr (statuspage)
-IN ACCEPT -source 10.3.20.123 -p tcp -dport 8090 -log nolog  # Homepage — widget customapi (statuspage)
 IN ACCEPT -p icmp -log nolog
