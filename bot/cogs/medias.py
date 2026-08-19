@@ -166,6 +166,44 @@ class Medias(commands.Cog):
             log.warning("qbit: %s", e)
             return None
 
+    def _arr_queue_sync(self):
+        """{hash bas-de-casse: {langues, score CF, qualité}} depuis les files Radarr ET
+        Sonarr. C'est ce qui permet d'afficher, PAR téléchargement, la langue retenue et
+        le score des formats français (phase 3 revue médias 2026-08-19) — l'utilisateur
+        voit AVANT la fin si un grab est bien VF. Échec d'une file = on l'omet : l'embed
+        reste utile avec les infos de l'autre, et sans aucune ligne enrichie au pire."""
+        out = {}
+        for svc in ("radarr", "sonarr"):
+            a = self.apis.get(svc)
+            if not a or not a.get("key"):
+                continue
+            try:
+                req = urllib.request.Request(
+                    a["url"] + "/api/v3/queue?pageSize=200",
+                    headers={"X-Api-Key": a["key"]})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    recs = (json.loads(r.read()) or {}).get("records") or []
+            except Exception as e:  # noqa: BLE001 — enrichissement best-effort
+                log.debug("file %s illisible: %s", svc, e)
+                continue
+            for rec in recs:
+                did = str(rec.get("downloadId") or "").lower()
+                if not did:
+                    continue
+                out[did] = {
+                    "langs": [str(x.get("name")) for x in rec.get("languages") or []
+                              if x.get("name")],
+                    "score": rec.get("customFormatScore"),
+                    "quality": ((rec.get("quality") or {}).get("quality") or {}).get("name"),
+                }
+        return out
+
+    async def _arr_queue(self):
+        try:
+            return await asyncio.to_thread(self._arr_queue_sync)
+        except Exception:  # noqa: BLE001
+            return {}
+
     # -------------------------------------------------- salon #telechargements
     async def _ensure_dl_channel(self):
         """Salon #telechargements, DANS la catégorie de supervision — jamais ailleurs.
@@ -229,6 +267,7 @@ class Medias(commands.Cog):
             emb.timestamp = discord.utils.utcnow()
             emb.set_footer(text="mise à jour automatique ~10 min · variation depuis le dernier refresh")
             return emb
+        details = await self._arr_queue()   # hash -> langue/score/qualité (best-effort)
         active = [t for t in torrents if t.get("state") in DL_STATES]
         active.sort(key=lambda t: (-(t.get("dlspeed", 0)), -(t.get("progress", 0))))
         if not active:
@@ -242,11 +281,21 @@ class Medias(commands.Cog):
                 pct = prog * 100
                 done = size * prog          # déjà téléchargé
                 left = size - done          # reste à télécharger
+                d = details.get(str(t.get("hash", "")).lower()) or {}
+                extra = ""
+                if d:
+                    langs = "/".join(d["langs"][:3]) or "?"
+                    fr = "🇫🇷" if any(l.lower() == "french" for l in d["langs"]) else "⚠️"
+                    extra = f" · {fr} {langs}"
+                    if d.get("score") is not None:
+                        extra += f" · score {d['score']}"
+                    if d.get("quality"):
+                        extra += f" · {d['quality']}"
                 lines.append(
                     f"`{_bar(pct)}` **{pct:4.1f} %** · {fmt.humanize_bytes(done)} / {fmt.humanize_bytes(size)}"
                     f" · {str(t.get('name','?'))[:42]}\n"
                     f"　↓ {fmt.humanize_rate(t.get('dlspeed', 0))} · ETA {_eta(t.get('eta', 0))}"
-                    f" · reste {fmt.humanize_bytes(left)}")
+                    f" · reste {fmt.humanize_bytes(left)}{extra}")
             desc = "\n".join(lines)
             color = 0x5865F2
         emb = discord.Embed(title=f"📥 Téléchargements ({len(active)} actif{'s' if len(active) != 1 else ''})",
