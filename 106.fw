@@ -32,9 +32,14 @@ OUT ACCEPT -dest 10.3.20.120 -p tcp -dport 8770 -log nolog   # ytgrab (YouTube /
 OUT ACCEPT -dest 10.3.20.122 -p tcp -dport 80 -log nolog     # fronote-dist (API admin whitelist /dist)
 
 # --- IN: live log stream UDP/514 from host, router and the LXC fleet (mgmt subnet) ---
-IN ACCEPT -source 10.3.0.0/16 -p udp -dport 514 -log nolog   # host + CTs + CRS305 forwarders
-IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 22 -log nolog    # admin SSH (mgmt LAN)
-IN ACCEPT -source 10.3.0.0/16 -p tcp -dport 9100 -log nolog  # node_exporter (scrape telegraf hôte)
+# revue securite 19/08 : /16 trop large depuis que CT106 a une patte VLAN20 (eth1).
+# Un /16 exposait SSH + node_exporter + syslog a TOUT le VLAN20. Resserre :
+# - 514 : DEUX /24 (les CTs VLAN20 forwardent leur rsyslog *.warning ici, verifie)
+# - 22 et 9100 : mgmt seul (aucun flux VLAN20 legitime)
+IN ACCEPT -source 10.3.10.0/24 -p udp -dport 514 -log nolog  # syslog : host + CTs mgmt + CRS305
+IN ACCEPT -source 10.3.20.0/24 -p udp -dport 514 -log nolog  # syslog : CTs VLAN20 (*.warning)
+IN ACCEPT -source 10.3.10.0/24 -p tcp -dport 22 -log nolog   # admin SSH (mgmt LAN uniquement)
+IN ACCEPT -source 10.3.10.0/24 -p tcp -dport 9100 -log nolog # node_exporter (scrape telegraf hote)
 # --- IN: statuspage (status.nicov1.fr) — service independant du bot, port 8090 ---
 IN ACCEPT -source 10.3.20.116 -p tcp -dport 8090 -log nolog  # Caddy — status.nicov1.fr (statuspage)
 IN ACCEPT -source 10.3.20.123 -p tcp -dport 8090 -log nolog  # Homepage — widget customapi (statuspage)
