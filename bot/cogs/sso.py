@@ -299,17 +299,23 @@ class Sso(commands.Cog):
         else:
             rows = await self._ct_auth_rows(last)
             if rows:
-                st.set("sso_last_auth_id", rows[-1]["id"])
-                ch = None
-                if cfg.alert_channel_id:
-                    ch = self.bot.get_channel(cfg.alert_channel_id)
-                if ch is not None:
+                ch = await self._alert_channel()
+                if ch is None:
+                    # NE PAS avancer le curseur : salon injoignable = on RÉESSAIE au
+                    # prochain cycle, sinon l'événement (potentiellement un ban) est
+                    # perdu en silence.
+                    log.warning("sso: %d événement(s) en attente, salon d'alertes "
+                                "injoignable — nouvel essai au prochain cycle",
+                                len(rows))
+                else:
                     for level, title, desc in summarize_batch(rows):
                         if level == "ok" and not cfg.sso_login_notify:
                             continue
                         color = {"ban": fmt.RED, "fail": fmt.YELLOW}.get(level, fmt.GREEN)
                         await ch.send(embed=discord.Embed(
                             title=title, description=desc, color=color))
+                        log.info("sso: alerte postée [%s] %s", level, title)
+                    st.set("sso_last_auth_id", rows[-1]["id"])
 
         # -- lien de validation (notification.txt) -----------------------------
         sig = await self._ct_notification_sig()
@@ -329,6 +335,22 @@ class Sso(commands.Cog):
                         "2FA ou reset de mot de passe). Il n'y a pas de SMTP : le "
                         "voici, ne le partage pas.\n"
                         f">>> {content[:1700]}")
+
+    async def _alert_channel(self):
+        """Salon d'alertes, avec repli fetch : au démarrage le cache peut être vide,
+        get_channel rendrait None et les événements seraient jetés (même piège que
+        alerts._channel)."""
+        cid = self.bot.cfg.alert_channel_id
+        if not cid:
+            return None
+        ch = self.bot.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(cid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("sso: salon d'alertes %s injoignable: %s", cid, e)
+                return None
+        return ch
 
     async def _dm_admins(self, text):
         sent = False
