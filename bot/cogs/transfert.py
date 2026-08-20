@@ -168,6 +168,10 @@ def embed_transfert(etat, cfg):
         if etat.get("total"):
             titre += (f" de ~{fmt.humanize_bytes(etat['total'])}" if scan_fini else
                       f" du volume analysé (~{fmt.humanize_bytes(etat['total'])}, provisoire)")
+        elif not scan_fini:
+            # 2026-08-20 : sans total estimé, le % brut de rsync ne porte que sur le
+            # DÉJÀ-analysé — le dire, sinon « X % » se lit comme un % du transfert entier.
+            titre += " du volume analysé (provisoire)"
         emb.add_field(name=titre, value=f"`{barre(pct)}`", inline=False)
         if not scan_fini and cfg.transfert_total_hint:
             emb.add_field(
@@ -393,9 +397,16 @@ class Transfert(commands.Cog):
             await self._publier(ch, embed_transfert(etat, self.cfg))
             garde = self.cfg.transfert_keep_min
             try:
+                # 2026-08-20 : « terminé » seulement si systemd dit success — l'embed
+                # au-dessus fait déjà la distinction, le message final doit la suivre
+                # (un `failed` ou un état inconnu n'est pas un transfert « terminé »).
+                if etat.get("resultat") == "success":
+                    entete = "⏹️ **Transfert terminé** (success)"
+                else:
+                    entete = (f"🔴 **Transfert arrêté** "
+                              f"({etat.get('resultat') or 'état inconnu'})")
                 await ch.send(
-                    f"⏹️ **Transfert terminé** ({etat.get('resultat') or '?'}) — "
-                    f"ce salon temporaire sera supprimé dans "
+                    f"{entete} — ce salon temporaire sera supprimé dans "
                     f"{fmt.humanize_duration(garde * 60)}.",
                     allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:

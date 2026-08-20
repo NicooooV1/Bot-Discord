@@ -34,8 +34,10 @@ RRD_TF = {"1h": ("hour", 3600), "6h": ("day", 6 * 3600), "24h": ("day", 86400),
 
 
 def _scale(series, factor):
+    # None conservé tel quel : matplotlib coupe la ligne sur un trou de collecte —
+    # un `(v or 0)` traçait le trou comme un creux à 0 % (2026-08-20)
     ts, vals = series
-    return ts, [(v or 0) * factor for v in vals]
+    return ts, [(v * factor) if v is not None else None for v in vals]
 
 
 _TZ = {}

@@ -246,7 +246,11 @@ class BackupDeleteView(GatedView):
             outcome = await self.cog.bot.pve.apoll_task(res, timeout=180)
             result = fmt.outcome_text(outcome, "supprimée")
         else:
-            result = "✅ supprimée"
+            # 2026-08-20 : réponse sans UPID = seul l'ENVOI de l'ordre a réussi, rien
+            # n'atteste que la suppression a eu lieu (aucune tâche à suivre) — dire
+            # « ✅ supprimée » était une affirmation. Le verdict réel est dans /backups.
+            result = ("— suppression **demandée** (pas de tâche à suivre), "
+                      "vérifie avec `/backups`")
         await itx.followup.send(f"🗑️ Sauvegarde de **{self.name}** {result}.", ephemeral=True)
         self.stop()
 

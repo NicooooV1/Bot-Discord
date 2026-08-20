@@ -313,6 +313,11 @@ class Servarr(commands.Cog):
             await ch.send(embed=emb, view=self._alert_view)
             self.alerts.set_level(key, level)
         elif not level and prev:
+            # 2026-08-20 : pour la plupart des clés, `desc` est le texte de la PANNE
+            # (fixe) — le republier au présent sous « Résolu » affirmait une panne en
+            # cours. Seules les clés listées calculent une desc de résolution dédiée.
+            if key not in ("servarr_ratio_low", "servarr_c411_stale"):
+                desc = "la condition n'est plus détectée"
             await ch.send(embed=discord.Embed(
                 title=f"✅ Résolu — {title}", description=desc, color=fmt.GREEN))
             self.alerts.clear(key)
@@ -535,7 +540,10 @@ class Servarr(commands.Cog):
             up_to = off["uploaded"] / 1e12
             dl_go = off["downloaded"] / 1e9
         color = fmt.GREEN if ratio >= 1 else (fmt.YELLOW if ratio >= RATIO_WARN * 0.9 else fmt.RED)
-        emb = discord.Embed(title=f"📈 Ratio C411 : {ratio:.2f}", color=color)
+        # 2026-08-20 : hors relève officielle, le chiffre du titre est une estimation
+        # (voire une saisie) — le dire dès le titre, pas seulement dans le footer.
+        emb = discord.Embed(title=f"📈 Ratio C411 : {ratio:.2f}"
+                                  + ("" if official else " (estimé)"), color=color)
         emb.timestamp = discord.utils.utcnow()
         if official:
             # --- valeurs OFFICIELLES lues direct sur C411 (auto, toutes les 15 min) ---
@@ -552,8 +560,22 @@ class Servarr(commands.Cog):
                               value="Ratio sous le seuil — seed davantage", inline=False)
         else:
             # --- repli estimation (relève tracker indispo / cookie expiré) ---
-            suffix = " (estimé)" if live["has_anchor"] else " (manuel)"
-            emb.add_field(name=f"Ratio C411{suffix}",
+            # 2026-08-20 : « (manuel) » sur les chiffres CODÉS EN DUR de DEFAULT_C411
+            # laissait croire à une saisie de Nico. On distingue : jamais saisi (défaut),
+            # saisi avec date (ts posé par /setratio), ancienne saisie sans ts.
+            saisie = self.bot.state.get("c411")
+            if live["has_anchor"]:
+                suffix, detail = " (estimé)", " (estimé)"
+            elif not saisie:
+                suffix = " (défaut)"
+                detail = " (défaut, jamais saisi — lance /setratio)"
+            elif saisie.get("ts"):
+                suffix = " (manuel)"
+                detail = (" (manuel, saisi le "
+                          + time.strftime("%d/%m/%Y", time.localtime(saisie["ts"])) + ")")
+            else:
+                suffix, detail = " (manuel)", " (manuel, date inconnue)"
+            emb.add_field(name=f"Ratio C411{detail}",
                           value=f"**{ratio:.3f}**", inline=False)
             up_bonus = f"\n(dont {c.get('bonus_go', 0):.1f} Go bonus)" if c.get("bonus_go") else ""
             dup = f" (▲ +{fmt.humanize_bytes(live['d_ul'])} depuis /setratio)" if live["d_ul"] >= 1 else ""
@@ -820,8 +842,11 @@ class Servarr(commands.Cog):
         self.bot.state.set("c411_prev", {"ratio": float(old.get("ratio", 0) or 0),
                                          "up_to": float(old.get("up_to", 0) or 0),
                                          "dl_go": float(old.get("dl_go", 0) or 0)})
+        # ts : date de saisie, affichée dans #ratio (« manuel, saisi le … ») — sans lui,
+        # une saisie était indiscernable des défauts codés en dur. 2026-08-20.
         self.bot.state.set("c411", {"ratio": ratio, "up_to": upload_to,
-                                    "dl_go": download_go, "bonus_go": bonus_go})
+                                    "dl_go": download_go, "bonus_go": bonus_go,
+                                    "ts": int(time.time())})
         await self._set_c411_anchor(ratio, upload_to, download_go)   # ré-ancre l'estimation live
         await self._push_c411()   # met à jour la série C411 dans InfluxDB (Grafana) tout de suite
         # rafraîchit le salon #ratio immédiatement
@@ -913,8 +938,11 @@ class RatioRefreshView(GatedView):
         # en rafale rejouait la charge autant de fois (2026-08-11).
         now = time.monotonic()
         if now - self.cog._last_manual_refresh < 10:
+            # 2026-08-20 : on ne sait ici qu'une chose — un clic récent a DEMANDÉ un
+            # rafraîchissement (qui a pu échouer) ; ne pas affirmer « déjà à jour ».
             await itx.response.send_message(
-                "⏱️ Déjà à jour (rafraîchi il y a moins de 10 s).", ephemeral=True)
+                "⏱️ Rafraîchissement demandé il y a moins de 10 s — patiente un instant.",
+                ephemeral=True)
             return
         self.cog._last_manual_refresh = now
         await itx.response.defer()
@@ -1020,7 +1048,7 @@ class TorrentsView(GatedView):
         self.selected = list(self.select.values)
         await itx.response.defer()
 
-    async def _apply(self, itx, action, verbe):
+    async def _apply(self, itx, action, verbe, annonce):
         if not self.selected:
             await itx.followup.send("Sélectionne d'abord un torrent.", ephemeral=True)
             return
@@ -1028,22 +1056,26 @@ class TorrentsView(GatedView):
         if not ok:
             await itx.followup.send("⚠️ qBittorrent a refusé l'action.", ephemeral=True)
             return
-        log.info("%d torrent(s) %s par %s", len(self.selected), verbe, itx.user.display_name)
+        log.info("%d torrent(s) : %s demandé(e) par %s", len(self.selected), verbe,
+                 itx.user.display_name)
         n = len(self.selected)
         await asyncio.sleep(1)          # laisse qBit appliquer avant de relire
-        await itx.followup.send(f"✅ {n} torrent(s) {verbe} par **{itx.user.display_name}**.",
+        # 2026-08-20 : qBittorrent répond 200 même sur un hash inconnu — le 200 ne
+        # prouve que la PRISE EN COMPTE de la demande, pas l'état final des torrents.
+        await itx.followup.send(f"{annonce} pour {n} torrent(s) (par "
+                                f"**{itx.user.display_name}**) — état réel dans le panneau.",
                                 ephemeral=True)
         await self._repaint(itx)
 
     @discord.ui.button(label="Mettre en pause", emoji="⏸️", style=discord.ButtonStyle.secondary, row=1)
     async def pause(self, itx: discord.Interaction, _b: discord.ui.Button):
         await itx.response.defer()
-        await self._apply(itx, "stop", "mis en pause")
+        await self._apply(itx, "stop", "pause", "⏸️ Pause demandée")
 
     @discord.ui.button(label="Reprendre", emoji="▶️", style=discord.ButtonStyle.success, row=1)
     async def resume(self, itx: discord.Interaction, _b: discord.ui.Button):
         await itx.response.defer()
-        await self._apply(itx, "start", "repris")
+        await self._apply(itx, "start", "reprise", "▶️ Reprise demandée")
 
     @discord.ui.button(label="Rafraîchir", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
     async def refresh(self, itx: discord.Interaction, _b: discord.ui.Button):

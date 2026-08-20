@@ -193,7 +193,11 @@ class Logs(commands.Cog):
         arr = await asyncio.to_thread(self.bot.pve.journal, n)
         lines, _ = split_journal(arr)
         matched = [x for x in lines if unit.lower() in str(x).lower()]
-        content, file = journal_response(matched[-80:], f"logs « {unit} » ({len(matched)} lignes)")
+        # au-delà de 80 correspondances on n'affiche que la fin : le dire, sinon le
+        # compte fait croire que tout est là (2026-08-20)
+        count = (f"{len(matched)} lignes, 80 dernières affichées" if len(matched) > 80
+                 else f"{len(matched)} lignes")
+        content, file = journal_response(matched[-80:], f"logs « {unit} » ({count})")
         if file:
             await itx.followup.send(content=None, file=file)
         else:
@@ -243,9 +247,14 @@ class Logs(commands.Cog):
             status, flag = _task_state(t)
             who = t.get("id") or t.get("vmid") or "-"
             lines.append(f"{flag} `{t.get('type')}` {who} — {status}")
-        emb = discord.Embed(title="🗂️ Tâches PVE",
-                            description="\n".join(lines)[:4000] or "Aucune tâche.",
-                            color=fmt.BLURPLE)
+        # troncatures annoncées (limite API 50 tâches, plafond embed 4096) : une coupe
+        # muette ferait passer la liste pour complète (2026-08-20)
+        desc = "\n".join(lines) or "Aucune tâche."
+        if len(rows) >= 50:
+            desc += "\n… liste tronquée (limite 50 tâches)"
+        if len(desc) > 4000:
+            desc = desc[:3970] + "\n… liste tronquée"
+        emb = discord.Embed(title="🗂️ Tâches PVE", description=desc, color=fmt.BLURPLE)
         await itx.followup.send(embed=emb)
 
     # ----- /logstream admin group (runtime control of the live UDP stream) -----

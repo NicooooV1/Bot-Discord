@@ -15,14 +15,16 @@ def sysinfo_fields(emb, d):
     if "node_load1" in d:
         emb.add_field(name="Load",
                       value=f"{d.get('node_load1', 0):.2f} / {d.get('node_load5', 0):.2f} / {d.get('node_load15', 0):.2f}")
+    # 2026-08-20 : Available/Free absents ≠ zéro libre — un `or 0` affichait une RAM
+    # « 100 % » fabriquée sur un simple trou de collecte.
     mt, ma = d.get("node_memory_MemTotal_bytes"), d.get("node_memory_MemAvailable_bytes")
     if mt:
-        used = mt - (ma or 0)
-        emb.add_field(name="RAM (réelle)", value=fmt.pct_of(used, mt))
+        emb.add_field(name="RAM (réelle)",
+                      value=fmt.pct_of(mt - ma, mt) if ma is not None else "utilisation inconnue")
     st, sf = d.get("node_memory_SwapTotal_bytes"), d.get("node_memory_SwapFree_bytes")
     if st:
-        su = st - (sf or 0)
-        emb.add_field(name="Swap", value=fmt.pct_of(su, st))
+        emb.add_field(name="Swap",
+                      value=fmt.pct_of(st - sf, st) if sf is not None else "utilisation inconnue")
     if "node_procs_running" in d:
         emb.add_field(name="Procs",
                       value=f"running {int(d.get('node_procs_running', 0))} · blocked {int(d.get('node_procs_blocked', 0))}")

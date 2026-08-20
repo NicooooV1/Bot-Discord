@@ -501,7 +501,10 @@ class Requests(commands.Cog):
                     self._props_pop(pid)
             if action == "approve":
                 e.color = 0x2ECC71
-                e.set_footer(text=f"✅ approuvé par {itx.user.display_name} — téléchargement lancé")
+                # 2026-08-20 : seul le 200 Seerr est vérifié ici — Radarr/Sonarr peuvent
+                # ne trouver aucune release, donc ne pas affirmer « téléchargement lancé ».
+                e.set_footer(text=f"✅ approuvé par {itx.user.display_name} — transmis à "
+                                  f"Seerr (téléchargement dès qu'une release est trouvée)")
             else:
                 e.color = 0xE74C3C
                 e.set_footer(text=f"✖️ refusé par {itx.user.display_name}")

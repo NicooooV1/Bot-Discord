@@ -801,7 +801,14 @@ class Terminal(commands.Cog):
                 st = await self.bot.pve.aguest_status(vmid, "lxc")
             except Exception:
                 log.debug("terminal %s: statut LXC illisible", name, exc_info=True)
-                st = {}
+                st = None
+            if st is None:
+                # 2026-08-20 : l'exception avalée (st={}) faisait affirmer « n'est pas
+                # démarré » sur un conteneur dont le statut n'a PAS pu être lu — ce
+                # message-là est réservé à un statut réellement lu.
+                await itx.followup.send(
+                    f"❌ Statut de **{name}** illisible (PVE) — réessaie.", ephemeral=True)
+                return
             if st.get("status") != "running":
                 await itx.followup.send(f"**{name}** n'est pas démarré.", ephemeral=True)
                 return

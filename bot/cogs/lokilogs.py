@@ -47,6 +47,14 @@ def restricted_reason(cfg, itx, requete="", host=""):
     return None
 
 
+def _count_label(rows, limit=100):
+    """« N lignes », ou l'annonce de la coupe quand query_range a plafonné (limit=100
+    côté core/loki) : « 100 lignes » sans mention laissait croire à une liste complète
+    (2026-08-20)."""
+    n = len(rows)
+    return f"{n} lignes — limite atteinte, tronqué" if n >= limit else f"{n} lignes"
+
+
 def _fmt_lines(rows):
     out = []
     for ts, labels, line in rows:
@@ -105,7 +113,7 @@ class LokiLogs(commands.Cog):
                             contains or requete or None)
         rows = await self.bot.loki.query_range(q, minutes)
         label = plage.name if plage else "1 h"
-        header = f"logsearch · {q[:120]} · {label} ({len(rows)} lignes)"
+        header = f"logsearch · {q[:120]} · {label} ({_count_label(rows)})"
         await self._reply(itx, rows, header)
 
     @app_commands.command(description="Logs d'un conteneur via Loki (host = nom du CT).")
@@ -128,7 +136,7 @@ class LokiLogs(commands.Cog):
         q = build_logql(ct, unit or None, level.value if level else None)
         rows = await self.bot.loki.query_range(q, minutes)
         label = plage.name if plage else "1 h"
-        header = f"ctlogs · {ct} · {label} ({len(rows)} lignes)"
+        header = f"ctlogs · {ct} · {label} ({_count_label(rows)})"
         await self._reply(itx, rows, header)
 
     @app_commands.command(description="Erreurs récentes d'un conteneur (Loki).")
@@ -154,7 +162,7 @@ class LokiLogs(commands.Cog):
             rows = await self.bot.loki.query_range(q, minutes)
             note = " · repli texte \"error\""
         label = plage.name if plage else "1 h"
-        header = f"apperrors · {ct} · {label} ({len(rows)} lignes){note}"
+        header = f"apperrors · {ct} · {label} ({_count_label(rows)}){note}"
         await self._reply(itx, rows, header)
 
 

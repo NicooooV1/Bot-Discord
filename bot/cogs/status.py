@@ -104,6 +104,8 @@ class Status(commands.Cog):
             top = "\n".join(f"🟢 **{c['name']}** {c['cpu_pct']:.0f}% CPU · "
                             f"RAM {fmt.pct_of(c['mem'], c['maxmem'])}"
                             for c in up[:3]) or "—"
+            if len(up) > 3:      # liste tronquée : le dire (2026-08-20)
+                top += f"\n… + {len(up) - 3} autres"
             # ct_table() ne lit que le bucket « Proxmox » : les invités Aveyron sont
             # écrits par avy_metrics dans leur propre bucket et ne comptent PAS ici.
             # On le dit dans le libellé plutôt que d'annoncer un parc faux (2026-08-11).
@@ -113,6 +115,8 @@ class Status(commands.Cog):
             st_txt = "\n".join(f"`{s['name']}` {s['pct']:.0f}% "
                                f"({fmt.humanize_bytes(s['used'])}/{fmt.humanize_bytes(s['total'])})"
                                for s in st[:4]) or "—"
+            if len(st) > 4:      # liste tronquée : le dire (2026-08-20)
+                st_txt += f"\n… + {len(st) - 4} autres"
             emb.add_field(name="Stockage", value=st_txt[:FIELD_MAX], inline=False)
 
             if ctrl:
@@ -123,10 +127,19 @@ class Status(commands.Cog):
                 emb.add_field(name="RAID", value=f"VD {vd} · BBU {bbu} · disques {disks}", inline=True)
 
             if bs:
+                # champ absent = « ? » et pas 0 : même règle que /health (2026-08-20)
+                nob = bs.get("guests_without_backup")
                 emb.add_field(name="Sauvegardes",
                               value=f"+ancienne: {fmt.humanize_duration(bs.get('oldest_age_seconds'))}\n"
-                                    f"sans backup: {int(bs.get('guests_without_backup', 0))}",
+                                    f"sans backup: {int(nob) if nob is not None else '?'}",
                               inline=True)
+
+            # même avertissement que /health : « aucune donnée » et « Influx en panne »
+            # rendent les mêmes listes vides — ne pas les présenter comme fraîches (2026-08-20)
+            if getattr(bot.influx, "blind", False):
+                emb.add_field(name="⚠️ InfluxDB",
+                              value="dernière requête Flux en échec — métriques "
+                                    "ci-dessus possiblement périmées", inline=False)
         await itx.followup.send(embed=emb)
 
     @app_commands.command(description="Bilan de santé consolidé (services, hôte, RAID, SMART, température, backups, alertes).")
@@ -140,16 +153,37 @@ class Status(commands.Cog):
             """État d'un service, ou None quand il n'est pas configuré (➖)."""
             return await asyncio.to_thread(fn) if enabled else None
 
-        pve_ok, influx_ok = await asyncio.gather(
+        async def loki_ready():
+            """Sonde RÉELLE de Loki (GET /ready, timeout court). `loki.enabled` ne dit
+            que « une URL est configurée » : la ligne Loki de /health ne pouvait donc
+            JAMAIS passer au ❌, même service éteint (2026-08-20). None = non configuré."""
+            loki = bot.loki
+            if not loki.enabled:
+                return None
+            try:
+                import aiohttp
+                sess = await loki._sess()
+                async with sess.get(loki.url + "/ready",
+                                    timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    return resp.status == 200
+            except Exception as e:  # noqa: BLE001 — injoignable = ❌, pas un plantage
+                log.debug("/health : sonde Loki en échec (%s)", e)
+                return False
+
+        pve_ok, influx_ok, loki_ok = await asyncio.gather(
             probe(bot.pve.enabled, bot.pve.reachable),
-            probe(bot.influx.enabled, bot.influx.health))
+            probe(bot.influx.enabled, bot.influx.health),
+            loki_ready())
 
         def svc(name, ok):
             return f"{name} " + ("✅" if ok else ("❌" if ok is False else "➖"))
 
-        rows.append(("crit" if (pve_ok is False or influx_ok is False) else "ok", "Services",
+        # Loki en panne = warn (les logs manquent), PVE/Influx en panne = crit
+        svc_lvl = ("crit" if (pve_ok is False or influx_ok is False)
+                   else ("warn" if loki_ok is False else "ok"))
+        rows.append((svc_lvl, "Services",
                      " · ".join([svc("PVE", pve_ok), svc("Influx", influx_ok),
-                                 svc("Loki", bot.loki.enabled or None)])))
+                                 svc("Loki", loki_ok)])))
 
         if bot.influx.enabled:
             # Les 10 lectures Flux ci-dessous sont indépendantes : les grouper ramène le
@@ -251,14 +285,18 @@ class Status(commands.Cog):
 
             if bs:
                 age = bs.get("oldest_age_seconds")
-                nob = int(bs.get("guests_without_backup", 0))
+                # champ absent = INCONNU (« ? »), pas 0 : « sans backup 0 » affirmait
+                # une couverture jamais mesurée (2026-08-20)
+                nob = bs.get("guests_without_backup")
+                nob = int(nob) if nob is not None else None
                 bl = "ok"
                 if age is not None and age >= 180000:
                     bl = "crit"
-                elif nob > 0 or (age is not None and age >= 108000):
+                elif (nob or 0) > 0 or (age is not None and age >= 108000):
                     bl = "warn"
                 rows.append((bl, "Sauvegardes",
-                             f"+ancienne {fmt.humanize_duration(age)} · sans backup {nob}"))
+                             f"+ancienne {fmt.humanize_duration(age)} · "
+                             f"sans backup {nob if nob is not None else '?'}"))
 
             # « Aucune donnée » et « InfluxDB en panne » se ressemblent trait pour trait
             # dans les lignes ci-dessus (les requêtes renvoient [] dans les deux cas) :
@@ -359,8 +397,11 @@ class Status(commands.Cog):
         if getattr(bot.pve, "avy_enabled", False):
             avy = bot.get_cog("Avy")
             ms = (avy._cluster or {}).get("ping_ms") if avy else None
+            # valeur lue du CACHE du cycle Aveyron, pas sondée à l'instant comme les
+            # autres lignes : dire son âge plutôt que la présenter comme live (2026-08-20)
             emb.add_field(name="Proxmox API (Aveyron, tunnel WG)",
-                          value=f"{ms:.0f} ms" if ms is not None else "➖")
+                          value=(f"{ms:.0f} ms (dernier cycle, ≤ 5 min)"
+                                 if ms is not None else "➖"))
         await itx.followup.send(embed=emb)
 
     @app_commands.command(description="Détail de l'hôte Proxmox.")

@@ -132,24 +132,33 @@ class Alerts(commands.Cog):
             dp = tp.get("data_percent")
             if dp is None:
                 du, pb = tp.get("data_used_bytes"), tp.get("pool_bytes")
-                dp = (du / pb * 100) if (du and pb) else 0.0
-            dp = float(dp)
-            level = "crit" if dp >= 90 else ("warn" if dp >= 85 else None)
-            out.append(("thinpool_usage", level, "🗄️ Thinpool presque plein",
-                        f"local-lvm usage réel **{dp:.0f}%** (un pool plein corrompt les volumes)"))
+                dp = (du / pb * 100) if (du and pb) else None
+            if dp is None:
+                # 2026-08-20 : les deux sources manquent — un 0.0 fabriqué comptait le
+                # thinpool « au vert » sur une collecte morte. Inconnu ≠ nominal.
+                out.append(("thinpool_usage", "warn", "🗄️ Thinpool — usage réel inconnu",
+                            "local-lvm : métrique absente d'Influx, remplissage inévaluable"))
+            else:
+                dp = float(dp)
+                level = "crit" if dp >= 90 else ("warn" if dp >= 85 else None)
+                out.append(("thinpool_usage", level, "🗄️ Thinpool presque plein",
+                            f"local-lvm usage réel **{dp:.0f}%** (un pool plein corrompt les volumes)"))
 
         if bs:
             age = bs.get("oldest_age_seconds")
-            nob = int(bs.get("guests_without_backup", 0))
+            # clé absente ≠ zéro invité sans backup : on affiche « ? » (2026-08-20)
+            nob = bs.get("guests_without_backup")
+            nob = int(nob) if nob is not None else None
             level = None
-            if nob > 0:
+            if nob is not None and nob > 0:
                 level = "warn"
             if age is not None and age >= 180000:            # 50 h
                 level = "crit"
             elif age is not None and age >= 108000 and level != "crit":  # 30 h
                 level = "warn"
             out.append(("backup_age", level, "🛟 Sauvegardes en retard",
-                        f"plus ancienne: {fmt.humanize_duration(age)} · sans backup: {nob}"))
+                        f"plus ancienne: {fmt.humanize_duration(age)} · "
+                        f"sans backup: {nob if nob is not None else '?'}"))
 
         if ctrl:
             offline = [d.get("slot") for d in disks if not d.get("online")]
@@ -233,6 +242,13 @@ class Alerts(commands.Cog):
     # tout doublon. La commande /alerts continue d'évaluer TOUT (via _evaluate).
     OWNED_KEYS = {"ipmi_temp"}
 
+    #: Contrôles que `_evaluate` est CENSÉ produire. Un contrôle dont la requête Influx
+    #: rend [] disparaît de findings : c'est de l'INCONNU, pas du vert — /alerts s'en
+    #: sert pour nommer ce qui n'a pas pu être évalué (2026-08-20).
+    EXPECTED_CHECKS = {"thinpool_usage": "thinpool", "backup_age": "sauvegardes",
+                       "raid_health": "RAID", "smart_fail": "SMART",
+                       "ipmi_temp": "température IPMI"}
+
     #: Clés que la boucle a POSSÉDÉES par le passé et n'émet plus : elles resteraient
     #: sinon persistées « crit » à vie dans state.json. Depuis le cloisonnement, la purge
     #: de démarrage se fait sur « pas dans OWNED_KEYS » (sûre : l'espace n'est qu'à nous) ;
@@ -302,7 +318,14 @@ class Alerts(commands.Cog):
                               inline=False)
         else:
             watched = ", ".join(t for _, _, t, _ in findings) or "—"
-            emb.description = f"Tous les indicateurs surveillés sont au vert.\n{watched}"[:4096]
+            seen = {k for k, _, _, _ in findings}
+            missing = [n for k, n in self.EXPECTED_CHECKS.items() if k not in seen]
+            if missing:
+                emb.description = (f"Aucune alerte active sur les indicateurs évalués : {watched}.\n"
+                                   f"➖ Non évalués (pas de données) : {', '.join(missing)}.")[:4096]
+                emb.color = fmt.YELLOW   # de l'inconnu n'est pas du vert
+            else:
+                emb.description = f"Tous les indicateurs surveillés sont au vert.\n{watched}"[:4096]
         # Un ✅ vert alors qu'InfluxDB ne répond plus est un feu vert MENSONGER : toutes
         # les requêtes renvoient [] et chaque contrôle se tait. Le drapeau vient de
         # core/influx (getattr : on ne dépend pas de sa présence).

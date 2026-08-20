@@ -174,6 +174,11 @@ class NodeChannel(commands.Cog):
                           value=f"🟢 **{g['running']}** / {g['total']} démarrés · "
                                 f"{g['lxc']} LXC · {g['qemu']} VM")
 
+        # Blocs Influx attendus mais restés vides ce cycle : un bloc en échec de
+        # collecte disparaissait en silence et l'embed ressemblait à un embed sain —
+        # « pas de données » n'est pas « rien à signaler » (2026-08-20).
+        manquants = []
+
         # ---- stockages (Influx)
         stors = await self._influx(self.bot.influx.storages, [])
         if stors:
@@ -185,7 +190,11 @@ class NodeChannel(commands.Cog):
                 lines.append(f"{mark} `{s.get('name')}` {pct:.0f} % · "
                              f"{fmt.humanize_bytes(s.get('used'))} / "
                              f"{fmt.humanize_bytes(s.get('total'))}")
+            if len(stors) > 6:   # liste tronquée : le dire (2026-08-20)
+                lines.append(f"… + {len(stors) - 6} autres")
             emb.add_field(name="Stockages", value="\n".join(lines)[:1024], inline=False)
+        else:
+            manquants.append("Stockages")
 
         # ---- matériel (Influx) : températures / ventilateurs / conso
         temps = await self._influx(self.bot.influx.ipmi_temps, [])
@@ -205,12 +214,16 @@ class NodeChannel(commands.Cog):
             # l'embed jaune en permanence, et une couleur toujours jaune ne signale plus
             # rien. Les marqueurs ⚠️/🔥 restent (même convention que /temps) et une vraie
             # surchauffe est déjà couverte par l'alerte ipmi_temp du cog alerts.
+        else:
+            manquants.append("Températures")
 
         fans = await self._influx(self.bot.influx.ipmi_fans, [])
         fans = [_f(v) for _, v in (fans or []) if _f(v) is not None]
         if fans:
             emb.add_field(name="Ventilateurs",
                           value=f"{len(fans)} · {min(fans):.0f}–{max(fans):.0f} RPM")
+        else:
+            manquants.append("Ventilateurs")
 
         power = await self._influx(self.bot.influx.ipmi_power, [])
         power = [_f(v) for _, v in (power or []) if _f(v) is not None]
@@ -222,6 +235,8 @@ class NodeChannel(commands.Cog):
                 if eur:
                     val += f" · ~{eur:.0f} €/mois"
             emb.add_field(name="Consommation", value=val)
+        else:
+            manquants.append("Consommation")
 
         # ---- RAID / SMART (Influx)
         raid = await self._influx(self.bot.influx.raid, (None, None))
@@ -237,6 +252,8 @@ class NodeChannel(commands.Cog):
                 bits.append(f"{int(_f(summ.get('disks_online')) or 0)}/"
                             f"{int(_f(summ.get('disks_total')) or 0)} disques online")
             emb.add_field(name="RAID (PERC H710)", value=" · ".join(bits), inline=False)
+        else:
+            manquants.append("RAID")
 
         health = await self._influx(self.bot.influx.smart_health, [])
         if health:
@@ -250,6 +267,8 @@ class NodeChannel(commands.Cog):
             if bad:
                 worst = max(worst, 95)
             emb.add_field(name="SMART", value=txt[:1024], inline=False)
+        else:
+            manquants.append("SMART")
 
         # ---- sauvegardes (Influx)
         bs = await self._influx(self.bot.influx.backup_summary, None)
@@ -258,8 +277,15 @@ class NodeChannel(commands.Cog):
             oa = _f(bs.get("oldest_age_seconds"))
             if oa is not None:
                 bits.append(f"plus ancienne : {fmt.humanize_duration(oa)}")
-            gwb = int(_f(bs.get("guests_without_backup")) or 0)
-            bits.append(f"⚠️ {gwb} VM/conteneur(s) sans sauvegarde" if gwb else "✅ tous sauvegardés")
+            # champ absent = INCONNU : « ✅ tous sauvegardés » n'est affirmé que sur une
+            # valeur réellement mesurée à 0, jamais par défaut (2026-08-20)
+            gwb = _f(bs.get("guests_without_backup"))
+            if gwb is None:
+                bits.append("sans sauvegarde : ?")
+            elif int(gwb):
+                bits.append(f"⚠️ {int(gwb)} VM/conteneur(s) sans sauvegarde")
+            else:
+                bits.append("✅ tous sauvegardés")
             df = _f(bs.get("dedup_factor"))
             if df:
                 bits.append(f"dédup ×{df:.1f}")
@@ -267,6 +293,14 @@ class NodeChannel(commands.Cog):
             if ru and dt:
                 bits.append(f"datastore {fmt.pct_of(ru, dt)}")
             emb.add_field(name="Sauvegardes (PBS)", value=" · ".join(bits)[:1024], inline=False)
+        else:
+            manquants.append("Sauvegardes (PBS)")
+
+        if self.bot.influx.enabled and manquants:
+            emb.add_field(name="⚠️ Blocs sans données ce cycle",
+                          value=", ".join(manquants)[:1024] + " — échec de collecte "
+                                "possible, absence ≠ zéro",
+                          inline=False)
 
         # ---- noyau. Pas de compteur de mises à jour APT : GET /nodes/{node}/apt/update
         # exige Sys.Modify (vérifié : 403 avec le token PVEAuditor du bot), une permission

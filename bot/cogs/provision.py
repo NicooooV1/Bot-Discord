@@ -1195,6 +1195,13 @@ class TopicalRefreshView(GatedView):
             await itx.message.edit(embed=emb, view=self)
         except discord.HTTPException:
             log.warning("bouton Rafraîchir : édition du message %s refusée", itx.message.id)
+            # 2026-08-20 : après defer(), une édition refusée était un silence total —
+            # le clic SEMBLAIT avoir marché alors que l'embed n'a pas bougé. Le dire.
+            try:
+                await itx.followup.send(
+                    "❌ Rafraîchissement impossible (édition refusée).", ephemeral=True)
+            except discord.HTTPException:
+                pass
             return
         # baselines de delta avancées seulement après une édition confirmée (#21)
         for k, v in (pending or {}).items():

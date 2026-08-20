@@ -43,10 +43,16 @@ async def emb_materiel(bot, h=None):
     pending = {}          # baselines de delta à persister APRÈS écriture réussie (#21)
     emb = discord.Embed(title="🔧 Matériel", color=fmt.BLURPLE)
     emb.timestamp = discord.utils.utcnow()
+    # 2026-08-20 : les sources attendues mais VIDES ce cycle sont listées en pied de
+    # page — avant, une section absente disparaissait en silence et l'embed restait
+    # bleu frais (une panne du collecteur ressemblait à un matériel sans histoire).
+    muettes = []
     power = await inf.ipmi_power()
     if power:
         emb.add_field(name="Alimentation (W)",
                       value="\n".join(f"{n}: {(v or 0):.0f}" for n, v in power)[:1024] or "—")
+    else:
+        muettes.append("alimentation")
     pc = await inf.power_cost()
     if pc:
         try:
@@ -64,6 +70,8 @@ async def emb_materiel(bot, h=None):
     if fans:
         emb.add_field(name="Ventilateurs (RPM)",
                       value="\n".join(f"{n}: {int(v or 0)}" for n, v in fans[:12])[:1024] or "—")
+    else:
+        muettes.append("ventilateurs")
     temps = [(n, v) for n, v in (await inf.ipmi_temps() or []) if v is not None]
     if temps:
         mx = max(v for _, v in temps)
@@ -76,17 +84,27 @@ async def emb_materiel(bot, h=None):
                       value=f"{mx:.0f}°C{_pdelta(mx, _p, '°C')} · seuils ⚠️≥40 / 🔥≥60",
                       inline=False)
         pending["prov_prev_mat_temp"] = mx
+    else:
+        muettes.append("températures")
     ctrl, summ = await inf.raid()
     if summ:
         disks = await inf.raid_disks()
         gd = max((int(d.get("grown_defects", 0) or 0) for d in disks), default=0)
+        # 2026-08-20 : `ctrl` absent = l'état du contrôleur n'a PAS été lu. Avant, le
+        # texte affichait « ⚠️ dégradé » (alors que la couleur, elle, ne passait rouge
+        # que sur un ctrl présent) — on ne dit ni dégradé ni optimal, on dit inconnu.
+        if ctrl:
+            etat = " · optimal ✅" if ctrl.get("vd_optimal") else " · ⚠️ dégradé"
+        else:
+            etat = " · état contrôleur inconnu"
         emb.add_field(
             name="RAID",
             value=(f"{int(summ.get('disks_online', 0))}/{int(summ.get('disks_total', 0))} online"
-                   + (" · optimal ✅" if (ctrl or {}).get("vd_optimal") else " · ⚠️ dégradé")
-                   + f" · grown max {gd}"))
+                   + etat + f" · grown max {gd}"))
         if ctrl and not ctrl.get("vd_optimal"):
             emb.color = fmt.RED
+    else:
+        muettes.append("RAID")
     health = await inf.smart_health()
     if health:
         bad = [d for d, h in health if not bool(h)]
@@ -95,7 +113,10 @@ async def emb_materiel(bot, h=None):
                              + (f" · ❌ {bad}" if bad else " ✅"))[:1024])
         if bad:
             emb.color = fmt.RED
-    emb.set_footer(text="rafraîchi")
+    else:
+        muettes.append("SMART")
+    emb.set_footer(text=("sources sans données ce cycle : " + ", ".join(muettes) + " · rafraîchi")
+                   if muettes else "rafraîchi")
     return emb, pending
 
 
@@ -143,6 +164,11 @@ async def emb_sauvegardes(bot, h=None):
             lines.append(f"{flag} **{name}** — {fmt.humanize_duration(age)}{szs}")
     if lines:
         emb.add_field(name="Par guest", value="\n".join(lines)[:1024], inline=False)
+    if not summ and not lines:
+        # 2026-08-20 : Influx muet ≠ sauvegardes saines — l'embed sortait VERT et quasi
+        # vide quand la collecte était en panne. Gris + le dire, jamais un feu vert.
+        emb.description = "⚠️ Aucune mesure de sauvegarde depuis 2 h (collecte en panne ?)"
+        emb.color = fmt.GREY
     emb.set_footer(text="rafraîchi")
     return emb, pending
 
@@ -679,8 +705,15 @@ async def emb_services(bot, h=None):
         down += 0 if ok else 1
     if down:
         color = fmt.RED
-    emb.description = (f"⚠️ **{down} service(s) KO**" if down
-                       else "✅ Tous les services répondent")
+    if not rows:
+        # 2026-08-20 : zéro sonde ≠ zéro panne. Un service_health() vide (collecteur en
+        # panne) sortait « ✅ Tous les services répondent » en vert, sans un seul
+        # service listé — le feu vert le plus mensonger du bot. Gris + le dire.
+        emb.description = "⚠️ Aucune donnée de sonde (collecteur muet ?)"
+        color = fmt.GREY
+    else:
+        emb.description = (f"⚠️ **{down} service(s) KO**" if down
+                           else "✅ Tous les services répondent")
     if body:
         emb.add_field(name="Services", value="\n".join(body)[:1024], inline=False)
     emb.color = color

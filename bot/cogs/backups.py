@@ -95,6 +95,13 @@ class Backups(commands.Cog):
                 # tri par CRITICITÉ avant la coupe : sinon les ❌ (les seules lignes qui
                 # justifient l'embed rouge) sont les premières à disparaître.
                 emb.add_field(name="Par conteneur", value=_fit_field(lines), inline=False)
+            if not summ and not lines:
+                # 2026-08-20 : Influx configuré mais MUET ≠ sauvegardes saines — la
+                # couleur GREEN d'office rendait un embed vert quasi vide quand la
+                # collecte était en panne. Gris + le dire, jamais un feu vert.
+                emb.description = ("⚠️ Aucune mesure de sauvegarde depuis 2 h "
+                                   "(collecte en panne ?)")
+                emb.color = fmt.GREY
         else:
             emb.description = "⚠️ InfluxDB non configuré (`INFLUX_TOKEN`)."
         if bot.pve.enabled:

@@ -40,19 +40,25 @@ class Hardware(commands.Cog):
         emb = discord.Embed(title="🧱 RAID — PERC H710")
         color = fmt.GREEN  # track severity as an int (never compare a Colour to an int)
         if ctrl:
-            vd = "optimal ✅" if ctrl.get("vd_optimal") else "⚠️ DÉGRADÉ"
-            bbu = "ok ✅" if ctrl.get("batt_good") else "⚠️ KO"
+            # 2026-08-20 : champ ABSENT ≠ champ FAUX. Un None affiché « ⚠️ KO » (ou un
+            # 0/0 fabriqué) transforme un trou de collecte en panne — on dit « ? » et
+            # on réserve DÉGRADÉ/KO (et le rouge) à une valeur explicitement fausse.
+            vd_raw, batt_raw = ctrl.get("vd_optimal"), ctrl.get("batt_good")
+            vd = ("? (pas de donnée)" if vd_raw is None
+                  else "optimal ✅" if vd_raw else "⚠️ DÉGRADÉ")
+            bbu = ("? (pas de donnée)" if batt_raw is None
+                   else "ok ✅" if batt_raw else "⚠️ KO")
             line = f"VD: {vd}\nBBU: {bbu}"
             if ctrl.get("rebuild_percent"):
                 line += f"\nrebuild: {ctrl['rebuild_percent']}%"
             emb.add_field(name="Contrôleur", value=line, inline=True)
-            if not ctrl.get("vd_optimal") or not ctrl.get("batt_good"):
+            if (vd_raw is not None and not vd_raw) or (batt_raw is not None and not batt_raw):
                 color = fmt.RED
-        if summ:
+        if summ and summ.get("disks_online") is not None and summ.get("disks_total") is not None:
             # valeurs Influx en float : int(None) lèverait, int("4") passerait
             emb.add_field(name="Disques",
-                          value=f"{int(float(summ.get('disks_online') or 0))}/"
-                                f"{int(float(summ.get('disks_total') or 0))} online",
+                          value=f"{int(float(summ.get('disks_online')))}/"
+                                f"{int(float(summ.get('disks_total')))} online",
                           inline=True)
         if disks:
             lines, worst, offline_slots = [], 0, []
@@ -116,15 +122,21 @@ class Hardware(commands.Cog):
         power = await self.bot.influx.ipmi_power()
         temps = await self.bot.influx.ipmi_temps()
         emb = discord.Embed(title="🔧 IPMI", color=fmt.BLURPLE)
+        # 2026-08-20 : capteur muet (None) affiché « ? », jamais 0 — « Fan1: 0 » est
+        # indiscernable d'un ventilateur à l'arrêt, et « 0°C »/« 0 W » sont des
+        # lectures rassurantes FABRIQUÉES sur un trou de collecte.
         if fans:
             emb.add_field(name="Ventilateurs (RPM)",
-                          value="\n".join(f"{n}: {int(v or 0)}" for n, v in fans[:12])[:1024], inline=True)
+                          value="\n".join(f"{n}: {int(v)}" if v is not None else f"{n}: ?"
+                                          for n, v in fans[:12])[:1024], inline=True)
         if power:
             emb.add_field(name="Alimentation (W)",
-                          value="\n".join(f"{n}: {(v or 0):.0f}" for n, v in power)[:1024], inline=True)
+                          value="\n".join(f"{n}: {v:.0f}" if v is not None else f"{n}: ?"
+                                          for n, v in power)[:1024], inline=True)
         if temps:
             emb.add_field(name="Températures (°C, seuils 45/60)",
-                          value="\n".join(f"{n}: {(v or 0):.0f}{_temp_flag(v)}"
+                          value="\n".join(f"{n}: {v:.0f}{_temp_flag(v)}" if v is not None
+                                          else f"{n}: ?"
                                           for n, v in temps[:12])[:1024], inline=False)
         if not (fans or power or temps):
             emb.description = "Aucune donnée IPMI."

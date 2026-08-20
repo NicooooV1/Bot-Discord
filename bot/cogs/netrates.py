@@ -49,9 +49,12 @@ def _fit(lines, budget=1024):
 
 
 def _fmt_pair(avg, mx):
-    """« 1,2 Mo/s (pic 8,4 Mo/s) », ou juste la moyenne si le pic n'apporte rien."""
-    a = fmt.humanize_rate(avg or 0)
-    if (mx or 0) > (avg or 0) * 1.2:
+    """« 1,2 Mo/s (pic 8,4 Mo/s) », ou juste la moyenne si le pic n'apporte rien.
+    Moyenne absente (None) = « ? », pas un 0 fabriqué (2026-08-20)."""
+    if avg is None:
+        return "?"
+    a = fmt.humanize_rate(avg)
+    if (mx or 0) > avg * 1.2:
         return f"{a} (pic {fmt.humanize_rate(mx)})"
     return a
 

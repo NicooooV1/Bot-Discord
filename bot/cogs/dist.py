@@ -382,8 +382,13 @@ class Dist(commands.Cog):
         if inst.get("healthy") == 0:
             return "warn", "santé dégradée"
         bage = inst.get("backup_age_seconds")
-        if bage is None or bage > backup_limit:
-            return "warn", "sauvegarde vieillissante" if bage else "aucune sauvegarde"
+        # 2026-08-20 : None = le phone-home n'a PAS rapporté d'âge de sauvegarde — on ne
+        # sait pas. « aucune sauvegarde » était une affirmation inventée ; ce libellé est
+        # réservé à une valeur réellement rapportée par l'instance.
+        if bage is None:
+            return "warn", "sauvegarde non rapportée"
+        if bage > backup_limit:
+            return "warn", "sauvegarde vieillissante"
         return "ok", "à jour"
 
     @staticmethod
@@ -571,8 +576,11 @@ class Dist(commands.Cog):
         emb.add_field(name="Version", value=f"`{inst.get('app_version') or '?'}`", inline=True)
         emb.add_field(name="Dernier contact",
                       value=f"il y a {self._fmt_age(inst.get('silence_seconds'))}", inline=True)
+        # 2026-08-20 : None = non rapporté par le phone-home (≠ « jamais sauvegardé »)
+        bage = inst.get("backup_age_seconds")
         emb.add_field(name="Dernière sauvegarde",
-                      value=f"il y a {self._fmt_age(inst.get('backup_age_seconds'))}", inline=True)
+                      value=("non rapportée" if bage is None
+                             else f"il y a {self._fmt_age(bage)}"), inline=True)
         note = inst.get("note")
         if note:
             emb.add_field(name="Licence", value=str(note)[:200], inline=False)
@@ -693,15 +701,20 @@ class Dist(commands.Cog):
             await itx.followup.send(
                 f"❌ Échec : {(r or {}).get('status', 'serveur dist injoignable')}")
             return
-        agg = self._aggregate(r.get("refused") or [])
+        rows = r.get("refused") or []
+        agg = self._aggregate(rows)
         if not agg:
             await itx.followup.send("✅ Aucune tentative refusée au journal.")
             return
         # plus récentes d'abord (le journal est chronologique)
         items = sorted(agg.items(), key=lambda kv: kv[1]["max_id"], reverse=True)[:15]
+        # 2026-08-20 : la réponse est BORNÉE (limit=1000) — revenue pleine, le compte
+        # d'IP n'est plus un total, seulement celui des dernières entrées lues.
+        portee = ("sur les 1000 dernières entrées du journal" if len(rows) >= 1000
+                  else "au journal")
         emb = discord.Embed(
             title="🚫 Tentatives refusées — serveur de distribution",
-            description=f"**{len(agg)}** IP distincte(s) au journal (15 max affichées). "
+            description=f"**{len(agg)}** IP distincte(s) {portee} (15 max affichées). "
                         "`/dist autoriser <ip>` pour whitelister.",
             color=0xE01B24)
         for ip, info in items:
@@ -725,9 +738,12 @@ class Dist(commands.Cog):
             return
         rows = r.get("licenses") or []
         actives = sum(1 for x in rows if not x.get("revoked"))
+        # 2026-08-20 : réponse BORNÉE (limit=200) — revenue pleine, « N émise(s) »
+        # serait un total inventé : ce n'est qu'un plancher, et on le dit.
+        cap = " (au moins — liste plafonnée à 200)" if len(rows) >= 200 else ""
         emb = discord.Embed(
             title="🔑 Licences — serveur de distribution Fronote",
-            description=f"**{len(rows)}** licence(s) émise(s), {actives} active(s). "
+            description=f"**{len(rows)}** licence(s) émise(s){cap}, {actives} active(s). "
                         "20 plus récentes affichées.",
             color=0x3584E4)
         for x in rows[:20]:
@@ -769,18 +785,23 @@ class Dist(commands.Cog):
             key=lambda t: (order.get(t[0][0], 3), -(t[1].get("silence_seconds") or 0)))
         crit = sum(1 for (lvl, _t), _i in ranked if lvl == "crit")
         warn = sum(1 for (lvl, _t), _i in ranked if lvl == "warn")
+        # 2026-08-20 : réponse BORNÉE (limit=500) — revenue pleine, le compte n'est
+        # qu'un plancher (« au moins N »), pas le total du parc.
+        cap = " (au moins — liste plafonnée à 500)" if len(instances) >= 500 else ""
         emb = discord.Embed(
             title="🏫 Parc Fronote — écoles installées",
-            description=(f"**{len(instances)}** instance(s) · "
+            description=(f"**{len(instances)}** instance(s){cap} · "
                          f"🔴 {crit} · 🟠 {warn} · 🟢 {len(instances) - crit - warn}"),
             color=0xE01B24 if crit else (0xE5A50A if warn else 0x26A269))
         for (level, txt), i in ranked[:20]:
             host = i.get("hostname") or f"instance #{i.get('activation_id')}"
+            # 2026-08-20 : None = âge non rapporté par le phone-home, pas « jamais »
+            bage = i.get("backup_age_seconds")
             emb.add_field(
                 name=f"{self._park_dot(level)} {host}",
                 value=(f"v`{i.get('app_version') or '?'}` · {txt}\n"
                        f"vu il y a {self._fmt_age(i.get('silence_seconds'))} · "
-                       f"sauv. {self._fmt_age(i.get('backup_age_seconds'))}"),
+                       f"sauv. {'non rapportée' if bage is None else self._fmt_age(bage)}"),
                 inline=True)
         await itx.followup.send(embed=emb)
 
@@ -799,10 +820,15 @@ class Dist(commands.Cog):
         if not rows:
             await itx.followup.send("📭 Aucune proposition reçue pour l'instant.")
             return
+        total = len(rows)
         rows = sorted(rows, key=lambda p: int(p.get("id") or 0), reverse=True)[:10]
+        # 2026-08-20 : réponse BORNÉE (limit=100) — revenue pleine, « au total » serait
+        # faux : on ne connaît qu'un plancher.
+        portee = (" (au moins — liste plafonnée à 100 ; 10 récentes affichées)"
+                  if total >= 100 else " au total (10 récentes affichées)")
         emb = discord.Embed(
             title="📩 Propositions — site vitrine Fronote",
-            description=f"**{len(r.get('proposals') or [])}** demande(s) au total (10 récentes affichées).",
+            description=f"**{total}** demande(s){portee}.",
             color=0xB9772A)
         for p in rows:
             who = self._safe(p.get("etablissement"), 80) or "établissement ?"

@@ -191,12 +191,14 @@ class Avy(commands.Cog):
     def _collect(self, node):
         """Toutes les lectures API d'un nœud (synchrone, appelé via to_thread)."""
         pve = self.bot.pve
-        out = {"status": None, "storages": [], "tasks": [],
+        # ⚠️ storages/tasks valent None tant que la lecture n'a pas RÉUSSI : [] voulait
+        # dire à la fois « rien » et « illisible », et les embeds affichaient alors des
+        # listes vides VERTES pendant une panne de lecture. None se propage jusqu'au
+        # rendu (« illisibles ce cycle ») ; les alertes, elles, sautent simplement le
+        # bloc — même convention que avy_metrics._backups (2026-08-20).
+        out = {"status": None, "storages": None, "tasks": None,
                "rrd_last": {}, "disks": []}
         out["status"] = pve.avy_node_status(node)          # lève si nœud injoignable
-        # ⚠️ une lecture ratée ici se lit comme « rien à signaler » dans les embeds ET
-        # neutralise les alertes correspondantes (stockage plein, vzdump en échec) :
-        # elle doit au moins laisser une trace (2026-08-11)
         try:
             out["storages"] = pve.avy_node_storages(node) or []
         except Exception:
@@ -273,6 +275,12 @@ class Avy(commands.Cog):
     def _content_by_node(self):
         """Contenu nas-backup réparti par nœud (une lecture CIFS ~16 s par cycle).
 
+        Renvoie un dict {node: [archives]} sur lecture RÉUSSIE, None si l'énumération a
+        échoué ce cycle, "disabled" si le stockage est désactivé côté PVE. ⚠️ Ne JAMAIS
+        confondre échec et {} : {} disait « aucune archive » et l'embed #sauvegardes
+        passait au rouge « jamais sauvegardé » pour TOUS les invités à chaque hoquet du
+        lien WG — même convention None qu'avy_metrics._backups (2026-08-20).
+
         ⚠️ guest_map() DOIT rester dans le try : c'était le seul appel non gardé du corps
         de refresh(), et il tape /cluster/resources sur le R820. Un jeton PVEAuditor
         révoqué (401 -> ResourceException, qui n'est PAS un OSError et ne déclenche donc
@@ -293,13 +301,14 @@ class Avy(commands.Cog):
                 self._pbs_off = False
                 log.warning("supervision Aveyron: contenu %s indisponible ce cycle",
                             self.bot.cfg.avy_storage, exc_info=True)
-            elif not getattr(self, "_pbs_off", False):
+                return None
+            if not getattr(self, "_pbs_off", False):
                 self._pbs_off = True
                 log.info("supervision Aveyron: stockage %s DÉSACTIVÉ côté PVE — plus "
                          "aucune sauvegarde distante listée (régler AVY_PVE_STORAGE sur "
                          "le stockage réellement utilisé pour rétablir la vue)",
                          self.bot.cfg.avy_storage)
-            return {}
+            return "disabled"
         vmid_node = {str((i.get("vmid") or 0) % 1_000_000): i.get("node")
                      for n, i in gm.items() if self.bot.pve.is_avy_name(n)}
         out = {}
@@ -338,7 +347,9 @@ class Avy(commands.Cog):
         else:
             s["down"] = 0
 
-        for st in data["storages"]:
+        # storages=None (illisibles ce cycle) : on saute — aucun verrou ne bouge, la
+        # condition sera réévaluée sur une vraie lecture (2026-08-20)
+        for st in data["storages"] or []:
             name, tot = st.get("storage"), st.get("total") or 0
             # Stockage DÉCLARÉ ACTIF mais qui ne répond pas (montage NFS/CIFS tombé).
             # Ajouté le 2026-08-14 : `nas-backup` était dans cet état depuis un moment
@@ -578,8 +589,11 @@ class Avy(commands.Cog):
         # une seule lecture, hors boucle d'événements (2026-08-11)
         nodes = await asyncio.to_thread(self.bot.pve.avy_nodes)
         if cl.get("ping_ms") is not None:
-            on = sum(1 for v in (cl.get("online") or {}).values() if v)
-            tot = len(cl.get("online") or {}) or len(nodes)
+            online = cl.get("online") or {}
+            on = sum(1 for v in online.values() if v)
+            # carte des pairs vide = dénominateur INCONNU : « ? », pas la liste
+            # configurée AVY_NODES affichée comme mesurée (2026-08-20)
+            tot = len(online) if online else "?"
             q = cl.get("quorate")
             lvl = "crit" if q is False else ("warn" if cl["ping_ms"] >= LAT_ALERT_MS else "ok")
             rows.append((lvl, "Aveyron (cluster)",
@@ -593,11 +607,22 @@ class Avy(commands.Cog):
             except Exception:
                 rows.append(("crit", f"Aveyron — {node}", "injoignable"))
                 continue
-            cpu = (st.get("cpu") or 0) * 100
+            # champ absent = valeur INCONNUE : « ? » et un niveau non évalué dessus —
+            # « RAM 0 % » notée « ok » masquait un total manquant (2026-08-20)
+            cpu = st.get("cpu")
+            cpu = cpu * 100 if cpu is not None else None
             mem, maxmem = (st.get("memory") or {}).get("used", 0), (st.get("memory") or {}).get("total", 0)
-            rampct = mem / maxmem * 100 if maxmem else 0
-            lvl = "crit" if (cpu >= 95 or rampct >= 95) else ("warn" if (cpu >= 85 or rampct >= 90) else "ok")
-            rows.append((lvl, f"Aveyron — {node}", f"CPU {cpu:.0f} % · RAM {rampct:.0f} %"))
+            rampct = mem / maxmem * 100 if maxmem else None
+            if cpu is None and rampct is None:
+                lvl = "na"
+            elif (cpu is not None and cpu >= 95) or (rampct is not None and rampct >= 95):
+                lvl = "crit"
+            elif (cpu is not None and cpu >= 85) or (rampct is not None and rampct >= 90):
+                lvl = "warn"
+            else:
+                lvl = "ok"
+            rows.append((lvl, f"Aveyron — {node}",
+                         f"CPU {embeds._num(cpu, '%')} · RAM {embeds._num(rampct, '%')}"))
         return rows
 
     async def refresh_node(self, node):
@@ -623,7 +648,11 @@ class Avy(commands.Cog):
             await self._pin_edit(chans.get("hyperviseur"), embeds.down(node),
                                  AvyNodeView(self))
             return None
-        content = getattr(self, "_cycle_content", {})
+        content = getattr(self, "_cycle_content", None)
+        # dict = lecture réussie (liste par nœud, éventuellement vide) ; None (échec
+        # d'énumération, ou pas encore de cycle) et "disabled" passent tels quels :
+        # l'embed dit « illisible/désactivé » au lieu d'un faux « aucune » (2026-08-20)
+        items = content.get(node) or [] if isinstance(content, dict) else content
         # une seule lecture de la carte du cycle pour les deux embeds qui listent les
         # invités (elle est déjà en mémoire, mais autant la passer explicitement)
         guests = self._node_guests(node)
@@ -634,8 +663,7 @@ class Avy(commands.Cog):
                              AvyNodeView(self))
         await self._pin_edit(chans.get("stockage"), embeds.stockage(node, data))
         await self._pin_edit(chans.get("sauvegardes"),
-                             embeds.sauvegardes(node, data, content.get(node) or [],
-                                                guests, sfx, cl))
+                             embeds.sauvegardes(node, data, items, guests, sfx, cl))
         await self._pin_edit(chans.get("materiel"), embeds.materiel(node, data))
         await self._journal(node, data, chans)
         return data

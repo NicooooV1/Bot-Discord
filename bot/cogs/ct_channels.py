@@ -190,21 +190,34 @@ class CtChannels(commands.Cog):
                 try:
                     cur = await bot.pve.aguest_status(vmid, gtype)
                 except Exception:
-                    cur = {}
-                running = cur.get("status") == "running"
-                emb.color = fmt.GREEN if running else fmt.GREY
-                emb.description = (f"{fmt.status_emoji(running)} `{cur.get('status', '?')}`"
-                                   f" · vmid {bot.pve.display_vmid(vmid)}")
-                described = True
-                emb.add_field(name="Uptime", value=fmt.humanize_duration(cur.get("uptime")))
-                mm = cur.get("maxmem") or 0
-                if mm:
-                    emb.add_field(name="RAM", value=fmt.pct_of(cur.get("mem") or 0, mm))
-                emb.add_field(name="CPU", value=f"{(cur.get('cpu') or 0) * 100:.0f}%")
-                md = cur.get("maxdisk") or 0
-                if md:
-                    emb.add_field(name="Disque", value=fmt.pct_of(cur.get("disk") or 0, md))
-                await self._enrich(emb, vmid, gtype, running)
+                    # 2026-08-20 : ILLISIBLE ≠ ÉTEINT. cur={} rendait un 🔴 `?` avec un
+                    # « CPU 0% » fabriqué alors que le statut n'a simplement PAS pu être
+                    # lu (le renommage du salon sait déjà distinguer ABSENT ≠ ÉTEINT
+                    # depuis le 2026-08-11 — l'embed, lui, continuait d'affirmer).
+                    cur = None
+                if cur is None:
+                    emb.color = fmt.GREY
+                    emb.description = (f"⚪ état PVE illisible ce cycle"
+                                       f" · vmid {bot.pve.display_vmid(vmid)}")
+                    described = True
+                    # pas de champs Uptime/RAM/CPU inventés ; la config (cache 30 min)
+                    # reste affichée : c'est une donnée réelle, pas un statut fabriqué.
+                    await self._enrich(emb, vmid, gtype, False)
+                else:
+                    running = cur.get("status") == "running"
+                    emb.color = fmt.GREEN if running else fmt.GREY
+                    emb.description = (f"{fmt.status_emoji(running)} `{cur.get('status', '?')}`"
+                                       f" · vmid {bot.pve.display_vmid(vmid)}")
+                    described = True
+                    emb.add_field(name="Uptime", value=fmt.humanize_duration(cur.get("uptime")))
+                    mm = cur.get("maxmem") or 0
+                    if mm:
+                        emb.add_field(name="RAM", value=fmt.pct_of(cur.get("mem") or 0, mm))
+                    emb.add_field(name="CPU", value=f"{(cur.get('cpu') or 0) * 100:.0f}%")
+                    md = cur.get("maxdisk") or 0
+                    if md:
+                        emb.add_field(name="Disque", value=fmt.pct_of(cur.get("disk") or 0, md))
+                    await self._enrich(emb, vmid, gtype, running)
         if bot.influx.enabled:
             d = await bot.influx.ct_sysinfo(name)
             if d:

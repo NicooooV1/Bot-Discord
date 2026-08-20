@@ -476,9 +476,15 @@ class Gestion(commands.Cog):
             note = (f"\n⏳ Sa session 2FA est fermée : le rôle **{niveau}** ne sera posé qu'à "
                     "son prochain `/2fa unlock` (et retiré à chaque expiration de session).")
         else:
-            note = ""
+            # 2026-08-20 : le « ✅ » ne couvre que l'ENREGISTREMENT (réel, fait ci-dessus
+            # sous le verrou). La POSE du rôle, elle, est le fait de la réconciliation —
+            # lancée juste après cette réponse, sans retour ici (filet : boucle de
+            # RECONCILE_MIN min) — on ne l'affirme donc pas, on dit qui la fait.
+            note = ("\n🔁 Rôle posé par la réconciliation (lancée immédiatement, "
+                    f"filet toutes les {RECONCILE_MIN} min).")
         await itx.followup.send(
-            f"✅ **{membre.display_name}** — niveau **{niveau}** sur **{serveur}**.{note}",
+            f"✅ **{membre.display_name}** — niveau **{niveau}** sur **{serveur}** "
+            f"enregistré.{note}",
             ephemeral=True)
         async with self._lock:
             await self.reconcile()

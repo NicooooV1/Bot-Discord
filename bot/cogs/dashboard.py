@@ -67,10 +67,11 @@ class Dashboard(commands.Cog):
             emb.add_field(name=f"Top CT ({len(up)}/{len(cts)}){scope}",
                           value=top[:1024], inline=True)
 
-            emb.add_field(name="Stockage",
-                          value=("\n".join(f"{s['name']} — {fmt.pct_of(s['used'], s['total'])}"
-                                           for s in st[:4]) or "—")[:1024],
-                          inline=True)
+            st_txt = "\n".join(f"{s['name']} — {fmt.pct_of(s['used'], s['total'])}"
+                               for s in st[:4]) or "—"
+            if len(st) > 4:      # liste tronquée : le dire (2026-08-20)
+                st_txt += f"\n… + {len(st) - 4} autres"
+            emb.add_field(name="Stockage", value=st_txt[:1024], inline=True)
 
             if ctrl:
                 emb.add_field(name="RAID",
@@ -79,6 +80,13 @@ class Dashboard(commands.Cog):
             if bs:
                 emb.add_field(name="Backup +ancien",
                               value=fmt.humanize_duration(bs.get("oldest_age_seconds")), inline=True)
+
+            # même avertissement que /health : sans lui le dashboard épinglé restait
+            # présenté comme frais pendant une panne InfluxDB (2026-08-20)
+            if getattr(bot.influx, "blind", False):
+                emb.add_field(name="⚠️ InfluxDB",
+                              value="dernière requête Flux en échec — métriques "
+                                    "ci-dessus possiblement périmées", inline=False)
 
             # Influx horodate en UTC : ramener dans cfg.tz avant le rendu, sinon l'axe
             # du dashboard est décalé de 2 h l'été par rapport aux messages Discord.

@@ -81,12 +81,13 @@ def hyperviseur(node, data, cluster, guests, sfx):
                        + (f" · {ci['model']}" if ci.get("model") else ""))
     emb.add_field(name="Uptime", value=fmt.humanize_duration(st.get("uptime")))
 
-    cpu_pct = (st.get("cpu") or 0) * 100
+    # `cpu` absent ≠ 0 % : « ? % » plutôt qu'un zéro inventé (2026-08-20)
+    cpu_txt = _num(st.get("cpu"), "%", scale=100)
     if ci.get("cpus"):
-        emb.add_field(name="CPU", value=f"{cpu_pct:.0f} % · {ci.get('cpus', '?')} threads "
+        emb.add_field(name="CPU", value=f"{cpu_txt} · {ci.get('cpus', '?')} threads "
                                        f"({ci.get('sockets', '?')} sockets)")
     else:
-        emb.add_field(name="CPU", value=f"{cpu_pct:.0f} %")
+        emb.add_field(name="CPU", value=cpu_txt)
     la = st.get("loadavg") or []
     if la:
         try:
@@ -116,12 +117,17 @@ def hyperviseur(node, data, cluster, guests, sfx):
     last = data.get("rrd_last") or {}
     pc, pi = last.get("pressurecpusome"), last.get("pressureiosome")
     if pc is not None or pi is not None:
+        # `_num` et non `or 0` : une des deux pressions peut manquer seule, et un
+        # « 0 % » inventé se lit comme une mesure réelle (2026-08-20)
         emb.add_field(name="⚠️ Pression" if max(pc or 0, pi or 0) >= 5 else "Pression",
-                      value=f"CPU {pc or 0:.0f} % · IO {pi or 0:.0f} %")
+                      value=f"CPU {_num(pc, '%')} · IO {_num(pi, '%')}")
     cl = cluster or {}
     if cl.get("quorate") is not None:
-        on = sum(1 for v in (cl.get("online") or {}).values() if v)
-        tot = len(cl.get("online") or {}) or 3
+        online = cl.get("online") or {}
+        on = sum(1 for v in online.values() if v)
+        # carte des pairs vide = dénominateur INCONNU : « ? » et pas un 3 codé en dur
+        # qui s'afficherait comme mesuré (2026-08-20)
+        tot = len(online) if online else "?"
         emb.add_field(name="Quorum",
                       value=f"{'🟢' if cl['quorate'] else '🔴'} {on}/{tot} nœuds")
         if not cl["quorate"]:
@@ -146,7 +152,13 @@ def hyperviseur(node, data, cluster, guests, sfx):
         up = sum(1 for _, i in guests if i.get("status") == "running")
         emb.add_field(name=f"📦 VM/conteneurs — {up}/{len(guests)} up",
                       value="\n".join(lines)[:1024], inline=False)
-    recents = [t for t in (data["tasks"] or []) if t.get("endtime")][:3]
+    if data.get("tasks") is None:
+        # lecture des tâches en échec : le dire plutôt qu'omettre le champ, l'absence
+        # se lirait comme « aucune tâche récente » (2026-08-20)
+        emb.add_field(name="Dernières tâches",
+                      value="⚠️ tâches du nœud illisibles ce cycle — données incomplètes",
+                      inline=False)
+    recents = [t for t in (data.get("tasks") or []) if t.get("endtime")][:3]
     if recents:
         lines = []
         for t in recents:
@@ -166,6 +178,13 @@ def stockage(node, data):
     Nico 2026-07-18 : « plus d'informations internes, des détails »)."""
     emb = discord.Embed(title=f"💽 Stockages — {node} (Aveyron)")
     emb.timestamp = discord.utils.utcnow()
+    if data.get("storages") is None:
+        # lecture en échec (≠ liste vide) : avant le 2026-08-20 elle rendait un embed
+        # VERT et VIDE — « illisible » n'est ni « rien » ni « sain », couleur neutre
+        emb.description = "⚠️ stockages illisibles ce cycle — données incomplètes"
+        emb.color = fmt.GREY
+        emb.set_footer(text="rafraîchi")
+        return emb
     worst = 0.0
     stos = sorted(data["storages"], key=lambda x: x.get("storage", ""))
     for n, s in enumerate(stos):
@@ -195,26 +214,48 @@ def sauvegardes(node, data, items, guests, sfx, cluster):
     """Couleur d'alerte sur le pire cas (jamais sauvegardé / trop vieux / jobs
     désactivés), comme les autres embeds Aveyron (demande Nico 2026-07-18).
 
-    `items` = archives nas-backup DE CE NŒUD (cf. `Avy._content_by_node`)."""
+    `items` = archives nas-backup DE CE NŒUD (cf. `Avy._content_by_node`) ; peut aussi
+    valoir None (énumération CIFS en échec ce cycle) ou "disabled" (stockage désactivé
+    côté PVE). Dans ces deux cas l'état des sauvegardes est INCONNU : avant le
+    2026-08-20, {} tenait lieu des trois et l'embed passait au rouge « jamais
+    sauvegardé » pour TOUS les invités à chaque hoquet du lien WG."""
     emb = discord.Embed(title=f"💾 Sauvegardes — {node} (Aveyron)")
     emb.timestamp = discord.utils.utcnow()
     worst = 0.0
-    vz = [t for t in (data["tasks"] or []) if t.get("type") == "vzdump"][:5]
-    if vz:
-        lines = []
-        for t in vz:
-            ok = str(t.get("status", "")) == "OK"
-            end = t.get("endtime")
-            when = (datetime.datetime.fromtimestamp(end).strftime("%d/%m %H:%M")
-                    if end else "en cours")
-            lines.append(f"{'✅' if ok else ('⏳' if not end else '⚠️')} "
-                         f"vmid {t.get('id') or 'tous'} · {when}")
-        emb.add_field(name="Dernières tâches vzdump", value="\n".join(lines)[:1024],
+    inconnu = False           # une source illisible ⇒ couleur neutre, jamais verte
+    if data.get("tasks") is None:
+        inconnu = True
+        emb.add_field(name="Dernières tâches vzdump",
+                      value="⚠️ tâches du nœud illisibles ce cycle — données incomplètes",
                       inline=False)
     else:
-        emb.add_field(name="Dernières tâches vzdump", value="aucune", inline=False)
-    items = items or []
-    if items:
+        vz = [t for t in data["tasks"] if t.get("type") == "vzdump"][:5]
+        if vz:
+            lines = []
+            for t in vz:
+                ok = str(t.get("status", "")) == "OK"
+                end = t.get("endtime")
+                when = (datetime.datetime.fromtimestamp(end).strftime("%d/%m %H:%M")
+                        if end else "en cours")
+                lines.append(f"{'✅' if ok else ('⏳' if not end else '⚠️')} "
+                             f"vmid {t.get('id') or 'tous'} · {when}")
+            emb.add_field(name="Dernières tâches vzdump", value="\n".join(lines)[:1024],
+                          inline=False)
+        else:
+            emb.add_field(name="Dernières tâches vzdump", value="aucune", inline=False)
+    if items == "disabled":
+        # décision d'exploitation, pas une panne — mais elle se disait seulement en log
+        inconnu = True
+        emb.add_field(name="Archives sur nas-backup",
+                      value="⚪ stockage nas-backup désactivé côté PVE — archives non "
+                            "listées", inline=False)
+        items = None
+    elif items is None:
+        inconnu = True
+        emb.add_field(name="Archives sur nas-backup",
+                      value="⚠️ archives nas-backup illisibles ce cycle — état des "
+                            "sauvegardes inconnu", inline=False)
+    elif items:
         latest = max((i.get("ctime") or 0) for i in items)
         emb.add_field(
             name=f"Archives sur nas-backup — {len(items)}",
@@ -224,29 +265,33 @@ def sauvegardes(node, data, items, guests, sfx, cluster):
             inline=False)
     else:
         emb.add_field(name="Archives sur nas-backup", value="aucune", inline=False)
-    # âge de la dernière sauvegarde PAR invité (⚠️ au-delà de BACKUP_STALE_DAYS)
-    by_vmid = {}
-    for it in items:
-        v = str(it.get("vmid"))
-        by_vmid[v] = max(by_vmid.get(v, 0), it.get("ctime") or 0)
-    now = time.time()
-    lines = []
-    for n, i in guests:
-        short = n.removesuffix(sfx)
-        last = by_vmid.get(str(Pve.display_vmid(i.get("vmid") or 0)), 0)
-        if not last:
-            lines.append(f"⚠️ **{short}** — jamais sauvegardé")
-            worst = max(worst, 90)
-            continue
-        days = (now - last) / 86400
-        flag = "⚠️" if days > BACKUP_STALE_DAYS else "🟢"
-        if days > BACKUP_STALE_DAYS:
-            worst = max(worst, 85)
-        when = (f"il y a {days:.0f} j" if days >= 1
-                else f"il y a {(now - last) / 3600:.0f} h")
-        lines.append(f"{flag} **{short}** — {when}")
-    if lines:
-        emb.add_field(name="Par VM/conteneur", value="\n".join(lines)[:1024], inline=False)
+    # âge de la dernière sauvegarde PAR invité (⚠️ au-delà de BACKUP_STALE_DAYS) —
+    # seulement quand la liste a été RÉELLEMENT lue : « jamais sauvegardé » est une
+    # accusation, pas un état par défaut (2026-08-20)
+    if items is not None:
+        by_vmid = {}
+        for it in items:
+            v = str(it.get("vmid"))
+            by_vmid[v] = max(by_vmid.get(v, 0), it.get("ctime") or 0)
+        now = time.time()
+        lines = []
+        for n, i in guests:
+            short = n.removesuffix(sfx)
+            last = by_vmid.get(str(Pve.display_vmid(i.get("vmid") or 0)), 0)
+            if not last:
+                lines.append(f"⚠️ **{short}** — jamais sauvegardé")
+                worst = max(worst, 90)
+                continue
+            days = (now - last) / 86400
+            flag = "⚠️" if days > BACKUP_STALE_DAYS else "🟢"
+            if days > BACKUP_STALE_DAYS:
+                worst = max(worst, 85)
+            when = (f"il y a {days:.0f} j" if days >= 1
+                    else f"il y a {(now - last) / 3600:.0f} h")
+            lines.append(f"{flag} **{short}** — {when}")
+        if lines:
+            emb.add_field(name="Par VM/conteneur", value="\n".join(lines)[:1024],
+                          inline=False)
     if (cluster or {}).get("jobs_disabled"):
         emb.add_field(
             name="⚠️ Jobs planifiés du cluster",
@@ -255,7 +300,9 @@ def sauvegardes(node, data, items, guests, sfx, cluster):
                    "touche pas)."),
             inline=False)
         worst = max(worst, 85)
-    emb.color = fmt.health_color(worst)
+    # source illisible + rien d'alarmant par ailleurs = gris (état inconnu), pas vert ;
+    # un vrai problème détecté sur ce qui a pu être lu garde sa couleur d'alerte
+    emb.color = fmt.GREY if (inconnu and not worst) else fmt.health_color(worst)
     emb.set_footer(text="rafraîchi")
     return emb
 
@@ -268,13 +315,21 @@ def materiel(node, data):
     emb.timestamp = discord.utils.utcnow()
     disks = data.get("disks") or []
     worst = 0.0
-    bad = [d for d in disks if str(d.get("health") or "?").upper() not in ("PASSED", "OK")]
+    # 3 catégories et pas 2 : une santé SMART INCONNUE (« ? », UNKNOWN) n'est pas un
+    # échec — l'alerte du cog la traite déjà comme non-alarmante, l'embed disait
+    # pourtant « ❌ en échec ». `bad` est réservé au réellement non-PASS (2026-08-20).
+    _inconnu_smart = ("UNKNOWN", "?", "")
+    bad = [d for d in disks
+           if str(d.get("health") or "?").upper() not in ("PASSED", "OK") + _inconnu_smart]
+    unk = [d for d in disks if str(d.get("health") or "?").upper() in _inconnu_smart]
     hot = [d for d in disks if d.get("temp") is not None and d["temp"] >= DISK_TEMP_ALERT]
     worn = [d for d in disks if str(d.get("wearout") or "").isdigit()
             and int(d["wearout"]) <= WEAROUT_ALERT]
     if disks:
         emb.description = (f"❌ **{len(bad)} disque(s) en échec**" if bad
-                           else f"✅ {len(disks)} disque(s) PASS")
+                           else f"✅ {len(disks) - len(unk)} disque(s) PASS")
+        if unk:
+            emb.description += f" · ⚪ {len(unk)} état inconnu"
         if hot:
             emb.description += f" · 🔥 {len(hot)} en surchauffe"
         if worn:
@@ -291,7 +346,9 @@ def materiel(node, data):
     for d in disks[:MAX_LIST_FIELDS]:
         health = str(d.get("health") or "?")
         ok = health.upper() in ("PASSED", "OK")
-        bits = [("🟢" if ok else "🔴") + f" {health}"]
+        # ⚪ pour l'inconnu : « 🔴 ? » accusait un disque dont on ne sait rien
+        mark = "🟢" if ok else ("⚪" if health.upper() in _inconnu_smart else "🔴")
+        bits = [f"{mark} {health}"]
         if d.get("wearout") is not None and str(d["wearout"]).isdigit():
             w = int(d["wearout"])
             bits.append(("⚠️ " if w <= WEAROUT_ALERT else "") + f"usure {100 - w} % "
@@ -347,9 +404,11 @@ def rapport(node, data, guests, sfx, cluster, fenetre_h=24):
     worst = 0.0
 
     mem = st.get("memory") or {}
-    rampct = (mem.get("used") or 0) / mem["total"] * 100 if mem.get("total") else 0
-    worst = max(worst, rampct)
-    ligne = [f"CPU {(st.get('cpu') or 0) * 100:.0f} %", f"RAM {rampct:.0f} %"]
+    # total absent = RAM INCONNUE (« ? »), pas 0 % — et elle ne pèse alors pas sur la
+    # couleur (2026-08-20)
+    rampct = (mem.get("used") or 0) / mem["total"] * 100 if mem.get("total") else None
+    worst = max(worst, rampct or 0)
+    ligne = [f"CPU {_num(st.get('cpu'), '%', scale=100)}", f"RAM {_num(rampct, '%')}"]
     la = st.get("loadavg") or []
     if la:
         ligne.append(f"charge {la[0]}")
@@ -365,32 +424,56 @@ def rapport(node, data, guests, sfx, cluster, fenetre_h=24):
             val += " · éteints : " + ", ".join(eteints[:8])
         emb.add_field(name="📦 VM/conteneurs", value=val[:1024], inline=False)
 
-    stos = [s for s in (data.get("storages") or []) if s.get("total")]
-    if stos:
-        pire = max(stos, key=lambda s: (s.get("used") or 0) / s["total"])
-        pct = (pire.get("used") or 0) / pire["total"] * 100
-        worst = max(worst, pct)
-        emb.add_field(name="Stockage le + plein",
-                      value=f"{pire.get('storage')} — {fmt.pct_of(pire.get('used'), pire['total'])}")
-
-    taches = data.get("tasks") or []
-    limite = time.time() - fenetre_h * 3600
-    recentes = [t for t in taches if (t.get("starttime") or 0) >= limite]
-    echecs = [t for t in recentes if t.get("status") not in (None, "OK")]
-    sauv = [t for t in recentes if str(t.get("type", "")).startswith("vzdump")]
-    sauv_ko = [t for t in sauv if t.get("status") not in (None, "OK")]
-    if sauv:
-        emb.add_field(name="Sauvegardes",
-                      value=("✅ " if not sauv_ko else "🔴 ")
-                            + f"{len(sauv) - len(sauv_ko)}/{len(sauv)} vzdump OK")
-        if sauv_ko:
-            worst = max(worst, 90)
+    if data.get("storages") is None:
+        # lecture en échec ≠ aucun stockage : le dire au lieu d'omettre (2026-08-20)
+        emb.add_field(name="Stockage", value="⚠️ illisibles ce cycle")
     else:
-        emb.add_field(name="Sauvegardes", value="➖ aucune sur la fenêtre")
-    val = f"{len(recentes)} tâches · {len(echecs)} en échec"
-    if len(taches) >= 20:
-        val += " (20 dernières lues)"
-    emb.add_field(name=f"Tâches ({fenetre_h} h)", value=val)
+        stos = [s for s in data["storages"] if s.get("total")]
+        if stos:
+            pire = max(stos, key=lambda s: (s.get("used") or 0) / s["total"])
+            pct = (pire.get("used") or 0) / pire["total"] * 100
+            worst = max(worst, pct)
+            emb.add_field(name="Stockage le + plein",
+                          value=f"{pire.get('storage')} — {fmt.pct_of(pire.get('used'), pire['total'])}")
+
+    taches = data.get("tasks")
+    if taches is None:
+        # même règle : une collecte ratée n'est ni « ➖ aucune » ni « n/n OK »
+        emb.add_field(name="Sauvegardes", value="⚠️ tâches illisibles — état inconnu")
+        emb.add_field(name=f"Tâches ({fenetre_h} h)",
+                      value="⚠️ illisibles ce cycle — données incomplètes")
+        echecs = []
+    else:
+        limite = time.time() - fenetre_h * 3600
+        recentes = [t for t in taches if (t.get("starttime") or 0) >= limite]
+        echecs = [t for t in recentes if t.get("status") not in (None, "OK")]
+        sauv = [t for t in recentes if str(t.get("type", "")).startswith("vzdump")]
+        # une tâche SANS endtime est encore EN COURS (status pas publié) : la compter
+        # « OK » gonflait le « n/n vzdump OK » (2026-08-20)
+        sauv_fin = [t for t in sauv if t.get("endtime")]
+        encours = len(sauv) - len(sauv_fin)
+        sauv_ko = [t for t in sauv_fin if str(t.get("status")) != "OK"]
+        if sauv:
+            if sauv_fin:
+                val = (("✅ " if not sauv_ko else "🔴 ")
+                       + f"{len(sauv_fin) - len(sauv_ko)}/{len(sauv_fin)} vzdump OK")
+                if encours:
+                    val += f" · ⏳ {encours} en cours"
+            else:
+                val = f"⏳ {encours} vzdump en cours"
+            # même caveat que le champ Tâches : _collect ne lit que 20 tâches, un nœud
+            # actif peut en avoir eu davantage sur la fenêtre (2026-08-20)
+            if len(taches) >= 20:
+                val += " (parmi les 20 dernières tâches lues)"
+            emb.add_field(name="Sauvegardes", value=val)
+            if sauv_ko:
+                worst = max(worst, 90)
+        else:
+            emb.add_field(name="Sauvegardes", value="➖ aucune sur la fenêtre")
+        val = f"{len(recentes)} tâches · {len(echecs)} en échec"
+        if len(taches) >= 20:
+            val += " (20 dernières lues)"
+        emb.add_field(name=f"Tâches ({fenetre_h} h)", value=val)
     if echecs:
         worst = max(worst, 80)
         lignes = [f"⚠️ `{t.get('type')}` {t.get('id') or ''} · {t.get('status')}"
@@ -422,9 +505,11 @@ def rapport(node, data, guests, sfx, cluster, fenetre_h=24):
     if cl.get("quorate") is not None or cl.get("ping_ms") is not None:
         bouts = []
         if cl.get("quorate") is not None:
-            on = sum(1 for v in (cl.get("online") or {}).values() if v)
+            online = cl.get("online") or {}
+            on = sum(1 for v in online.values() if v)
+            # carte des pairs vide = dénominateur inconnu, « ? » et pas 3 (2026-08-20)
             bouts.append(f"quorum {'🟢' if cl['quorate'] else '🔴'} {on}/"
-                         f"{len(cl.get('online') or {}) or 3}")
+                         f"{len(online) if online else '?'}")
             if not cl["quorate"]:
                 worst = max(worst, 95)
         if cl.get("ping_ms") is not None:

@@ -66,9 +66,13 @@ class Reports(commands.Cog):
             line.append(f"CPU moy/max {sum(cpu[1]) / len(cpu[1]):.0f}/{max(cpu[1]):.0f}%")
         if mem[1]:
             line.append(f"RAM max {max(mem[1]):.0f}%")
-        if load:
-            line.append(f"load {float(load.get('load1') or 0):.2f}")
+        if load and load.get("load1") is not None:
+            line.append(f"load {float(load['load1']):.2f}")
         emb.add_field(name=f"Hôte {bot.cfg.pve_node} (24h)", value=" · ".join(line) or "—", inline=False)
+
+        # 2026-08-20 : une source Influx qui rend [] disparaissait du rapport EN
+        # SILENCE — indiscernable d'un « rien à signaler ». On récapitule les trous.
+        sans_donnees = []
 
         cts = await bot.influx.ct_table()
         up = [c for c in cts if c["running"]]
@@ -80,12 +84,16 @@ class Reports(commands.Cog):
             emb.add_field(name="Stockage le + plein",
                           value=f"{worst['name']} — {fmt.pct_of(worst['used'], worst['total'])}",
                           inline=True)
+        else:
+            sans_donnees.append("stockages")
         tp = await bot.influx.thinpool()
         if tp and tp.get("overcommit_percent") is not None:
             emb.add_field(name="Thinpool overcommit",
                           value=f"{tp['overcommit_percent']:.0f}% "
                                 f"({fmt.humanize_bytes(tp.get('allocated_bytes'))} alloués / "
                                 f"{fmt.humanize_bytes(tp.get('pool_bytes'))} pool)", inline=True)
+        else:
+            sans_donnees.append("thinpool")
 
         ctrl, summ = await bot.influx.raid()
         if ctrl:
@@ -100,20 +108,31 @@ class Reports(commands.Cog):
             if offline:
                 value += f" · ❌ slot(s) offline : {', '.join(offline[:6])}"
             emb.add_field(name="RAID", value=value[:1024], inline=True)
+        else:
+            sans_donnees.append("RAID")
 
         bs = await bot.influx.backup_summary()
         if bs:
+            # clé absente ≠ zéro invité sans backup : « ? » plutôt qu'un 0 fabriqué
+            nob = bs.get("guests_without_backup")
             emb.add_field(name="Sauvegardes",
                           value=f"+ancienne {fmt.humanize_duration(bs.get('oldest_age_seconds'))} · "
-                                f"sans backup {int(bs.get('guests_without_backup') or 0)}",
+                                f"sans backup {int(nob) if nob is not None else '?'}",
                           inline=True)
+        else:
+            sans_donnees.append("sauvegardes")
 
         ipmi = await bot.influx.ipmi_temps()
-        if ipmi:
-            mx = max((v for _, v in ipmi if v is not None), default=None)
-            if mx is not None:
-                flag = " 🔥" if mx >= 60 else (" ⚠️" if mx >= 45 else "")
-                emb.add_field(name="Temp max", value=f"{mx:.0f}°C{flag} (seuil 60°C)", inline=True)
+        mx = max((v for _, v in ipmi if v is not None), default=None) if ipmi else None
+        if mx is not None:
+            flag = " 🔥" if mx >= 60 else (" ⚠️" if mx >= 45 else "")
+            emb.add_field(name="Temp max", value=f"{mx:.0f}°C{flag} (seuil 60°C)", inline=True)
+        else:
+            sans_donnees.append("IPMI")
+
+        if sans_donnees:
+            emb.add_field(name="Sources sans données ce matin",
+                          value="➖ " + ", ".join(sans_donnees), inline=False)
 
         avy = bot.get_cog("Avy")
         if avy is not None and getattr(avy, "enabled", False):
@@ -125,8 +144,15 @@ class Reports(commands.Cog):
             if rows:
                 icon = {"crit": "🔥", "warn": "⚠️", "ok": "✅", "na": "➖"}
                 lines = [f"{icon.get(l, '•')} {n} : {d}" for l, n, d in rows]
-                emb.add_field(name="Aveyron (3 nœuds)", value="\n".join(lines)[:1024],
-                              inline=False)
+                # nombre de nœuds dérivé des lignes réelles (1 ligne cluster + 1/nœud),
+                # plus de « 3 nœuds » codé en dur (2026-08-20)
+                n_nodes = sum(1 for _, n, _ in rows if str(n).startswith("Aveyron — "))
+                name = f"Aveyron ({n_nodes} nœud{'s' if n_nodes > 1 else ''})" if n_nodes else "Aveyron"
+                emb.add_field(name=name, value="\n".join(lines)[:1024], inline=False)
+            else:
+                # omission silencieuse = « rien à signaler » mensonger (2026-08-20)
+                emb.add_field(name="Aveyron",
+                              value="➖ indisponible (pas de données ce matin)", inline=False)
 
         if bot.loki.enabled:
             try:
@@ -134,12 +160,16 @@ class Reports(commands.Cog):
                     'topk(5, sum by (host) (count_over_time({host=~".+"} '
                     '| level=~"warning|err|crit|alert|emerg" [24h])))')
                 rows.sort(key=lambda r: -float(r[2]))
-                if rows:
-                    top = " · ".join(f"{labels.get('host', '?')} {float(val):.0f}"
-                                     for _, labels, val in rows)
-                    emb.add_field(name="Top logs (24h)", value=top[:1024], inline=False)
             except Exception:
                 log.exception("rapport: requête Loki top logs échouée")
+                rows = []
+            if rows:
+                top = " · ".join(f"{labels.get('host', '?')} {float(val):.0f}"
+                                 for _, labels, val in rows)
+                emb.add_field(name="Top logs (24h)", value=top[:1024], inline=False)
+            else:
+                emb.add_field(name="Top logs (24h)",
+                              value="➖ indisponible (pas de données ce matin)", inline=False)
 
         file = await asyncio.to_thread(render.timeseries, "Hôte CPU/RAM (24h)", "%",
                                        {"CPU%": cpu, "RAM%": mem}, "report.png", True)

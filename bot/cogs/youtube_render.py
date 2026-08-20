@@ -31,11 +31,15 @@ def fmt_delay(hours):
 
 
 def bar(pct_str):
-    """Barre de 20 blocs à partir du pourcentage TEXTUEL de yt-dlp (« 42.3% »)."""
+    """Barre de 20 blocs à partir du pourcentage TEXTUEL de yt-dlp (« 42.3% »).
+
+    2026-08-20 : un pourcentage illisible n'est PAS 0 % — « 0% » affichait une mesure
+    là où on n'en avait aucune. Barre vide + « ?% » quand le parse échoue.
+    """
     try:
-        p = float((pct_str or "0").replace("%", "").strip())
+        p = float((pct_str or "").replace("%", "").strip())
     except ValueError:
-        p = 0.0
+        return "░" * 20 + " ?%"
     n = max(0, min(20, round(p / 5)))
     return "█" * n + "░" * (20 - n) + f" {p:.0f}%"
 
@@ -69,7 +73,8 @@ def progress_text(job, files):
     `job` est la réponse ytgrab telle quelle ; `files` la liste des fichiers DÉJÀ livrés
     (une playlist en cours en a déjà terminé une partie, on le dit).
     """
-    val = bar(job.get("percent", "0%"))
+    # pas de repli « 0% » : un champ absent doit rendre « ?% », pas un faux zéro mesuré
+    val = bar(job.get("percent"))
     if job.get("pl_count"):
         val += f"\n📃 Élément **{job.get('pl_idx', '?')}/{job['pl_count']}**" \
                + (f" · {len(files)} terminé(s)" if files else "")

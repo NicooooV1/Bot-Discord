@@ -352,11 +352,14 @@ class Medias(commands.Cog):
         if pr is None:
             var = "— (première mesure)"
         else:
-            d = pr - remaining  # positif = téléchargé depuis le refresh
+            d = pr - remaining  # positif = le « reste à télécharger » agrégé a baissé
+            # 2026-08-20 : ce delta n'est PAS un compteur de téléchargement — un torrent
+            # retiré de la file fait baisser le reste autant qu'un torrent téléchargé
+            # (et un ajout/une taille précisée le fait monter). Dire le delta, pas plus.
             if d > 1024 * 1024:
-                var = f"📉 **{fmt.humanize_bytes(d)}** téléchargés"
+                var = f"📉 reste à télécharger : **−{fmt.humanize_bytes(d)}** (téléchargé ou retiré de la file)"
             elif d < -1024 * 1024:
-                var = f"📥 **{fmt.humanize_bytes(-d)}** ajoutés à la file"
+                var = f"📥 reste à télécharger : **+{fmt.humanize_bytes(-d)}** (ajout ou taille précisée)"
             else:
                 var = "= (stable)"
         emb.add_field(name="Variation depuis le refresh", value=var, inline=False)

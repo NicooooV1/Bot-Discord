@@ -92,7 +92,10 @@ def strip_status_emoji(nm):
 
 
 def level_emoji(level):
-    return {"crit": "🔥", "warn": "⚠️", "ok": "✅", None: "✅"}.get(level, "•")
+    # 2026-08-20 : None valait ✅ — un niveau NON CALCULÉ devenait un feu vert. Aucun
+    # appelant ne passe None pour dire « ok » (seul alerts.py appelle, et il filtre les
+    # niveaux vides avant le rendu) : None tombe donc sur le « • » neutre du défaut.
+    return {"crit": "🔥", "warn": "⚠️", "ok": "✅"}.get(level, "•")
 
 
 def health_color(pct, warn=80, crit=90):

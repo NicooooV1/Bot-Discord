@@ -10,12 +10,15 @@ from ..core.permissions import read_check
 def _data_pct(tp):
     """Usage RÉEL du thinpool (données écrites / taille pool), en %. C'est LA métrique
     qui doit rester < 100 % (un thinpool plein = corruption). À ne PAS confondre avec la
-    surallocation (overcommit), qui dépasse 100 % en thin provisioning et est normale."""
+    surallocation (overcommit), qui dépasse 100 % en thin provisioning et est normale.
+
+    Rend None quand les DEUX sources manquent : un 0.0 fabriqué affichait « 0 %
+    utilisé » et un embed vert sur une collecte morte (2026-08-20)."""
     dp = tp.get("data_percent")
     if dp is not None:
         return float(dp)
     du, pb = tp.get("data_used_bytes"), tp.get("pool_bytes")
-    return (du / pb * 100) if (du and pb) else 0.0
+    return (du / pb * 100) if (du and pb) else None
 
 
 class Storage(commands.Cog):
@@ -44,15 +47,20 @@ class Storage(commands.Cog):
                           inline=False)
         tp = await bot.influx.thinpool()
         if tp and tp.get("pool_bytes"):
-            dp = _data_pct(tp)                         # usage RÉEL (doit rester < 100 %)
+            dp = _data_pct(tp)                         # usage RÉEL (doit rester < 100 %), None si inconnu
             oc = tp.get("overcommit_percent")          # surallocation (info, peut > 100 %)
-            warn = " ⚠️" if dp >= 85 else ""           # alarme sur l'USAGE, pas la surallocation
-            value = (f"{fmt.pct_bar(dp)}\n"
-                     f"usage réel **{dp:.0f}%** — "
-                     f"{fmt.pct_of(tp.get('data_used_bytes'), tp.get('pool_bytes'))}")
+            if dp is None:
+                name = "Thinpool local-lvm — usage réel ?"
+                value = "⚠️ usage réel inconnu (métrique absente d'Influx)"
+            else:
+                warn = " ⚠️" if dp >= 85 else ""       # alarme sur l'USAGE, pas la surallocation
+                name = f"Thinpool local-lvm — {dp:.0f}%{warn}"
+                value = (f"{fmt.pct_bar(dp)}\n"
+                         f"usage réel **{dp:.0f}%** — "
+                         f"{fmt.pct_of(tp.get('data_used_bytes'), tp.get('pool_bytes'))}")
             if oc is not None:
                 value += f"\nsurprovision {oc:.0f}% (normal en thin provisioning)"
-            emb.add_field(name=f"Thinpool local-lvm — {dp:.0f}%{warn}", value=value, inline=False)
+            emb.add_field(name=name, value=value, inline=False)
         await itx.followup.send(embed=emb)
 
     @app_commands.command(description="Détail d'un thin pool (surprovisionnement).")
@@ -70,15 +78,26 @@ class Storage(commands.Cog):
             return
         oc = tp.get("overcommit_percent")
         dp = _data_pct(tp)                    # usage RÉEL = la métrique qui doit rester < 100 %
-        emb = discord.Embed(
-            title=f"🗄️ Thinpool {pool} — {dp:.0f}% utilisé",
-            description=("⚠️ Usage réel élevé — un thinpool PLEIN corrompt les volumes."
-                         if dp >= 85 else "Usage réel sous contrôle."),
-            color=fmt.RED if dp >= 90 else fmt.YELLOW if dp >= 85 else fmt.GREEN)
-        emb.add_field(name="Usage réel (données écrites)",
-                      value=f"**{dp:.0f}%** — "
-                            f"{fmt.pct_of(tp.get('data_used_bytes'), tp.get('pool_bytes'))}",
-                      inline=False)
+        if dp is None:
+            # 2026-08-20 : collecte morte ≠ pool vide — jamais « sous contrôle » ni
+            # d'embed vert quand la métrique manque.
+            emb = discord.Embed(
+                title=f"🗄️ Thinpool {pool} — usage réel ?",
+                description="⚠️ usage réel inconnu (métrique absente d'Influx) — "
+                            "impossible de dire si le pool se remplit.",
+                color=fmt.YELLOW)
+            emb.add_field(name="Usage réel (données écrites)",
+                          value="**?** (pas de donnée)", inline=False)
+        else:
+            emb = discord.Embed(
+                title=f"🗄️ Thinpool {pool} — {dp:.0f}% utilisé",
+                description=("⚠️ Usage réel élevé — un thinpool PLEIN corrompt les volumes."
+                             if dp >= 85 else "Usage réel sous contrôle."),
+                color=fmt.RED if dp >= 90 else fmt.YELLOW if dp >= 85 else fmt.GREEN)
+            emb.add_field(name="Usage réel (données écrites)",
+                          value=f"**{dp:.0f}%** — "
+                                f"{fmt.pct_of(tp.get('data_used_bytes'), tp.get('pool_bytes'))}",
+                          inline=False)
         emb.add_field(name="Taille pool", value=fmt.humanize_bytes(tp.get("pool_bytes")))
         emb.add_field(name="Alloué (provisionné)", value=fmt.humanize_bytes(tp.get("allocated_bytes")))
         if oc is not None:

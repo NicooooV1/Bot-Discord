@@ -822,14 +822,18 @@ class YouTube(commands.Cog):
                 # _yt renvoie le CORPS d'une erreur HTTP (ex. 404 « job inconnu ») : ce n'est
                 # PAS un job. Un 404 franc = ytgrab a redémarré et _sweep_orphans a tué le
                 # yt-dlp -> c'est un ARRÊT, pas une panne. Ne jamais afficher « Échec » ici.
+                # 2026-08-20 : on ne distingue pas le 404 des autres corps sans « state »
+                # (le corps JSON ne porte pas le code HTTP) — le redémarrage est donc dit
+                # PROBABLE, pas affirmé. Seule certitude : le job n'est plus connu.
                 lost += 1
                 if lost < 3:
                     continue
                 emb = discord.Embed(title=title, color=0x95A5A6,
                                     description=f"[Lien]({url})")
                 emb.add_field(
-                    name="⏹️ Arrêté",
-                    value="Le service de téléchargement a redémarré, le job a été interrompu.\n"
+                    name="⏹️ Suivi arrêté",
+                    value="Le job n'est plus connu du service de téléchargement "
+                          "(redémarrage probable de ytgrab).\n"
                           "Relance avec `/yt`, `/tw` ou `/musique`.", inline=False)
                 emb.set_footer(text=f"job {jid}")
                 view.freeze()
@@ -854,10 +858,13 @@ class YouTube(commands.Cog):
             elif state == "done":
                 emb.color = 0x2ECC71
                 nb = len(files) if files else 1
+                # 2026-08-20 : le scan Jellyfin n'est déclenché qu'APRÈS cet embed et son
+                # résultat est ignoré — « disponible » n'est pas vérifié, on dit « devrait ».
                 emb.add_field(
                     name="✅ Terminé",
-                    value=(f"**{nb} fichier(s)** disponibles" if nb > 1 else "Disponible")
-                          + f" dans Jellyfin → **{lib}** (peut prendre ~1 min à apparaître).",
+                    value=f"**{nb} fichier(s)** livré(s) ; "
+                          + ("ils devraient apparaître" if nb > 1 else "il devrait apparaître")
+                          + f" dans Jellyfin → **{lib}** d'ici ~1 min (scan demandé).",
                     inline=False)
                 if fn:
                     emb.add_field(name="Fichier" if nb == 1 else "Dernier fichier",
@@ -894,9 +901,12 @@ class YouTube(commands.Cog):
             elif state == "error" and files:
                 # playlist partiellement réussie (--ignore-errors) : PAS un échec sec.
                 emb.color = 0xE67E22
+                # même règle que « ✅ Terminé » : l'apparition dans Jellyfin n'est pas
+                # vérifiée, seul le scan est demandé (2026-08-20).
                 emb.add_field(
                     name="⚠️ Terminé avec des erreurs",
-                    value=f"**{len(files)}** fichier(s) téléchargés dans **{lib}**, "
+                    value=f"**{len(files)}** fichier(s) livré(s) — ils devraient apparaître "
+                          f"dans Jellyfin → **{lib}** d'ici ~1 min (scan demandé) — "
                           f"mais certains éléments ont échoué.\n"
                           f"`{(j.get('error') or 'détail indisponible')[:300]}`",
                     inline=False)
