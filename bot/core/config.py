@@ -333,6 +333,18 @@ class Config:
         self.dist_proposals_channel_id = _int(g("DIST_PROPOSALS_CHANNEL_ID"))
         self.dist_proposals_poll_seconds = max(30, _int(g("DIST_PROPOSALS_POLL_SECONDS", "120"), 120))
 
+        # --- Portail SSO Authelia (CT123 auth) 2026-08-20 ----------------------
+        # /sso + veille sso_watch : lecture SEULE de CT123 via l'hyperviseur
+        # (nodeshell.run_readonly puis `pct exec`). La table authentication_logs
+        # d'Authelia est la seule trace fiable des tentatives (le log texte ne les
+        # contient pas au niveau info). SSO_LOGIN_NOTIFY=0 tait les connexions
+        # réussies dans #alertes (bans et échecs restent toujours postés).
+        self.sso_ct_id = g("SSO_CT_ID", "123").strip()
+        self.sso_db = g("SSO_DB", "/opt/auth/authelia/db.sqlite3").strip()
+        self.sso_notif_file = g("SSO_NOTIF_FILE", "/opt/auth/authelia/notification.txt").strip()
+        self.sso_poll_seconds = max(60, _int(g("SSO_POLL_SECONDS", "120"), 120))
+        self.sso_login_notify = g("SSO_LOGIN_NOTIFY", "1").strip().lower() not in ("0", "false", "non", "no")
+
         # --- 2FA (TOTP) --------------------------------------------------------
         # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les
         # commandes sans laisser personne s'inscrire. On active APRÈS un /2fa setup.
