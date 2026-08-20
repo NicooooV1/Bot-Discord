@@ -11,6 +11,8 @@ se cale sur l'entrée la plus récente sans spammer tout l'historique.
 Salon provisionné par provision.py (_provision_jellyfin_log_channel) ; channel_id
 recâblé en direct après provisioning, comme NodeChannel."""
 import logging
+import re
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -41,6 +43,67 @@ _TYPE_EMOJI = {
 }
 
 _SEV_EMOJI = {"error": "❌", "critical": "❌", "warn": "⚠️", "warning": "⚠️"}
+
+# ------------------------------------------------ micro-coupures de session
+# L'appli TV (« Salon ») ferme et rouvre sa session en ~1 s à chaque reprise (et
+# parfois en boucle pendant la lecture) : Jellyfin logue une paire
+# SessionEnded/SessionStarted que le bot relayait telle quelle — Nico recevait des
+# « déconnecté » alors que la reconnexion avait suivi dans la seconde (2026-08-20).
+# Règle : une fin de session n'est publiée que si AUCUNE reconnexion du même
+# (utilisateur, appareil) n'arrive dans les FLAP_WINDOW_S ; une paire rapide est
+# absorbée en silence. Les fins en attente vivent dans state["jf_pending_ended"].
+FLAP_WINDOW_S = 300
+_RX_DEPUIS = re.compile(r" depuis (.+)$")
+
+
+def _flap_key(entry):
+    """(UserId, appareil, type) pour les entrées de session, None sinon."""
+    t = (entry.get("Type") or "").lower()
+    if t not in ("sessionstarted", "sessionended"):
+        return None
+    m = _RX_DEPUIS.search(entry.get("Name") or "")
+    return (entry.get("UserId"), m.group(1) if m else None, t)
+
+
+def _entry_dt(entry):
+    try:
+        d = datetime.fromisoformat((entry.get("Date") or "").replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
+def _classify(entries, pending, now):
+    """Sépare ce qui se publie de ce qui attend une reconnexion.
+
+    Rend (a_publier, pending'). `pending` = {str(Id): entrée} des fins de session
+    (ou des lignes dont l'envoi a échoué) en attente ; les entrées mûres (fenêtre
+    dépassée sans reconnexion) passent en tête de `a_publier`, en ordre d'Id.
+    """
+    pending = dict(pending)
+    posts = []
+    for e in entries:
+        key = _flap_key(e)
+        if key and key[2] == "sessionended":
+            pending[str(e["Id"])] = e
+            continue
+        if key and key[2] == "sessionstarted":
+            match = None
+            for pid, pe in pending.items():
+                pk = _flap_key(pe)
+                if (pk and pk[2] == "sessionended" and pk[:2] == key[:2]
+                        and abs((_entry_dt(e) - _entry_dt(pe)).total_seconds()) <= FLAP_WINDOW_S):
+                    match = pid
+                    break
+            if match is not None:
+                pending.pop(match)      # micro-coupure : les DEUX lignes disparaissent
+                continue
+        posts.append(e)
+    mures = [pe for pe in pending.values()
+             if (now - _entry_dt(pe)).total_seconds() > FLAP_WINDOW_S]
+    for pe in mures:
+        pending.pop(str(pe["Id"]), None)
+    return sorted(mures, key=lambda x: x.get("Id") or 0) + posts, pending
 
 
 def _emoji_for(entry):
@@ -112,7 +175,10 @@ class JellyfinActivity(commands.Cog):
             self.bot.state.set("jellyfin_activity_last_id", self._last_id)
             return
         new = [e for e in items if (e.get("Id") or 0) > self._last_id]
-        if not new:
+        # même sans nouveauté, une fin de session en attente doit pouvoir mûrir et
+        # être publiée une fois la fenêtre passée (sinon la DERNIÈRE déconnexion de
+        # la journée ne sortirait jamais, 2026-08-20)
+        if not new and not (self.bot.state.get("jf_pending_ended") or {}):
             return
         ch = self.bot.get_channel(self.channel_id)
         if ch is None:
@@ -128,29 +194,32 @@ class JellyfinActivity(commands.Cog):
         # curseur est persisté dans state.json, donc la perte survivait au redémarrage).
         # Le reliquat est repris au cycle suivant, 20 par 20.
         batch = new[:20]
-        sent = None
-        for i, entry in enumerate(batch):
+        # micro-coupures de session absorbées : cf. _classify. Le curseur avance sur
+        # tout le lot (les fins de session non publiées survivent dans pending, qui
+        # est persisté — rien n'est perdu, 2026-08-20).
+        pending = self.bot.state.get("jf_pending_ended") or {}
+        posts, pending = _classify(batch, pending, discord.utils.utcnow())
+        for i, entry in enumerate(posts):
             try:
                 await ch.send(self._format(entry))
             except (discord.Forbidden, discord.NotFound):
-                # Panne DURABLE (droit d'écriture retiré, salon supprimé) : garder le
-                # curseur ferait rejouer éternellement le même envoi voué à l'échec.
-                # On avance donc jusqu'au lot courant, mais on le DIT.
-                log.warning("jellyfin-logs %s inaccessible — %d entrée(s) non publiée(s), "
-                            "curseur avancé", self.channel_id, len(batch) - i,
-                            exc_info=True)
-                sent = batch[-1]["Id"]
+                # Panne DURABLE (droit d'écriture retiré, salon supprimé) : rejouer le
+                # même envoi voué à l'échec ne mène nulle part — on jette, et on le DIT.
+                log.warning("jellyfin-logs %s inaccessible — %d entrée(s) non publiée(s)",
+                            self.channel_id, len(posts) - i, exc_info=True)
                 break
             except discord.HTTPException:
-                # Panne transitoire : on s'arrête là, la suite repart au prochain tour.
+                # Panne transitoire : les lignes non parties retournent en attente et
+                # ressortiront au prochain cycle (via l'échéance de _classify).
                 log.warning("envoi vers jellyfin-logs échoué — reprise au cycle suivant",
                             exc_info=True)
+                for e in posts[i:]:
+                    pending[str(e["Id"])] = e
                 break
-            sent = entry["Id"]
-        if sent is None or sent == self._last_id:
-            return
-        self._last_id = sent
-        self.bot.state.set("jellyfin_activity_last_id", self._last_id)
+        self.bot.state.set("jf_pending_ended", pending)
+        if batch and batch[-1]["Id"] != self._last_id:
+            self._last_id = batch[-1]["Id"]
+            self.bot.state.set("jellyfin_activity_last_id", self._last_id)
 
     @poll.before_loop
     async def _before(self):

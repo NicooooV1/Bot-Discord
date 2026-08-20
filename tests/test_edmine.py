@@ -1039,5 +1039,53 @@ class TestLangueDepuisNomDeRelease(unittest.TestCase):
         self.assertEqual(emoji, "🎧")
 
 
+class TestMicroCoupuresJellyfin(unittest.TestCase):
+    """jellyfin_activity : une paire déconnexion/reconnexion rapide du même
+    (utilisateur, appareil) est absorbée — Nico recevait des « déconnecté depuis
+    Salon » alors que la reconnexion avait suivi dans la seconde (2026-08-20).
+    Une déconnexion SANS reconnexion dans la fenêtre reste publiée : l'absorption
+    ne doit jamais devenir du silence sur une vraie coupure."""
+
+    def _e(self, id_, type_, user="u1", dev="Salon", date="2026-08-20T16:43:29"):
+        return {"Id": id_, "Type": type_, "UserId": user, "Date": date,
+                "Name": "Nico s'est %s depuis %s" % (
+                    "connecté" if type_ == "SessionStarted" else "déconnecté", dev)}
+
+    def _run(self, entries, pending=None, now="2026-08-20T16:50:00"):
+        from datetime import datetime, timezone
+        from bot.cogs.jellyfin_activity import _classify
+        return _classify(entries, pending or {},
+                         datetime.fromisoformat(now).replace(tzinfo=timezone.utc))
+
+    def test_paire_rapide_absorbee(self):
+        posts, pending = self._run([
+            self._e(1431, "SessionEnded", date="2026-08-20T16:43:29"),
+            self._e(1432, "SessionStarted", date="2026-08-20T16:43:30"),
+        ], now="2026-08-20T16:44:00")
+        self.assertEqual(posts, [])
+        self.assertEqual(pending, {})
+
+    def test_deconnexion_durable_publiee_apres_la_fenetre(self):
+        _, pending = self._run([self._e(10, "SessionEnded")], now="2026-08-20T16:44:00")
+        self.assertIn("10", pending)          # d'abord en attente
+        posts, pending = self._run([], pending, now="2026-08-20T16:50:00")
+        self.assertEqual([p["Id"] for p in posts], [10])
+        self.assertEqual(pending, {})
+
+    def test_autre_appareil_ne_paire_pas(self):
+        posts, pending = self._run([
+            self._e(1, "SessionEnded", dev="Salon"),
+            self._e(2, "SessionStarted", dev="iPhone"),
+        ], now="2026-08-20T16:44:00")
+        self.assertEqual([p["Id"] for p in posts], [2])   # la connexion iPhone sort
+        self.assertIn("1", pending)                       # la fin Salon attend
+
+    def test_lecture_video_passe_telle_quelle(self):
+        e = {"Id": 5, "Type": "VideoPlayback", "Name": "Nico lit X", "Date": "2026-08-20T16:43:29"}
+        posts, pending = self._run([e], now="2026-08-20T16:44:00")
+        self.assertEqual(posts, [e])
+        self.assertEqual(pending, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
