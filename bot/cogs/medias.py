@@ -68,8 +68,11 @@ _RX_NOFR_LIST = re.compile(
 def _release_lang(name, arr_langs):
     """(emoji, libellé) de la langue d'une release, depuis son NOM d'abord.
 
-    Retombe sur les langues parsées par Radarr/Sonarr seulement si le nom ne porte
-    aucun marqueur — elles servent alors d'indice, pas de verdict (⚠️, pas 🇫🇷).
+    RÈGLE (Nico 2026-08-20) : le bot doit être RÉEL dans ses mots — il n'affirme que ce
+    que la release ANNONCE (marqueur VFF/VFQ/… dans le nom) ; tout ce qui n'est que
+    déduit est dit comme tel (« probable », « estimé »), jamais présenté comme un fait.
+    « MULTi » seul n'est PAS une garantie de VF, et les langues parsées par
+    Radarr/Sonarr ne sont qu'une estimation (vu : « Japanese » sur un MULTi.VFF).
     """
     name = name or ""
     for rx, emoji, label in _LANG_MARKERS:
@@ -80,10 +83,10 @@ def _release_lang(name, arr_langs):
     if _RX_MULTI.search(name):
         if _RX_NOFR_LIST.search(name):
             return "⚠️", "MULTi sans piste FR listée"
-        return "🇫🇷", "MULTi (VF incluse)"
+        return "🎧", "MULTi (VF probable, non annoncée)"
     if any((l or "").lower() == "french" for l in arr_langs):
-        return "🇫🇷", "/".join(arr_langs[:3])
-    return "⚠️", "/".join(arr_langs[:3]) or "langue inconnue"
+        return "🇫🇷", "/".join(arr_langs[:3]) + " (estimé)"
+    return "⚠️", ("/".join(arr_langs[:3]) + " (estimé)") if arr_langs else "langue inconnue"
 
 
 def _norm_titre(s):

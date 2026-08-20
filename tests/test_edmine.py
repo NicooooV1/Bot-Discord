@@ -1006,10 +1006,13 @@ class TestLangueDepuisNomDeRelease(unittest.TestCase):
         emoji, label = self._lang("Evil.Dead.Burn.2026.FRENCH.CA.2160p.WEB-SUPPLY")
         self.assertEqual(emoji, "🍁")
 
-    def test_multi_seul_vaut_vf_incluse(self):
+    def test_multi_seul_est_probable_pas_affirme(self):
+        # règle « le bot est réel dans ses mots » : MULTi seul n'ANNONCE pas la VF,
+        # le bot dit « probable », il n'affiche pas 🇫🇷 comme un fait
         emoji, label = self._lang("Grimsby.2016.MULTi.1080p.WEB.H264-SiGeRiS", ["English"])
-        self.assertEqual(emoji, "🇫🇷")
+        self.assertEqual(emoji, "🎧")
         self.assertIn("MULTi", label)
+        self.assertIn("probable", label)
 
     def test_multi_avec_liste_sans_fr_est_signale(self):
         emoji, label = self._lang("Cars.3.2017.Multi.2160p.BluRay.[En+Hi]-DT", ["English"])
@@ -1028,11 +1031,12 @@ class TestLangueDepuisNomDeRelease(unittest.TestCase):
         emoji, label = self._lang("Movie.2020.1080p.BluRay-X", ["English"])
         self.assertEqual(emoji, "⚠️")
         self.assertIn("English", label)
+        self.assertIn("estimé", label)   # une langue parsée n'est jamais un fait
 
     def test_le_groupe_de_release_ne_pollue_pas(self):
         # « ENIGMA » contient « eng », « DE » peut apparaître : bornes de mots obligatoires
         emoji, _ = self._lang("Film.2024.MULTi.2160p.WEB.H265-ENIGMA")
-        self.assertEqual(emoji, "🇫🇷")
+        self.assertEqual(emoji, "🎧")
 
 
 if __name__ == "__main__":
