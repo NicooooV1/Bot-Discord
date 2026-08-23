@@ -26,7 +26,8 @@ log = logging.getLogger("discord-bot.servarr")
 RATIO_WARN = 1.0
 RATIO_CHANNEL = "ratio"
 # Vraies stats C411 (le tracker, ≠ ratio local qBittorrent) — saisies via /setratio.
-DEFAULT_C411 = {"ratio": 2.96, "up_to": 2.592, "dl_go": 898.1, "bonus_go": 269.8}
+# Repli seulement (jamais saisi + relève morte) ; rebasé sur le relevé officiel du 2026-08-23.
+DEFAULT_C411 = {"ratio": 27.86, "up_to": 46.355, "dl_go": 1663.8, "bonus_go": 289.8}
 #: Clés d'alerte émises par ce cog. Servent à REPRENDRE les clés nues écrites avant le
 #: cloisonnement de state["alerts"] (cf. core/state.AlertSpace) : sans cette reprise, les
 #: alertes en cours seraient toutes re-postées dans #alertes au premier démarrage.
@@ -832,7 +833,7 @@ class Servarr(commands.Cog):
         await itx.followup.send(embed=_emb_torrents(dl), view=view, ephemeral=True)
 
     @app_commands.command(description="Mettre à jour tes vraies stats C411 (ratio, upload, download, bonus).")
-    @app_commands.describe(ratio="Ton ratio C411 (ex. 2.96)", upload_to="Upload en To (ex. 2.592)",
+    @app_commands.describe(ratio="Ton ratio C411 (ex. 27.86)", upload_to="Upload en To (ex. 46.355)",
                            download_go="Download en Go (ex. 898.1)", bonus_go="Bonus en Go (optionnel)")
     @admin_check(require_admin_channel=False)
     async def setratio(self, itx: discord.Interaction, ratio: float, upload_to: float,
