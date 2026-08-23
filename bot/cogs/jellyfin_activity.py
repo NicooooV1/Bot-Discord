@@ -25,10 +25,12 @@ POLL_MINUTES = 2
 PAGE_SIZE = 50
 
 _TYPE_EMOJI = {
-    "sessionstart": "🟢",
+    "sessionstarted": "🟢",
     "sessionended": "🔴",
-    "playbackstart": "▶️",
-    "playbackstopped": "⏹️",
+    "videoplayback": "▶️",
+    "videoplaybackstopped": "⏹️",
+    "audioplayback": "🎵",
+    "audioplaybackstopped": "⏹️",
     "authenticationsucceeded": "🔓",
     "authenticationfailed": "🚫",
     "authenticationfailure": "🚫",
