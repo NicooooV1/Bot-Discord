@@ -1,6 +1,7 @@
-"""Journal Jellyseerr dans #jellyseerr-logs (catégorie 🔒 Lock, 2026-08-24) — demande
-Nico : « que les logs jellyfin et jellyseerr soient séparés, que j'aie aussi les
-demandes (X a demandé X films/série) ».
+"""Journal Jellyseerr dans #jelly-logs (catégorie 🔒 Lock, 2026-08-24) — demandes
+(« X a demandé X films/série »), refus et disponibilité. D'abord voulu séparé, puis
+fusionné le même jour : « il faut que tout soit dans un seul salon, jelly-logs » —
+le cog écrit donc dans LE MÊME salon que JellyfinActivity (prov jellyfin_logs).
 
 Source : l'API Jellyseerr (servarr-apis.json, comme le cog Medias) :
   • GET /api/v1/request?sort=added  -> nouvelles demandes (« Nico a demandé … ») ;
@@ -57,7 +58,7 @@ class SeerrActivity(commands.Cog):
         self.bot = bot
         self.cfg = bot.cfg
         self.seerr = client_for(load_service_apis(), "seerr")
-        self.channel_id = (bot.state.get("prov", {}) or {}).get("seerr_logs")
+        self.channel_id = (bot.state.get("prov", {}) or {}).get("jellyfin_logs")
         self._last_id = bot.state.get("seerr_last_req_id")
         # {str(request_id): [status, media_status]} — transitions déjà publiées
         self._statuts = dict(bot.state.get("seerr_req_status", {}) or {})
@@ -128,7 +129,7 @@ class SeerrActivity(commands.Cog):
             try:
                 ch = await self.bot.fetch_channel(self.channel_id)
             except Exception:  # noqa: BLE001
-                log.warning("salon jellyseerr-logs %s introuvable", self.channel_id)
+                log.warning("salon jelly-logs %s introuvable", self.channel_id)
                 return
         lignes = []
         maxi = self._last_id
@@ -164,11 +165,11 @@ class SeerrActivity(commands.Cog):
                 await ch.send(ligne, allowed_mentions=discord.AllowedMentions.none())
                 envoyees += 1
         except (discord.Forbidden, discord.NotFound):
-            log.warning("jellyseerr-logs %s inaccessible — %d ligne(s) non publiée(s)",
+            log.warning("jelly-logs %s inaccessible — %d ligne(s) non publiée(s)",
                         self.channel_id, len(lignes) - envoyees, exc_info=True)
             return
         except discord.HTTPException:
-            log.warning("envoi vers jellyseerr-logs échoué — reprise au cycle suivant",
+            log.warning("envoi vers jelly-logs échoué — reprise au cycle suivant",
                         exc_info=True)
             return
         self._last_id = maxi
