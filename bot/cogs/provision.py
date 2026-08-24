@@ -394,6 +394,46 @@ class Provision(commands.Cog):
         self.prov["jellyfin_logs"] = ch.id
         return ch
 
+    async def _provision_seerr_log_channel(self, guild):
+        """Salon #jellyseerr-logs dans « 🔒 Lock » : journal des demandes Jellyseerr
+        (X a demandé tel film/série, refus, disponibilité) — séparé de #jellyfin-logs
+        (demande Nico 2026-08-24)."""
+        cog = self.bot.get_cog("SeerrActivity")
+        if cog is None or not cog.enabled:
+            return
+        ow = self._lock_fn(guild)
+        if ow is None:
+            log.warning("rôles M/O non résolus — #jellyseerr-logs NON provisionné ce cycle")
+            return
+        cat = await self._ensure_lock_category(guild)
+        name = "jellyseerr-logs"
+        cid = self.prov.get("seerr_logs")
+        ch = guild.get_channel(cid) if cid else None
+        if not isinstance(ch, discord.TextChannel):
+            ch = discord.utils.get(cat.text_channels, name=name)
+        if not isinstance(ch, discord.TextChannel):
+            ch = await guild.create_text_channel(
+                name=name, category=cat, overwrites=ow,
+                topic="Journal Jellyseerr (demandes, approbations, disponibilité) — "
+                      "propriétaire uniquement.",
+                reason="auto-provision : journal Jellyseerr")
+            log.info("salon jellyseerr-logs créé: #%s", ch.name)
+        else:
+            if ch.category_id != cat.id:
+                try:
+                    await ch.edit(category=cat, sync_permissions=True,
+                                  reason="auto-provision: rangement dans Lock")
+                except discord.HTTPException:
+                    log.warning("#jellyseerr-logs : rangement dans Lock impossible")
+            if perms.lock_perms_drifted(ch, guild, self.cfg):
+                try:
+                    await ch.edit(overwrites=ow,
+                                  reason="salon jellyseerr-logs : propriétaire uniquement")
+                except discord.HTTPException:
+                    log.exception("application des permissions de jellyseerr-logs")
+        self.prov["seerr_logs"] = ch.id
+        return ch
+
     async def _ensure_text(self, guild, name, category, key_store, key, topic=None,
                            global_fallback=True, overwrites=None):
         """Adopte (id persisté -> nom dans la catégorie) ou crée un salon texte.
@@ -569,6 +609,7 @@ class Provision(commands.Cog):
                 lock_cat = await self._ensure_lock_category(guild)
                 await self._provision_node_channel(guild)
                 await self._provision_jellyfin_log_channel(guild)
+                await self._provision_seerr_log_channel(guild)
                 # toute la catégorie Lock (salon nœud + salons persos) = Gestion+O R820
                 await self._enforce_perms(guild, lock_cat, self._lock_fn)
             except Exception:
@@ -999,6 +1040,12 @@ class Provision(commands.Cog):
             jfcog.channel_id = self.prov["jellyfin_logs"]
             if not jfcog.poll.is_running():
                 jfcog.poll.start()
+        # journal des demandes Jellyseerr : même mécanique que JellyfinActivity
+        seerrcog = self.bot.get_cog("SeerrActivity")
+        if seerrcog is not None and seerrcog.enabled and self.prov.get("seerr_logs"):
+            seerrcog.channel_id = self.prov["seerr_logs"]
+            if not seerrcog.poll.is_running():
+                seerrcog.poll.start()
 
     # ------------------------------------ rendus thématiques (message épinglé)
     # Les embeds eux-mêmes sont dans provision_embeds ; ici, seule la publication.

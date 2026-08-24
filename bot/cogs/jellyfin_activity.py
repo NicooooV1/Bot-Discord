@@ -56,6 +56,26 @@ _SEV_EMOJI = {"error": "❌", "critical": "❌", "warn": "⚠️", "warning": "�
 # absorbée en silence. Les fins en attente vivent dans state["jf_pending_ended"].
 FLAP_WINDOW_S = 300
 _RX_DEPUIS = re.compile(r" depuis (.+)$")
+_RX_IP = re.compile(r"Adresse IP\s*:\s*([0-9a-fA-F.:]+)")
+
+
+def _hms(sec):
+    """4930 -> « 1:22:10 » (heures sans zéro de tête, comme l'UI Jellyfin)."""
+    h, r = divmod(int(sec), 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _seerr_host_ip():
+    """IP du Jellyseerr de servarr-apis.json (None s'il n'est pas configuré) : une
+    authentification Jellyfin venant de cette adresse est faite PAR Seerr."""
+    try:
+        from urllib.parse import urlsplit
+        from ..core.http import load_service_apis
+        url = (load_service_apis().get("seerr") or {}).get("url") or ""
+        return urlsplit(url).hostname
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _flap_key(entry):
@@ -122,6 +142,8 @@ class JellyfinActivity(commands.Cog):
         self.cfg = bot.cfg
         self.channel_id = (bot.state.get("prov", {}) or {}).get("jellyfin_logs")
         self._last_id = bot.state.get("jellyfin_activity_last_id")
+        self._seerr_ip = _seerr_host_ip()
+        self._sessions_cache = None    # rempli au plus une fois par tour de poll
         if self.channel_id and self.enabled:
             self.poll.start()
 
@@ -142,14 +164,102 @@ class JellyfinActivity(commands.Cog):
                          {"Authorization": f'MediaBrowser Token="{self.cfg.jellyfin_api_key}"'},
                          timeout=8, label="jellyfin activity")
 
-    def _format(self, entry):
+    def _format(self, entry, extra=None):
         when = (entry.get("Date") or "")[:19].replace("T", " ")
         who = entry.get("Name") or "?"
         overview = entry.get("ShortOverview") or entry.get("Overview") or ""
         line = f"{_emoji_for(entry)} `{when}` {who}"
         if overview and overview != who:
             line += f" — {overview}"
+        if extra:
+            line += f" — {extra}"
         return line[:500]
+
+    # ------------------------------------------------ enrichissements (Nico 24/08)
+
+    async def _sessions(self):
+        """GET /Sessions, UNE fois par tour de poll (cache remis à zéro par poll()).
+        Sert à nommer le client d'une authentification : l'ActivityLog ne donne que
+        l'adresse IP, la session dit « Streamyfin sur iPhone »."""
+        if self._sessions_cache is None:
+            s = await self._client().aget("/Sessions", quiet=True)
+            self._sessions_cache = s if isinstance(s, list) else []
+        return self._sessions_cache
+
+    async def _provenance_auth(self, entry):
+        """« via Jellyseerr » / « Streamyfin sur iPhone » / « Jellyfin Web sur Firefox ».
+
+        Deux sources, dans l'ordre :
+        • l'adresse IP de l'entrée : celle du CT Jellyseerr = une connexion faite PAR
+          Seerr (import d'utilisateur, login Seerr adossé à Jellyfin) — les sessions ne
+          la voient pas, c'est un aller-retour serveur→serveur ;
+        • sinon la session la plus récente du même utilisateur (fenêtre 10 min) : son
+          Client/DeviceName désigne l'appli réelle (Streamyfin, Jellyfin Web, TV…)."""
+        m = _RX_IP.search(entry.get("ShortOverview") or "")
+        ip = m.group(1) if m else None
+        if ip and self._seerr_ip and ip == self._seerr_ip:
+            return "via **Jellyseerr**"
+        uid = entry.get("UserId") or ""
+        if not uid.strip("0"):
+            return None                      # échec d'auth : pas de session à croiser
+        ref = _entry_dt(entry)
+        best = None
+        for s in await self._sessions():
+            if s.get("UserId") != uid:
+                continue
+            try:
+                d = datetime.fromisoformat(
+                    (s.get("LastActivityDate") or "").replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            ecart = abs((d - ref).total_seconds())
+            if ecart <= 600 and (best is None or ecart < best[0]):
+                best = (ecart, s)
+        if best is None:
+            return None
+        client = (best[1].get("Client") or "").strip()
+        device = (best[1].get("DeviceName") or "").strip()
+        if not client:
+            return None
+        via = f"sur **{client}**"
+        if device and device.lower() not in client.lower():
+            via += f" ({device})"
+        return via
+
+    async def _timecode_arret(self, entry):
+        """« arrêté à 0:42:10 / 0:57:31 (73 %) » pour un VideoPlaybackStopped.
+
+        La position n'est pas dans l'ActivityLog : c'est la position de REPRISE que
+        Jellyfin vient d'enregistrer sur l'item (UserData.PlaybackPositionTicks).
+        Position nulle + Played = visionnage terminé. Échec d'appel = pas de suffixe
+        (la ligne sort quand même, l'info est un bonus)."""
+        uid, iid = entry.get("UserId"), entry.get("ItemId")
+        if not (uid and iid):
+            return None
+        item = await self._client().aget(f"/Users/{uid}/Items/{iid}", quiet=True)
+        if not isinstance(item, dict):
+            return None
+        ud = item.get("UserData") or {}
+        pos = int(ud.get("PlaybackPositionTicks") or 0) // 10_000_000
+        duree = int(item.get("RunTimeTicks") or 0) // 10_000_000
+        if pos <= 0:
+            return "**terminé**" if ud.get("Played") else None
+        txt = f"arrêté à **{_hms(pos)}**"
+        if duree > 0:
+            txt += f" / {_hms(duree)} ({round(pos * 100 / duree)} %)"
+        return txt
+
+    async def _extra(self, entry):
+        t = (entry.get("Type") or "").lower()
+        try:
+            if t in ("authenticationsucceeded", "authenticationfailed",
+                     "authenticationfailure"):
+                return await self._provenance_auth(entry)
+            if t == "videoplaybackstopped":
+                return await self._timecode_arret(entry)
+        except Exception:  # noqa: BLE001 — l'enrichissement ne doit jamais bloquer la ligne
+            log.debug("enrichissement impossible", exc_info=True)
+        return None
 
     # ------------------------------------------------------------------ boucle
 
@@ -201,9 +311,10 @@ class JellyfinActivity(commands.Cog):
         # est persisté — rien n'est perdu, 2026-08-20).
         pending = self.bot.state.get("jf_pending_ended") or {}
         posts, pending = _classify(batch, pending, discord.utils.utcnow())
+        self._sessions_cache = None    # cache /Sessions : au plus un GET par tour
         for i, entry in enumerate(posts):
             try:
-                await ch.send(self._format(entry))
+                await ch.send(self._format(entry, extra=await self._extra(entry)))
             except (discord.Forbidden, discord.NotFound):
                 # Panne DURABLE (droit d'écriture retiré, salon supprimé) : rejouer le
                 # même envoi voué à l'échec ne mène nulle part — on jette, et on le DIT.
