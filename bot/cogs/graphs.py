@@ -20,6 +20,7 @@ from discord.ext import commands
 from ..core import format as fmt
 from ..core import render
 from ..core.permissions import read_check
+from ..core import ui
 from ..core.ui import target_autocomplete
 
 log = logging.getLogger("discord-bot.graphs")
@@ -178,6 +179,17 @@ class Graphs(commands.Cog):
         m = metric.value
 
         avy = await self._avy_target(tgt)
+        # Serveur de la cible : nœud/invité Aveyron -> AVY-<NŒUD>, sinon R820. Refus si le
+        # salon n'est pas de ce serveur (Nico 2026-08-26 : on ne mélange rien).
+        if avy is not None:
+            kind, ident, _ = avy
+            tgt_srv = bot.pve.avy_server_key(ident if kind == "node" else (ident.get("node") or "?"))
+        else:
+            tgt_srv = None
+        refus = ui.server_mismatch(bot, itx, tgt, tgt_srv)
+        if refus:
+            await itx.followup.send(refus)
+            return
         if avy is not None:
             kind, ident, label = avy
             title = f"{metric.name} — {label} ({rng})"

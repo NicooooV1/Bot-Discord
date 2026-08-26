@@ -369,3 +369,104 @@ class TestVerdictDeTache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------- séparation des serveurs
+class FauxPve:
+    avy_enabled = True
+    enabled = True
+
+    @staticmethod
+    def avy_server_key(node):
+        return f"AVY-{str(node).upper()}"
+
+    @staticmethod
+    def is_avy_name(name):
+        return str(name).endswith("-avy")
+
+    @staticmethod
+    def guest_map():
+        return {"caddy": {"type": "lxc", "vmid": 105, "status": "running"},
+                "nas-vm-avy": {"type": "qemu", "vmid": 1000100, "status": "running", "node": "nas"},
+                "llm-avy": {"type": "qemu", "vmid": 1000342, "status": "stopped", "node": "llm"}}
+
+
+class FauxCfg:
+    server_key = "R820"
+    avy_nodes = ["nas", "ms01", "llm"]
+    pve_node = "pve"
+
+
+class FauxBot:
+    def __init__(self, cats):
+        self.cfg = FauxCfg()
+        self.pve = FauxPve()
+        self.state = FauxEtat({"prov": {"categories": cats}})
+
+
+def faux_salon(cat):
+    class S:  # salon texte minimal : seule `.category` est lue
+        category = cat
+        parent = None
+    return S()
+
+
+class TestSeparationServeurs(unittest.TestCase):
+    """Règle Nico 2026-08-26 : « chaque serveur est séparé, on ne mélange rien ». Le
+    rapport quotidien du R820 affichait un champ « Aveyron (3 nœuds) » ; /health, /ping,
+    /cts aussi. Ces tests ancrent la définition unique « quel serveur est ce salon » et
+    l'autocomplétion qui en découle."""
+
+    def setUp(self):
+        self.c_r820 = faux_categorie(1, "Gestion R820")
+        self.c_nas = faux_categorie(2, "Gestion AVY-NAS")
+        self.c_llm_nom = faux_categorie(3, "📊 Supervision AVY-LLM")   # pas publiée par prov
+        self.c_syno = faux_categorie(4, "🔒 Lock SYNO")
+        self.bot = FauxBot({"containers": 1, "avy_gest_nas": 2})
+
+    def test_server_of_channel(self):
+        f = channels.server_of_channel
+        self.assertEqual(f(self.bot, None), "R820")
+        self.assertEqual(f(self.bot, faux_salon(None)), "R820")
+        self.assertEqual(f(self.bot, faux_salon(self.c_r820)), "R820")
+        self.assertEqual(f(self.bot, faux_salon(self.c_nas)), "AVY-NAS")
+        # repli sur le NOM quand provision n'a pas (encore) publié l'id
+        self.assertEqual(f(self.bot, faux_salon(self.c_llm_nom)), "AVY-LLM")
+        self.assertEqual(f(self.bot, faux_salon(self.c_syno)), "SYNO")
+
+    def test_same_server(self):
+        self.assertTrue(channels.same_server("R820", None))
+        self.assertFalse(channels.same_server("R820", "AVY-NAS"))
+        self.assertTrue(channels.same_server("AVY-NAS", "AVY-NAS"))
+        self.assertFalse(channels.same_server("AVY-NAS", None))
+        self.assertTrue(channels.same_server("AVY", "AVY-LLM"))
+        self.assertFalse(channels.same_server("AVY", None))
+
+    def test_autocomplete_par_serveur(self):
+        import asyncio
+        from bot.core import ui
+        run = asyncio.run
+        r820 = [c.value for c in run(ui._lxc_choices(self.bot, "", True, faux_salon(self.c_r820)))]
+        self.assertEqual(r820, ["pve", "caddy"])
+        nas = [c.value for c in run(ui._lxc_choices(self.bot, "", True, faux_salon(self.c_nas)))]
+        self.assertEqual(nas, ["avy:nas", "nas-vm-avy"])
+        # salon sans catégorie (#général) = serveur de l'instance, JAMAIS Aveyron
+        gen = [c.value for c in run(ui._lxc_choices(self.bot, "", True, faux_salon(None)))]
+        self.assertEqual(gen, ["pve", "caddy"])
+
+    def test_server_mismatch(self):
+        from bot.core import ui
+
+        class I:
+            channel = faux_salon(self.c_r820)
+        self.assertIsNone(ui.server_mismatch(self.bot, I(), "caddy", None))
+        self.assertIn("AVY-NAS", ui.server_mismatch(self.bot, I(), "nas-vm-avy", "AVY-NAS"))
+
+    def test_vues_r820_sans_aveyron(self):
+        """Le rapport quotidien, /health, /ping et /cts du R820 ne lisent plus le cog Avy."""
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for f in ("bot/cogs/reports.py", "bot/cogs/status.py"):
+            with open(os.path.join(here, f), encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertNotIn('get_cog("Avy")', src.split("async def _post_avy")[0]
+                             if f.endswith("reports.py") else src, f)

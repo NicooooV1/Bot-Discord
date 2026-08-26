@@ -133,26 +133,9 @@ class Reports(commands.Cog):
         if sans_donnees:
             emb.add_field(name="Sources sans données ce matin",
                           value="➖ " + ", ".join(sans_donnees), inline=False)
-
-        avy = bot.get_cog("Avy")
-        if avy is not None and getattr(avy, "enabled", False):
-            try:
-                rows = await avy.health_rows()
-            except Exception:
-                log.warning("rapport : état du cluster Aveyron indisponible", exc_info=True)
-                rows = []
-            if rows:
-                icon = {"crit": "🔥", "warn": "⚠️", "ok": "✅", "na": "➖"}
-                lines = [f"{icon.get(l, '•')} {n} : {d}" for l, n, d in rows]
-                # nombre de nœuds dérivé des lignes réelles (1 ligne cluster + 1/nœud),
-                # plus de « 3 nœuds » codé en dur (2026-08-20)
-                n_nodes = sum(1 for _, n, _ in rows if str(n).startswith("Aveyron — "))
-                name = f"Aveyron ({n_nodes} nœud{'s' if n_nodes > 1 else ''})" if n_nodes else "Aveyron"
-                emb.add_field(name=name, value="\n".join(lines)[:1024], inline=False)
-            else:
-                # omission silencieuse = « rien à signaler » mensonger (2026-08-20)
-                emb.add_field(name="Aveyron",
-                              value="➖ indisponible (pas de données ce matin)", inline=False)
+        # ⛔ Plus AUCUNE ligne Aveyron ici (Nico 2026-08-26 : « chaque serveur est séparé,
+        # on ne mélange rien ») : chaque nœud Aveyron a SON rapport dans #rapports-<nœud>
+        # (Avy.post_rapports). Ce rapport-ci = R820 seul.
 
         if bot.loki.enabled:
             try:

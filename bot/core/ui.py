@@ -6,23 +6,37 @@ import discord
 from discord import app_commands
 
 
-async def _lxc_choices(bot, current, include_host=False):
+async def _lxc_choices(bot, current, include_host=False, channel=None):
+    """Choix d'invités (et d'hôtes) LIMITÉS au serveur du salon `channel`.
+
+    Nico 2026-08-26 : « chaque serveur est séparé, on ne mélange rien ». Avant, la liste
+    mêlait l'hôte R820, les nœuds Aveyron et les invités des deux clusters ; désormais un
+    salon R820 ne voit que le R820, un salon AVY-NAS que le nœud nas et ses invités."""
+    from bot.core import channels as _ch
+    srv = _ch.server_of_channel(bot, channel)
+    default = getattr(bot.cfg, "server_key", "R820")
     try:
         gm = await asyncio.to_thread(bot.pve.guest_map) if bot.pve.enabled else {}
     except Exception:
         gm = {}
     cur = (current or "").lower()
     out = []
-    if include_host and (not cur or cur in bot.cfg.pve_node.lower()):
+    if include_host and _ch.same_server(srv, None, default) \
+            and (not cur or cur in bot.cfg.pve_node.lower()):
         out.append(app_commands.Choice(name=f"{bot.cfg.pve_node} (hôte)", value=bot.cfg.pve_node))
-    # nœuds du cluster Aveyron : pseudo-cibles « avy:<nom> » (graphes via RRD)
+    # nœuds du cluster Aveyron : pseudo-cibles « avy:<nom> » (graphes via RRD) — uniquement
+    # depuis les salons DE ce nœud
     if include_host and getattr(bot.pve, "avy_enabled", False):
-        for n in bot.pve.avy_nodes():
+        for n in (getattr(bot.cfg, "avy_nodes", None) or []):
+            if not _ch.same_server(srv, bot.pve.avy_server_key(n), default):
+                continue
             label = f"{n} (hôte Aveyron)"
             if not cur or cur in label.lower() or cur in f"avy:{n}":
                 out.append(app_commands.Choice(name=label, value=f"avy:{n}"))
     for name, info in sorted(gm.items()):
         if info.get("type") not in ("lxc", "qemu"):
+            continue
+        if not _ch.same_server(srv, guest_server(bot, name, info), default):
             continue
         if cur and cur not in name.lower() and cur not in str(info.get("vmid", "")):
             continue
@@ -35,12 +49,36 @@ async def _lxc_choices(bot, current, include_host=False):
     return out[:25]
 
 
+def guest_server(bot, name, info=None):
+    """Clé serveur d'un invité à partir de son entrée `guest_map` (None = R820).
+    Sans I/O : `info` est l'entrée déjà lue (évite un `server_of_name` bloquant)."""
+    if not bot.pve.is_avy_name(name):
+        return None
+    node = (info or {}).get("node")
+    return bot.pve.avy_server_key(node) if node else "AVY"
+
+
+def server_mismatch(bot, interaction, target, target_srv):
+    """Message de refus si `target` (serveur `target_srv`, None = R820) n'appartient pas
+    au serveur du salon de `interaction` ; None sinon. Garde commune de /ct et /graph."""
+    from bot.core import channels as _ch
+    default = getattr(bot.cfg, "server_key", "R820")
+    srv = _ch.server_of_channel(bot, getattr(interaction, "channel", None))
+    if _ch.same_server(srv, target_srv, default):
+        return None
+    return (f"⛔ `{target}` appartient au serveur **{target_srv or default}**, pas à "
+            f"**{srv}** : les serveurs ne se mélangent pas. Relance la commande depuis "
+            f"un salon de **{target_srv or default}**.")
+
+
 async def ct_autocomplete(interaction, current):
-    return await _lxc_choices(interaction.client, current, include_host=False)
+    return await _lxc_choices(interaction.client, current, include_host=False,
+                              channel=getattr(interaction, "channel", None))
 
 
 async def target_autocomplete(interaction, current):
-    return await _lxc_choices(interaction.client, current, include_host=True)
+    return await _lxc_choices(interaction.client, current, include_host=True,
+                              channel=getattr(interaction, "channel", None))
 
 
 # ---------------------------------------------------------------- message épinglé

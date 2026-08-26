@@ -97,6 +97,63 @@ def supervision_category(bot, guild):
     return resolve(bot, guild, "supervision", f"Supervision {srv}")
 
 
+def server_of_channel(bot, channel):
+    """Clé serveur du SALON d'où part une commande : « R820 » (SERVER_KEY) par défaut,
+    « AVY-<NŒUD> » dans une catégorie provisionnée d'un nœud Aveyron, « AVY » dans la
+    catégorie générique `containers_avy`, « SYNO » dans celles du NAS.
+
+    Règle Nico 2026-08-26 : « chaque serveur est séparé, on ne mélange rien ». Cette
+    fonction est la SEULE définition de « quel serveur est ce salon » : l'autocomplétion
+    et les commandes qui prennent une cible (/ct, /graph) s'en servent pour ne proposer
+    et n'afficher que les machines du serveur courant.
+
+    Sources, par ordre de fiabilité : l'id de catégorie publié par provision
+    (`state["prov"]["categories"]`), puis le NOM de la catégorie (normalisé) pour un
+    provisioning pas encore passé. Salon sans catégorie (#général, DM) = serveur de
+    CETTE instance.
+    """
+    srv = getattr(bot.cfg, "server_key", "R820")
+    if channel is None:
+        return srv
+    cat = channel if isinstance(channel, discord.CategoryChannel) else None
+    if cat is None:
+        # fil -> salon parent -> catégorie
+        parent = getattr(channel, "parent", None)
+        cat = getattr(channel, "category", None) or getattr(parent, "category", None)
+    if cat is None:
+        return srv
+    cats = ((bot.state.get("prov") or {}).get("categories") or {})
+    for key, cid in cats.items():
+        if cid != cat.id:
+            continue
+        for pfx in ("avy_sup_", "avy_gest_", "avy_lock_"):
+            if key.startswith(pfx):
+                return bot.pve.avy_server_key(key[len(pfx):])
+        if key == "containers_avy":
+            return "AVY"
+        if key.startswith("syno_"):
+            return "SYNO"
+        return srv
+    n = norm(cat.name)
+    for node in (getattr(bot.cfg, "avy_nodes", None) or []):
+        k = bot.pve.avy_server_key(node)
+        if n.endswith(norm(k)):
+            return k
+    if n.endswith(norm("SYNO")):
+        return "SYNO"
+    return srv
+
+
+def same_server(channel_srv, target_srv, default="R820"):
+    """True si une cible de serveur `target_srv` (None = cluster primaire) peut être
+    montrée dans un salon de serveur `channel_srv`. « AVY » (catégorie générique
+    Aveyron) accepte tout nœud AVY-*."""
+    t = target_srv or default
+    if channel_srv == "AVY":
+        return str(t).startswith("AVY-")
+    return channel_srv == t
+
+
 def is_public(channel):
     """True si @everyone peut VOIR ce salon/cette catégorie (None si indéterminable)."""
     guild = getattr(channel, "guild", None)

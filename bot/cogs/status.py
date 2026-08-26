@@ -11,6 +11,7 @@ from ..core import bg
 from ..core import format as fmt
 from ..core import render
 from ..core.permissions import read_check
+from ..core import ui
 from ..core.ui import ct_autocomplete
 from .graphs import to_local     # même repère de temps que les graphes RRD (cfg.tz)
 from .storage import _data_pct   # usage RÉEL du thinpool : une seule définition
@@ -65,6 +66,21 @@ class Status(commands.Cog):
 
         bg.spawn(_read(), name="Status.version", logger=log)
 
+    async def _r820_only(self, itx):
+        """True si la commande peut continuer. Les vues Influx/Loki (/status, /health,
+        /node) sont celles du R820 : lancées depuis une catégorie d'un AUTRE serveur
+        (AVY-NAS, SYNO…) elles répondraient avec les chiffres du R820 — un mélange
+        (Nico 2026-08-26). On refuse et on renvoie vers les salons du bon serveur."""
+        from ..core import channels as _ch
+        srv = _ch.server_of_channel(self.bot, getattr(itx, "channel", None))
+        mine = getattr(self.bot.cfg, "server_key", "R820")
+        if srv == mine:
+            return True
+        await itx.followup.send(
+            f"⛔ Cette commande décrit le serveur **{mine}** ; ce salon appartient à "
+            f"**{srv}**. L'état de {srv} est dans ses propres salons de supervision.")
+        return False
+
     def _scope(self):
         """Suffixe de libellé quand un compteur ne couvre QUE le cluster primaire.
         Les métriques d'invités Aveyron vivent dans un autre bucket InfluxDB, donc tout
@@ -75,6 +91,8 @@ class Status(commands.Cog):
     @read_check()
     async def status(self, itx: discord.Interaction):
         await itx.response.defer()
+        if not await self._r820_only(itx):
+            return
         bot = self.bot
         emb = discord.Embed(title="🖥️ État du homelab", color=fmt.BLURPLE)
         if not bot.influx.enabled:
@@ -146,6 +164,8 @@ class Status(commands.Cog):
     @read_check()
     async def health(self, itx: discord.Interaction):
         await itx.response.defer()
+        if not await self._r820_only(itx):
+            return
         bot = self.bot
         rows = []  # (level, name, detail); level in ok/warn/crit/na
 
@@ -309,15 +329,8 @@ class Status(commands.Cog):
         else:
             rows.append(("na", "Métriques", "InfluxDB non configuré (`INFLUX_TOKEN`)."))
 
-        avy = bot.get_cog("Avy")
-        if avy is not None and getattr(avy, "enabled", False):
-            try:
-                rows.extend(await avy.health_rows())
-            except Exception:
-                # Une panne de lecture Aveyron est une information : la journaliser au
-                # lieu de l'avaler, la ligne « lecture impossible » ne dit pas pourquoi.
-                log.exception("/health : lecture Aveyron impossible")
-                rows.append(("warn", "Aveyron (cluster)", "lecture impossible"))
+        # ⛔ Plus de lignes Aveyron dans /health : chaque serveur est séparé, l'état des
+        # nœuds Aveyron vit dans LEURS salons de supervision (Nico 2026-08-26).
 
         # Boucles de fond : une boucle morte laissait /health tout vert alors que la
         # supervision ou les alertes ne tournaient plus (filet bg.guard_cog_loops).
@@ -394,20 +407,15 @@ class Status(commands.Cog):
         emb.add_field(name="Gateway Discord", value=f"{lat} ms")
         emb.add_field(name="Proxmox API", value=mark(pve_ok))
         emb.add_field(name="InfluxDB", value=mark(influx_ok))
-        if getattr(bot.pve, "avy_enabled", False):
-            avy = bot.get_cog("Avy")
-            ms = (avy._cluster or {}).get("ping_ms") if avy else None
-            # valeur lue du CACHE du cycle Aveyron, pas sondée à l'instant comme les
-            # autres lignes : dire son âge plutôt que la présenter comme live (2026-08-20)
-            emb.add_field(name="Proxmox API (Aveyron, tunnel WG)",
-                          value=(f"{ms:.0f} ms (dernier cycle, ≤ 5 min)"
-                                 if ms is not None else "➖"))
+        # ⛔ Plus de ligne « Proxmox API (Aveyron) » : /ping = R820 seul (Nico 2026-08-26).
         await itx.followup.send(embed=emb)
 
     @app_commands.command(description="Détail de l'hôte Proxmox.")
     @read_check()
     async def node(self, itx: discord.Interaction):
         await itx.response.defer()
+        if not await self._r820_only(itx):
+            return
         bot = self.bot
         if not bot.pve.enabled:
             await itx.followup.send("Proxmox API non configurée.")
@@ -450,6 +458,11 @@ class Status(commands.Cog):
                 unreachable = True
                 log.warning("/ct %s : inventaire PVE indisponible (%s)", name, e)
             if g:
+                # Serveur du salon ≠ serveur de l'invité : on refuse (Nico 2026-08-26).
+                refus = ui.server_mismatch(bot, itx, name, ui.guest_server(bot, name, g))
+                if refus:
+                    await itx.followup.send(refus)
+                    return
                 vmid, gtype = g.get("vmid"), g.get("type")
                 if gtype == "qemu":
                     emb.title = f"🖥️ {name}"
@@ -507,6 +520,32 @@ class Status(commands.Cog):
     async def cts(self, itx: discord.Interaction):
         await itx.response.defer()
         bot = self.bot
+        from ..core import channels as _ch
+        srv = _ch.server_of_channel(bot, getattr(itx, "channel", None))
+        if srv != getattr(bot.cfg, "server_key", "R820"):
+            # Catégorie d'un nœud Aveyron : SES invités, depuis l'API PVE distante
+            # (pas d'Influx là-bas). Rien du R820 (Nico 2026-08-26).
+            try:
+                res = await bot.pve.aresources()
+            except Exception as e:
+                log.warning("/cts %s : inventaire indisponible (%s)", srv, e)
+                await itx.followup.send(f"❌ Inventaire {srv} indisponible : `{e}`")
+                return
+            lines = []
+            for r in res:
+                nm = r.get("name")
+                if not nm or r.get("type") not in ("lxc", "qemu"):
+                    continue
+                if not _ch.same_server(srv, ui.guest_server(bot, nm, r)):
+                    continue
+                kind = " 🖥️VM" if r.get("type") == "qemu" else ""
+                lines.append(f"{fmt.status_emoji(r.get('status') == 'running')} **{nm}** "
+                             f"({bot.pve.display_vmid(r.get('vmid'))}){kind}")
+            emb = discord.Embed(title=f"📦 Conteneurs — {srv}",
+                                description="\n".join(sorted(lines)) or "Aucun conteneur.",
+                                color=fmt.BLURPLE)
+            await itx.followup.send(embed=emb)
+            return
         lines, seen = [], set()
         if bot.influx.enabled:
             for c in await bot.influx.ct_table():
@@ -520,29 +559,8 @@ class Status(commands.Cog):
                 seen.add(c.get("name"))
                 lines.append(f"{fmt.status_emoji(c.get('status') == 'running')} "
                              f"**{c.get('name')}** ({bot.pve.display_vmid(c.get('vmid'))})")
-        # Aveyron : ses invités sont écrits par avy_metrics dans le bucket « Aveyron »,
-        # que ct_table() ne lit pas — /cts les omettait donc entièrement alors que
-        # l'autocomplete de /ct les propose. On complète depuis l'API PVE, seule source
-        # qui connaît les DEUX clusters (2026-08-11). Pas de collision de noms : les
-        # invités Aveyron gardent leur suffixe -avy ici.
-        if getattr(bot.pve, "avy_enabled", False):
-            try:
-                res = await bot.pve.aresources()
-            except Exception as e:
-                log.warning("/cts : inventaire Aveyron indisponible (%s)", e)
-                res = []
-            avy = []
-            for r in res:
-                nm = r.get("name")
-                if (not nm or nm in seen or r.get("type") not in ("lxc", "qemu")
-                        or not bot.pve.is_avy_name(nm)):
-                    continue
-                kind = " 🖥️VM" if r.get("type") == "qemu" else ""
-                avy.append(f"{fmt.status_emoji(r.get('status') == 'running')} **{nm}** "
-                           f"({bot.pve.display_vmid(r.get('vmid'))}){kind}")
-            if avy:
-                lines.append("\n**— Aveyron —**")
-                lines.extend(sorted(avy))
+        # ⛔ Pas de section « — Aveyron — » : /cts liste le serveur du salon d'où il est
+        # lancé, et seulement lui (Nico 2026-08-26 : on ne mélange pas les serveurs).
         desc = "\n".join(lines)
         if len(desc) > DESC_MAX - 96:          # limite Discord : 4096 caractères
             desc = desc[:DESC_MAX - 96].rsplit("\n", 1)[0] + "\n… (liste tronquée)"
