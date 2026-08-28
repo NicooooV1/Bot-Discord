@@ -18,6 +18,7 @@ OUT ACCEPT -dest 10.0.10.11 -p tcp -dport 8006 -log nolog    # API cluster Aveyr
 OUT ACCEPT -dest 10.0.10.12 -p tcp -dport 8006 -log nolog    # API cluster Aveyron - noeud llm (idem ; un noeud malade ne doit pas couper la supervision)
 OUT ACCEPT -dest 10.3.10.200 -p tcp -dport 22 -log nolog     # console root du noeud (terminal Discord, cle dediee restreinte)
 OUT ACCEPT -dest 10.3.10.117 -p tcp -dport 3100 -log nolog   # Loki (read)
+OUT ACCEPT -dest 10.3.10.53 -p tcp -dport 3000 -log nolog    # AdGuard Home API (/dns, flux DNS)
 OUT ACCEPT -p tcp -dport 443 -log nolog                      # discord.com gateway+CDN (rotating IPs)
 OUT ACCEPT -p udp -dport 53 -log nolog                       # DNS
 OUT ACCEPT -p tcp -dport 53 -log nolog                       # DNS/TCP

@@ -60,6 +60,7 @@ SUPER_CHANNELS = [
     ("nas",           "nas",           "NAS Synology : capacité, santé disques/SMART, RAID, température."),
     ("reseau",        "reseau",        "Réseau : routeur CRS305, WAN (latence/débit), services publics."),
     ("services",      "services",      "Santé des services (Postgres/Vaultwarden/mail/*arr…)."),
+    ("dns",           "dns",           "DNS maison (AdGuard Home CT125) : requêtes bloquées, bilan horaire."),
 ]
 
 CAT_SUPERVISION = "📊 Supervision R820"
@@ -978,6 +979,11 @@ class Provision(commands.Cog):
                 self.bot.state.set("alerts", {})
         if s.get("rapports"):
             self.cfg.report_channel_id = s["rapports"]
+        if s.get("dns"):
+            self.cfg.dns_channel_id = s["dns"]
+            dnscog = self.bot.get_cog("Dns")
+            if dnscog is not None:
+                dnscog.channel_id = s["dns"]
         if s.get("journaux_live"):
             self.cfg.live_log_channel_id = s["journaux_live"]
             logs_cog = self.bot.get_cog("Logs")

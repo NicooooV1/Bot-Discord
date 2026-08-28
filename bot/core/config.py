@@ -358,6 +358,17 @@ class Config:
         self.sso_poll_seconds = max(60, _int(g("SSO_POLL_SECONDS", "120"), 120))
         self.sso_login_notify = g("SSO_LOGIN_NOTIFY", "1").strip().lower() not in ("0", "false", "non", "no")
 
+        # /dns + boucles dns_poll/dns_digest : AdGuard Home (CT125 dns, 10.3.10.53)
+        # Lecture du journal des requêtes + règles utilisateur. USER/PASS vides = cog inactif.
+        self.adguard_url = g("ADGUARD_URL", "http://10.3.10.53:3000").strip().rstrip("/")
+        self.adguard_user = g("ADGUARD_USER", "").strip()
+        self.adguard_pass = g("ADGUARD_PASS", "")
+        self.dns_channel_id = _int(g("DNS_CHANNEL_ID"))          # repli si non provisionné
+        self.dns_poll_seconds = max(15, _int(g("DNS_POLL_SECONDS", "60"), 60))
+        self.dns_feed_logs = g("DNS_FEED_LOGS", "1").strip().lower() not in ("0", "false", "non", "no")
+        self.dns_spike_blocked = max(5, _int(g("DNS_SPIKE_BLOCKED", "30"), 30))
+        self.dns_spike_queries = max(50, _int(g("DNS_SPIKE_QUERIES", "600"), 600))
+
         # --- 2FA (TOTP) --------------------------------------------------------
         # Défaut FALSE volontaire : activer avant d'être inscrit barrerait toutes les
         # commandes sans laisser personne s'inscrire. On active APRÈS un /2fa setup.
@@ -451,6 +462,10 @@ class Config:
     @property
     def loki_enabled(self):
         return bool(self.loki_url)
+
+    @property
+    def adguard_enabled(self):
+        return bool(self.adguard_url and self.adguard_user and self.adguard_pass)
 
     @property
     def pve_enabled(self):
