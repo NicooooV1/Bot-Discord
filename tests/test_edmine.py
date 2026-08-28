@@ -536,6 +536,102 @@ class TestFiletDesBoucles(unittest.TestCase):
                          "restart() est un no-op après échec — utiliser start()")
 
 
+# ------------------------------------------- bascule entre points d'entrée Aveyron
+class TestBasculeAveyron(unittest.TestCase):
+    """2026-08-28 (Nico) : trois points d'entrée équivalents (nas 10.0.10.10, ms01
+    10.0.10.11, llm 10.0.10.12). Si l'un tombe, le bot doit continuer sur les deux autres
+    sans que l'appelant ne voie rien."""
+
+    class _Cfg:
+        avy_key = "AVEYRON"; avy_storage = "pbs-local"; avy_port = 8006
+        avy_verify_ssl = False; avy_token_id = "discordbot@pve!bot"
+        avy_token_secret = "s"; avy_action_token_id = "discordbot@pve!actions"
+        avy_action_token_secret = "s2"; avy_user = ""; avy_password = ""
+        avy_hosts = ["10.0.10.10", "10.0.10.11", "10.0.10.12"]; avy_host = "10.0.10.10"
+        @staticmethod
+        def split_token(t):
+            u, _, n = t.partition("!"); return u, n
+
+    def _cluster(self, dead):
+        """_RemoteCluster dont les hôtes de `dead` ne répondent pas à la sonde."""
+        from bot.core import pve as pvemod
+
+        class _Version:
+            def __init__(self, host): self.host = host
+            def get(self):
+                if self.host in dead:
+                    raise ConnectionError(f"{self.host} muet")
+                return {"version": "8"}
+
+        class _Client:
+            def __init__(self, host): self.host = host; self.version = _Version(host)
+
+        made = []
+        def fake_mk(cfg, token_id, secret, timeout=30, host=None):
+            made.append((host, timeout)); return _Client(host)
+        orig = pvemod._mk_remote_client
+        pvemod._mk_remote_client = fake_mk
+        self.addCleanup(setattr, pvemod, "_mk_remote_client", orig)
+        return pvemod._RemoteCluster(self._Cfg()), made
+
+    def test_hote_vivant_pas_de_bascule(self):
+        c, _ = self._cluster(dead=set())
+        self.assertFalse(c.switch_if_dead())
+        self.assertEqual(c.host, "10.0.10.10")
+
+    def test_hote_courant_mort_bascule_sur_le_suivant_vivant(self):
+        c, _ = self._cluster(dead={"10.0.10.10", "10.0.10.11"})
+        self.assertTrue(c.switch_if_dead())
+        self.assertEqual(c.host, "10.0.10.12", "ms01 aussi muet : on saute jusqu'à llm")
+        self.assertTrue(c.alive())
+
+    def test_tous_morts_aucune_bascule(self):
+        c, _ = self._cluster(dead={"10.0.10.10", "10.0.10.11", "10.0.10.12"})
+        self.assertFalse(c.switch_if_dead())
+        self.assertEqual(c.host, "10.0.10.10")
+        self.assertFalse(c.alive())
+
+    def test_bascule_vide_les_caches_du_vieil_hote(self):
+        c, _ = self._cluster(dead={"10.0.10.10"})
+        c._local_cache, c._local_ts = "nas", time.time()
+        c._nodes_cache, c._nodes_ts = ["nas"], time.time()
+        self.assertTrue(c.switch_if_dead())
+        self.assertIsNone(c._local_cache, "le nœud local dépend de l'hôte visé")
+        self.assertIsNone(c._nodes_cache)
+
+    def test_clients_par_hote_crees_une_fois(self):
+        c, made = self._cluster(dead=set())
+        c._ro; c._ro; c._probe
+        self.assertEqual(sorted(made), [("10.0.10.10", 5), ("10.0.10.10", 30)])
+
+    def test_mot_de_passe_active_les_actions_sans_jeton(self):
+        from bot.core import pve as pvemod
+        cfg = self._Cfg(); cfg.avy_action_token_secret = ""
+        cfg.avy_user, cfg.avy_password = "nico@pve", "x"
+        orig = pvemod._mk_remote_client
+        pvemod._mk_remote_client = lambda *a, **k: object()
+        self.addCleanup(setattr, pvemod, "_mk_remote_client", orig)
+        c = pvemod._RemoteCluster(cfg)
+        self.assertTrue(c.actions_enabled)
+        self.assertIsNotNone(c._rw)
+
+    def test_lecture_rejouee_apres_bascule(self):
+        """_avy_guarded : hôte d'entrée muet, autre vivant -> la lecture est rejouée et
+        l'appelant reçoit le résultat, coupe-circuit NON armé."""
+        from bot.core.pve import Pve
+        c, _ = self._cluster(dead={"10.0.10.10"})
+        p = Pve.__new__(Pve)
+        p._avy = c; p._avy_fail_ts = 0.0; p._avy_ok_ts = 0.0; p._avy_warned = False
+        calls = []
+        def lecture():
+            calls.append(c.host)
+            if c.host == "10.0.10.10":
+                raise ConnectionError("nas muet")
+            return "ok via " + c.host
+        self.assertEqual(p._avy_read(lecture), "ok via 10.0.10.11")
+        self.assertEqual(calls, ["10.0.10.10", "10.0.10.11"])
+        self.assertEqual(p._avy_fail_ts, 0.0)
+
 # ------------------------------------------- coupe-circuit du cluster secondaire
 class TestCoupeCircuitAveyron(unittest.TestCase):
     """2026-08-14 : 287 bascules « injoignable / de nouveau joignable » en une journée,

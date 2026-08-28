@@ -58,14 +58,22 @@ def _mk_client(cfg, token_id, secret):
         verify_ssl=cfg.pve_verify_ssl, timeout=15)
 
 
-def _mk_remote_client(cfg, token_id, secret, timeout=30):
+def _mk_remote_client(cfg, token_id, secret, timeout=30, host=None):
     from proxmoxer import ProxmoxAPI
-    user, name = cfg.split_token(token_id)
+    host = host or cfg.avy_host
     # timeout 30 s (vs 15 côté R820) : l'énumération du stockage CIFS nas-backup prend
     # ~16 s à travers le tunnel WG (mesuré 2026-07-17) ; tous les appels passent par
     # asyncio.to_thread, un appel lent ne bloque donc jamais la boucle du bot.
+    if getattr(cfg, "avy_password", "") and getattr(cfg, "avy_user", ""):
+        # Utilisateur + mot de passe (Nico 2026-08-28) : proxmoxer obtient un ticket et
+        # le renouvelle seul (renew_age = 1 h < 2 h de validité). Même compte pour la
+        # lecture et les actions ; `token_id`/`secret` sont alors ignorés.
+        return ProxmoxAPI(
+            host, port=cfg.avy_port, user=cfg.avy_user, password=cfg.avy_password,
+            verify_ssl=cfg.avy_verify_ssl, timeout=timeout)
+    user, name = cfg.split_token(token_id)
     return ProxmoxAPI(
-        cfg.avy_host, port=cfg.avy_port, user=user,
+        host, port=cfg.avy_port, user=user,
         token_name=name, token_value=secret,
         verify_ssl=cfg.avy_verify_ssl, timeout=timeout)
 
@@ -120,12 +128,20 @@ class _RemoteCluster:
     def __init__(self, cfg):
         self.key = cfg.avy_key
         self.storage = cfg.avy_storage
-        self._ro = _mk_remote_client(cfg, cfg.avy_token_id, cfg.avy_token_secret)
-        self._rw = None
-        if cfg.avy_action_token_secret:
-            self._rw = _mk_remote_client(cfg, cfg.avy_action_token_id,
-                                         cfg.avy_action_token_secret)
-        else:
+        self._cfg = cfg
+        # Points d'entrée ÉQUIVALENTS (Nico 2026-08-28) : nas / ms01 / llm. Un client par
+        # (hôte, rôle), créé à la demande ; `_ro`/`_rw`/`_probe` visent l'hôte COURANT et
+        # `switch_if_dead()` en change quand il ne répond plus (cf. Pve._avy_guarded).
+        self._hosts = list(getattr(cfg, "avy_hosts", None) or [cfg.avy_host])
+        self._hi = 0
+        self._clients = {}
+        by_password = bool(getattr(cfg, "avy_password", "") and getattr(cfg, "avy_user", ""))
+        self._rw_enabled = by_password or bool(cfg.avy_action_token_secret)
+        if by_password:
+            log.info("cluster %s : authentification par mot de passe (%s), actions "
+                     "activées, %d point(s) d'entrée : %s", self.key, cfg.avy_user,
+                     len(self._hosts), ", ".join(self._hosts))
+        elif not self._rw_enabled:
             # 2026-08-11 : sans ce log, l'oubli du secret (AVY_* n'est documenté NULLE PART
             # dans config.env.example) ne se voyait qu'au premier /ctctl sur un invité -avy,
             # sous la forme d'un « 'NoneType' object has no attribute 'nodes' ».
@@ -137,16 +153,84 @@ class _RemoteCluster:
         self._local_cache = None        # nœud servi SANS tunnel inter-nœuds (cf. _local_node)
         self._local_ts = 0.0
         self._node_fail = {}            # nœud -> instant jusqu'auquel on le court-circuite
-        # Client de SONDE : même hôte, même jeton, mais timeout court. Il ne sert qu'à
-        # trancher « lien mort ou ressource morte ? » quand une lecture expire — question
-        # à laquelle on ne peut pas répondre avec un client dont le timeout EST la panne
-        # qu'on essaie de qualifier (cf. Pve._avy_maybe_trip).
-        self._probe = _mk_remote_client(cfg, cfg.avy_token_id, cfg.avy_token_secret,
-                                        timeout=5)
+
+    # ---- points d'entrée multiples ----
+    @property
+    def host(self):
+        """Hôte (adresse) actuellement visé."""
+        return self._hosts[self._hi]
+
+    def _client(self, kind, host=None):
+        """Client proxmoxer pour (hôte, rôle) — créé une fois, puis réutilisé (un client
+        = une session/ticket ; le recréer à chaque appel referait un login par appel)."""
+        host = host or self.host
+        key = (host, kind)
+        c = self._clients.get(key)
+        if c is None:
+            cfg = self._cfg
+            if kind == "rw":
+                c = _mk_remote_client(cfg, cfg.avy_action_token_id,
+                                      cfg.avy_action_token_secret, host=host)
+            elif kind == "probe":
+                # Client de SONDE : timeout court. Il ne sert qu'à trancher « lien mort ou
+                # ressource morte ? » quand une lecture expire — question à laquelle on ne
+                # peut pas répondre avec un client dont le timeout EST la panne qu'on
+                # essaie de qualifier (cf. Pve._avy_maybe_trip).
+                c = _mk_remote_client(cfg, cfg.avy_token_id, cfg.avy_token_secret,
+                                      timeout=5, host=host)
+            else:
+                c = _mk_remote_client(cfg, cfg.avy_token_id, cfg.avy_token_secret, host=host)
+            self._clients[key] = c
+        return c
+
+    @property
+    def _ro(self):
+        return self._client("ro")
+
+    @property
+    def _rw(self):
+        return self._client("rw") if self._rw_enabled else None
+
+    @property
+    def _probe(self):
+        return self._client("probe")
+
+    def _probe_host(self, host):
+        try:
+            self._client("probe", host).version.get()
+            return True
+        except Exception:  # noqa: BLE001 — toute erreur = hôte muet
+            return False
+
+    def _use_host(self, i, why):
+        old = self.host
+        self._hi = i
+        # ce que l'ancien hôte nous avait dit de lui-même ne vaut plus pour le nouveau
+        self._local_cache, self._local_ts = None, 0.0
+        self._nodes_cache, self._nodes_ts = None, 0.0
+        log.warning("cluster %s : bascule du point d'entrée %s -> %s (%s)",
+                    self.key, old, self.host, why)
+
+    def switch_if_dead(self):
+        """Si l'hôte courant ne répond plus, passe au premier autre hôte qui répond.
+
+        Retourne True quand on a CHANGÉ d'hôte (l'appelant peut rejouer sa lecture),
+        False sinon : hôte courant vivant (l'échec était local à la ressource lue) ou
+        aucun hôte ne répond (vraie coupure du lien). Sonde à timeout court : au pire
+        5 s × nombre d'hôtes."""
+        if self._probe_host(self.host):
+            return False
+        for i, h in enumerate(self._hosts):
+            if i == self._hi:
+                continue
+            if self._probe_host(h):
+                self._use_host(i, "hôte muet")
+                return True
+        return False
 
     @property
     def actions_enabled(self):
-        return self._rw is not None
+        return self._rw_enabled
 
     @property
     def _action_api(self):
@@ -206,11 +290,11 @@ class _RemoteCluster:
         Sert d'arbitre à `Pve._avy_maybe_trip` : une lecture qui expire ne dit pas si
         c'est le LIEN ou la RESSOURCE qui est morte, et le client normal (30 s) ne peut
         pas répondre — son timeout est précisément la panne à qualifier."""
-        try:
-            self._probe.version.get()
+        if self._probe_host(self.host):
             return True
-        except Exception:  # noqa: BLE001 — toute erreur = pas de preuve de vie
-            return False
+        # hôte courant muet : le LIEN n'est pas mort pour autant si un autre point
+        # d'entrée répond — on bascule dessus au passage.
+        return self.switch_if_dead()
 
     def _node_guard(self, node, fn, *a, **kw):
         """Coupe-circuit PAR NŒUD (2026-08-14).
@@ -714,6 +798,18 @@ class Pve:
         try:
             r = fn(*a, **kw)
         except OSError as e:
+            # Hôte d'entrée muet mais un autre répond ? On bascule et on REJOUE une fois :
+            # l'appelant ne voit rien (Nico 2026-08-28 : « si l'un est down, les deux
+            # autres continuent la gestion »).
+            switch = getattr(self._avy, "switch_if_dead", None)
+            if switch is not None and switch():
+                try:
+                    r = fn(*a, **kw)
+                except OSError as e2:
+                    e = e2
+                else:
+                    self._avy_ok()
+                    return r
             if arm:
                 self._avy_maybe_trip()
                 raise AvyUnreachable(str(e) or "réseau") from None
@@ -739,7 +835,14 @@ class Pve:
                 return []
         else:
             try:
-                cur = self._avy.resources()
+                try:
+                    cur = self._avy.resources()
+                except OSError:
+                    # même règle que _avy_guarded : autre point d'entrée vivant -> rejouer
+                    switch = getattr(self._avy, "switch_if_dead", None)
+                    if switch is None or not switch():
+                        raise
+                    cur = self._avy.resources()
                 # liste VIDE = anomalie (jeton aveugle / glitch), pas « zéro invité » :
                 # la servir ferait archiver tous les salons AVY par provision (vécu
                 # 2026-07-17 : ACL /vms écrasant PVEAuditor -> resources()=[] sans

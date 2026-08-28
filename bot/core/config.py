@@ -161,18 +161,31 @@ class Config:
         # les rôles de cette clé dans GESTION_SERVERS. Vide (pas d'hôte/jeton) = inactif.
         self.avy_key = g("AVY_SERVER_KEY", "AVEYRON").strip()
         self.avy_suffix = g("AVY_SUFFIX", "avy").strip()
-        self.avy_host = g("AVY_PVE_HOST", "").strip()
+        # 2026-08-28 (Nico) : TROIS points d'entrée équivalents — 10.0.10.10 (nas),
+        # 10.0.10.11 (ms01), 10.0.10.12 (llm). Le bot doit rester opérationnel si l'un
+        # d'eux tombe : AVY_PVE_HOSTS (liste) prime, AVY_PVE_HOST reste accepté (1 hôte).
+        self.avy_hosts = [x.strip() for x in g("AVY_PVE_HOSTS", "").split(",") if x.strip()]
+        if not self.avy_hosts and g("AVY_PVE_HOST", "").strip():
+            self.avy_hosts = [g("AVY_PVE_HOST").strip()]
+        self.avy_host = self.avy_hosts[0] if self.avy_hosts else ""
         self.avy_port = _int(g("AVY_PVE_PORT", "8006"), 8006)
         self.avy_verify_ssl = _verify_ssl(g("AVY_PVE_VERIFY_SSL"), False)
         self.avy_token_id = g("AVY_PVE_TOKEN_ID", "discordbot@pve!bot")
         self.avy_token_secret = g("AVY_PVE_TOKEN_SECRET").strip()
         self.avy_action_token_id = g("AVY_PVE_ACTION_TOKEN_ID", "discordbot@pve!actions")
         self.avy_action_token_secret = g("AVY_PVE_ACTION_TOKEN_SECRET").strip()
+        # Identifiants Proxmox (utilisateur + mot de passe, ticket renouvelé par proxmoxer)
+        # demandés par Nico le 2026-08-28 pour Aveyron : quand AVY_PVE_PASSWORD est
+        # renseigné, il remplace les DEUX jetons (lecture ET actions) — un seul compte,
+        # valable sur les trois nœuds. Sinon, on reste sur les jetons.
+        self.avy_user = g("AVY_PVE_USER", "").strip()
+        self.avy_password = g("AVY_PVE_PASSWORD", "")
         self.avy_storage = g("AVY_PVE_STORAGE", "nas-backup")
         # nœuds supervisés (STATIQUE : un nœud éteint garde ses salons/catégories) ;
         # chaque nœud = un « serveur » à part entière (clé AVY-<NOM>, cf. pve.avy_server_key)
         self.avy_nodes = [x.strip() for x in g("AVY_NODES", "").split(",") if x.strip()]
-        self.avy_enabled = bool(self.avy_host and self.avy_token_secret)
+        self.avy_enabled = bool(self.avy_hosts and (
+            (self.avy_user and self.avy_password) or self.avy_token_secret))
 
         # Certificat de l'hyperviseur NON authentifié tant que *_VERIFY_SSL est faux : les
         # jetons (dont celui d'ACTION : start/stop/backup/delete-backup) partent sur un
@@ -186,7 +199,7 @@ class Config:
                          "_verify_ssl() pour passer un chemin de bundle CA", self.pve_host)
         if self.avy_enabled and self.avy_verify_ssl is False:
             _log.warning("AVY_PVE_VERIFY_SSL=false : API du cluster %s (%s) en TLS "
-                         "NON vérifié", self.avy_key, self.avy_host)
+                         "NON vérifié", self.avy_key, ", ".join(self.avy_hosts))
 
         # --- NAS Synology = serveur à part entière (clé SYNO) 2026-08-07 ---
         # Supervisé en SNMP par Telegraf (mesures synology* du bucket Proxmox) : le bot
