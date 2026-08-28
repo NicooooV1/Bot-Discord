@@ -8,9 +8,10 @@ bot et aussi dans un salon spécifique avec les informations essentielles »)
      - dans #journaux-live (le « log » du bot, `cfg.live_log_channel_id`) : TOUT le
        trafic DNS, compacté (lignes identiques consécutives client+domaine → ×N,
        lots découpés à 1900 caractères) — débrayable via DNS_FEED_LOGS=0 ;
-     - dans #dns (salon provisionné « dns », catégorie Supervision) : l'ESSENTIEL
-       seulement — les requêtes BLOQUÉES regroupées par (client, domaine) avec la
-       règle qui a matché.
+     - dans #dns (salon provisionné « dns », catégorie Supervision) : les requêtes
+       BLOQUÉES regroupées par (client, domaine) avec la règle — SEULEMENT si
+       DNS_BLOCKED_FEED=1. Défaut 0 depuis le 28/08 (Nico : #dns = bilan horaire et
+       pics seulement, le détail reste dans l'UI AdGuard et Grafana).
    Le curseur (horodatage AdGuard de la dernière entrée traitée) vit dans state.json
    et n'avance QU'APRÈS un envoi réussi : salon injoignable = on réessaie, rien n'est
    perdu en silence. Premier démarrage : on se cale sur le présent SANS rejouer
@@ -434,12 +435,13 @@ class Dns(commands.Cog):
             st.set("dns_cursor", fresh[-1]["time"].isoformat())
             return
 
-        # -- #dns : l'essentiel (bloquées) -----------------------------------------
-        ch = await self._channel(self.channel_id, "#dns")
+        # -- #dns : bloquées du cycle — DÉSACTIVÉ par défaut (Nico 28/08 : « limite #dns
+        #    au bilan horaire et aux pics seulement »). DNS_BLOCKED_FEED=1 pour rouvrir.
+        ch = await self._channel(self.channel_id, "#dns") if cfg.dns_blocked_feed else None
         if ch is None:
-            if not self._warned_no_channel:
+            if cfg.dns_blocked_feed and not self._warned_no_channel:
                 log.warning("dns: aucun salon #dns (provisioning non fait ou "
-                            "DNS_CHANNEL_ID vide) — flux essentiel inactif")
+                            "DNS_CHANNEL_ID vide) — flux des bloquées inactif")
                 self._warned_no_channel = True
         else:
             lines = blocked_summary(fresh)
@@ -548,7 +550,9 @@ class Dns(commands.Cog):
                                 f"(total listes : {rules})", inline=True)
         emb.add_field(name="Flux Discord",
                       value=("⏸️ en pause (persistant)" if self.paused else
-                             f"▶️ actif, sondage {self.bot.cfg.dns_poll_seconds} s") +
+                             f"▶️ sondage {self.bot.cfg.dns_poll_seconds} s · #dns = bilan "
+                             f"horaire{' + bloquées' if self.bot.cfg.dns_blocked_feed else ''}"
+                             f", pics → #alertes") +
                             (f"\n⚠️ dernier échec : {self.last_error}" if self.last_error else ""),
                       inline=True)
         emb.set_footer(text="Lecture AdGuard Home via son API · #dns = bloquées + bilan horaire")
@@ -588,8 +592,8 @@ class Dns(commands.Cog):
         self.paused = not self.paused
         self.bot.state.set("dns_paused", self.paused)
         await itx.response.send_message(
-            ("⏸️ Flux DNS en pause : plus de messages dans #dns ni #journaux-live "
-             "(les alertes de pic et le bilan horaire continuent). Réglage persistant."
+            ("⏸️ Flux DNS en pause : plus de détail par cycle dans #dns/#journaux-live "
+             "(si activés) ; les alertes de pic et le bilan horaire continuent. Persistant."
              if self.paused else
              "▶️ Flux DNS repris (le trafic pendant la pause n'est pas rejoué)."))
 

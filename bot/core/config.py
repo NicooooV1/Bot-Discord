@@ -365,7 +365,8 @@ class Config:
         self.adguard_pass = g("ADGUARD_PASS", "")
         self.dns_channel_id = _int(g("DNS_CHANNEL_ID"))          # repli si non provisionné
         self.dns_poll_seconds = max(15, _int(g("DNS_POLL_SECONDS", "60"), 60))
-        self.dns_feed_logs = g("DNS_FEED_LOGS", "1").strip().lower() not in ("0", "false", "non", "no")
+        self.dns_feed_logs = g("DNS_FEED_LOGS", "0").strip().lower() in ("1", "true", "oui", "yes")
+        self.dns_blocked_feed = g("DNS_BLOCKED_FEED", "0").strip().lower() in ("1", "true", "oui", "yes")
         self.dns_spike_blocked = max(5, _int(g("DNS_SPIKE_BLOCKED", "30"), 30))
         self.dns_spike_queries = max(50, _int(g("DNS_SPIKE_QUERIES", "600"), 600))
 
