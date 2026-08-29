@@ -368,6 +368,14 @@ class Config:
         self.adguard_url = g("ADGUARD_URL", "http://10.3.10.53:3000").strip().rstrip("/")
         self.adguard_user = g("ADGUARD_USER", "").strip()
         self.adguard_pass = g("ADGUARD_PASS", "")
+
+        # Relais des alertes Grafana par le bot (cog grafana_alerts, Nico 29/08/2026 :
+        # « pas de webhook grafana »). Token = compte de service Grafana « edmine »
+        # (Viewer, lecture seule). Salon : GRAFANA_ALERT_CHANNEL_ID, repli ALERT_CHANNEL_ID.
+        self.grafana_url = g("GRAFANA_URL", "http://10.3.10.104:3000").strip().rstrip("/")
+        self.grafana_token = g("GRAFANA_TOKEN", "").strip()
+        self.grafana_alert_channel_id = _int(g("GRAFANA_ALERT_CHANNEL_ID")) or self.alert_channel_id
+        self.grafana_poll_seconds = max(30, _int(g("GRAFANA_POLL_SECONDS", "60"), 60))
         self.dns_channel_id = _int(g("DNS_CHANNEL_ID"))          # repli si non provisionné
         self.dns_poll_seconds = max(15, _int(g("DNS_POLL_SECONDS", "60"), 60))
         self.dns_feed_logs = g("DNS_FEED_LOGS", "0").strip().lower() in ("1", "true", "oui", "yes")
@@ -472,6 +480,10 @@ class Config:
     @property
     def adguard_enabled(self):
         return bool(self.adguard_url and self.adguard_user and self.adguard_pass)
+
+    @property
+    def grafana_enabled(self):
+        return bool(self.grafana_url and self.grafana_token)
 
     @property
     def pve_enabled(self):
