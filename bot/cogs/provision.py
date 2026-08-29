@@ -442,6 +442,49 @@ class Provision(commands.Cog):
             cog.channel_id = ch.id
         return ch
 
+    async def _provision_pterodactyl_log_channel(self, guild):
+        """Salon #ptero-logs dans « 🔒 Lock » : journaux Pterodactyl (panel CT101 + Wings
+        CT100) lus dans Loki par le cog PterodactylLogs — propriétaire uniquement (Nico
+        2026-08-29 : comptes et serveurs de jeu). Même mécanique que
+        _provision_dolibarr_log_channel."""
+        if not (getattr(self.cfg, "pterodactyl_logs_enabled", True) and self.cfg.loki_url):
+            return
+        ow = self._lock_fn(guild)
+        if ow is None:
+            log.warning("rôles M/O non résolus — #ptero-logs NON provisionné ce cycle")
+            return
+        cat = await self._ensure_lock_category(guild)
+        name = "ptero-logs"
+        cid = self.prov.get("pterodactyl_logs")
+        ch = guild.get_channel(cid) if cid else None
+        if not isinstance(ch, discord.TextChannel):
+            ch = discord.utils.get(cat.text_channels, name=name)
+        if not isinstance(ch, discord.TextChannel):
+            ch = await guild.create_text_channel(
+                name=name, category=cat, overwrites=ow,
+                topic="Journaux Pterodactyl : panel (Laravel, apache erreurs/HTTP ≥ 400) + Wings "
+                      "(power, install, erreurs) — propriétaire uniquement. Incidents → #alertes.",
+                reason="auto-provision : journaux Pterodactyl")
+            log.info("salon ptero-logs créé: #%s", ch.name)
+        else:
+            if ch.category_id != cat.id:
+                try:
+                    await ch.edit(category=cat, sync_permissions=True,
+                                  reason="auto-provision: rangement dans Lock")
+                except discord.HTTPException:
+                    log.warning("#ptero-logs : rangement dans Lock impossible")
+            if perms.lock_perms_drifted(ch, guild, self.cfg):
+                try:
+                    await ch.edit(overwrites=ow,
+                                  reason="salon ptero-logs : propriétaire uniquement")
+                except discord.HTTPException:
+                    log.exception("application des permissions de ptero-logs")
+        self.prov["pterodactyl_logs"] = ch.id
+        cog = self.bot.get_cog("PterodactylLogs")
+        if cog is not None:
+            cog.channel_id = ch.id
+        return ch
+
     async def _ensure_text(self, guild, name, category, key_store, key, topic=None,
                            global_fallback=True, overwrites=None):
         """Adopte (id persisté -> nom dans la catégorie) ou crée un salon texte.
@@ -618,6 +661,7 @@ class Provision(commands.Cog):
                 await self._provision_node_channel(guild)
                 await self._provision_jellyfin_log_channel(guild)
                 await self._provision_dolibarr_log_channel(guild)
+                await self._provision_pterodactyl_log_channel(guild)
                 # toute la catégorie Lock (salon nœud + salons persos) = Gestion+O R820
                 await self._enforce_perms(guild, lock_cat, self._lock_fn)
             except Exception:

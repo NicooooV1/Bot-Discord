@@ -356,3 +356,12 @@ logs ≥ warning). Le pare-feu `106.fw` autorise la sortie TCP/3100 vers Loki.
   Nico) : supervision et alertes, pas d'administration.
 - Quand l'hôte est éteint la nuit, CT106 (et le bot) le sont aussi ; reprise auto via `onboot=1`
   + rattrapage du rapport au réveil. L'alerting critique reste assuré par Grafana.
+
+### `#ptero-logs` (🔒 Lock)
+Journaux Pterodactyl : panel CT101 (Laravel `storage/logs/laravel.log`, apache erreurs + HTTP ≥ 400,
+via Alloy `/etc/alloy/20-pterodactyl.alloy`, `{job="pterodactyl"}`) et Wings CT100 (journald
+`unit="wings.service"`, niveau lu dans le préfixe texte). Cog `pterodactyl_logs` (même modèle que
+`dolibarr_logs`) : curseur Loki persistant, 40 lignes/cycle (30 s), INFO Wings limités aux événements
+utiles (power/install/backup/SFTP), incidents (Laravel ≥ err, Wings ERROR/FATAL, 5xx, PHP Fatal) →
+`#alertes` edge-trigger + « Résolu » après 60 min. Config : `PTERODACTYL_LOGS_ENABLED`,
+`PTERODACTYL_LOGS_CHANNEL_ID`, `PTERODACTYL_LOGS_POLL_SECONDS`.

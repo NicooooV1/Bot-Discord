@@ -146,6 +146,11 @@ class Config:
         self.dolibarr_logs_enabled = _bool(g("DOLIBARR_LOGS_ENABLED"), True)
         self.dolibarr_logs_channel_id = _int(g("DOLIBARR_LOGS_CHANNEL_ID"))  # repli si non provisionné
         self.dolibarr_logs_poll_seconds = max(10, _int(g("DOLIBARR_LOGS_POLL_SECONDS", "30"), 30))
+        # Journaux Pterodactyl (panel CT101 via Alloy + Wings CT100 via journald) dans #ptero-logs
+        # (🔒 Lock) — demande Nico 2026-08-29. Inactif si LOKI_URL est vide.
+        self.pterodactyl_logs_enabled = _bool(g("PTERODACTYL_LOGS_ENABLED"), True)
+        self.pterodactyl_logs_channel_id = _int(g("PTERODACTYL_LOGS_CHANNEL_ID"))  # repli si non provisionné
+        self.pterodactyl_logs_poll_seconds = max(10, _int(g("PTERODACTYL_LOGS_POLL_SECONDS", "30"), 30))
         # Heartbeat externe (dead-man's-switch) : URL de ping healthchecks.io/ntfy
         self.heartbeat_url = g("HEARTBEAT_URL", "").strip()
 
