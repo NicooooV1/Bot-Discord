@@ -57,6 +57,39 @@ _SEV_EMOJI = {"error": "❌", "critical": "❌", "warn": "⚠️", "warning": "�
 FLAP_WINDOW_S = 300
 _RX_DEPUIS = re.compile(r" depuis (.+)$")
 _RX_IP = re.compile(r"Adresse IP\s*:\s*([0-9a-fA-F.:]+)")
+_RX_SUR = re.compile(r" sur (.+)$")
+
+
+def _appli_pour(devices, uid, appareil, ref):
+    """« Streamyfin (iPhone) » : l'appli réelle derrière un nom d'appareil.
+
+    L'ActivityLog ne donne que le NOM de l'appareil (« iPhone », « Opera »,
+    « Ordi-Nico ») — impossible d'y distinguer Streamyfin de l'appli Jellyfin iOS,
+    ou Jellyfin Desktop d'un navigateur (Nico 29/08). /Devices, lui, mémorise
+    durablement (utilisateur, nom d'appareil) -> AppName. Quand un même
+    utilisateur a plusieurs appareils du même nom (« LG Smart TV » = appli WebOS
+    ET navigateur), on prend celui dont la dernière activité est la plus proche
+    de l'entrée. Rend None si rien ne colle (la ligne sort sans suffixe)."""
+    if not (uid and appareil):
+        return None
+    best = None
+    for d in devices or []:
+        if d.get("LastUserId") != uid or (d.get("Name") or "").strip() != appareil:
+            continue
+        try:
+            dt = datetime.fromisoformat(
+                (d.get("DateLastActivity") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        ecart = abs((dt - ref).total_seconds())
+        if best is None or ecart < best[0]:
+            best = (ecart, d)
+    if best is None:
+        return None
+    app = (best[1].get("AppName") or "").strip()
+    if not app:
+        return None
+    return f"**{app}**" + (f" ({appareil})" if appareil.lower() not in app.lower() else "")
 
 
 def _hms(sec):
@@ -144,6 +177,7 @@ class JellyfinActivity(commands.Cog):
         self._last_id = bot.state.get("jellyfin_activity_last_id")
         self._seerr_ip = _seerr_host_ip()
         self._sessions_cache = None    # rempli au plus une fois par tour de poll
+        self._devices_cache = None
         if self.channel_id and self.enabled:
             self.poll.start()
 
@@ -185,6 +219,24 @@ class JellyfinActivity(commands.Cog):
             s = await self._client().aget("/Sessions", quiet=True)
             self._sessions_cache = s if isinstance(s, list) else []
         return self._sessions_cache
+
+    async def _devices(self):
+        """GET /Devices, UNE fois par tour de poll (même cache-reset que /Sessions)."""
+        if self._devices_cache is None:
+            d = await self._client().aget("/Devices", quiet=True)
+            items = d.get("Items") if isinstance(d, dict) else None
+            self._devices_cache = items if isinstance(items, list) else []
+        return self._devices_cache
+
+    async def _appareil(self, entry):
+        """Suffixe « — Streamyfin (iPhone) » pour une session ou une lecture : le nom
+        d'appareil est en fin de Name (« … depuis iPhone » / « … sur Opera »)."""
+        name = entry.get("Name") or ""
+        m = _RX_DEPUIS.search(name) or _RX_SUR.search(name)
+        if not m:
+            return None
+        return _appli_pour(await self._devices(), entry.get("UserId"),
+                           m.group(1).strip(), _entry_dt(entry))
 
     async def _provenance_auth(self, entry):
         """« via Jellyseerr » / « Streamyfin sur iPhone » / « Jellyfin Web sur Firefox ».
@@ -256,7 +308,11 @@ class JellyfinActivity(commands.Cog):
                      "authenticationfailure"):
                 return await self._provenance_auth(entry)
             if t == "videoplaybackstopped":
-                return await self._timecode_arret(entry)
+                parts = [await self._appareil(entry), await self._timecode_arret(entry)]
+                return " — ".join(p for p in parts if p) or None
+            if t in ("sessionstarted", "sessionended", "videoplayback",
+                     "audioplayback", "audioplaybackstopped"):
+                return await self._appareil(entry)
         except Exception:  # noqa: BLE001 — l'enrichissement ne doit jamais bloquer la ligne
             log.debug("enrichissement impossible", exc_info=True)
         return None
@@ -312,6 +368,7 @@ class JellyfinActivity(commands.Cog):
         pending = self.bot.state.get("jf_pending_ended") or {}
         posts, pending = _classify(batch, pending, discord.utils.utcnow())
         self._sessions_cache = None    # cache /Sessions : au plus un GET par tour
+        self._devices_cache = None     # idem /Devices
         for i, entry in enumerate(posts):
             try:
                 await ch.send(self._format(entry, extra=await self._extra(entry)))

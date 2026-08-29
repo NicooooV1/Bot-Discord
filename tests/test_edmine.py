@@ -1190,3 +1190,52 @@ class TestMicroCoupuresJellyfin(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestJellyfinAppliParAppareil(unittest.TestCase):
+    """L'ActivityLog ne dit que « depuis iPhone » ; /Devices nomme l'appli (Nico 29/08)."""
+
+    def _devs(self):
+        return [
+            {"LastUserId": "u1", "Name": "iPhone", "AppName": "Streamyfin",
+             "DateLastActivity": "2026-08-29T17:03:00Z"},
+            {"LastUserId": "u1", "Name": "iPhone de Nico", "AppName": "Jellyfin iOS",
+             "DateLastActivity": "2026-07-12T17:07:00Z"},
+            {"LastUserId": "u1", "Name": "Ordi-Nico", "AppName": "Jellyfin Desktop",
+             "DateLastActivity": "2026-08-29T18:22:00Z"},
+            {"LastUserId": "u2", "Name": "LG Smart TV", "AppName": "Jellyfin for WebOS",
+             "DateLastActivity": "2026-08-15T22:45:00Z"},
+            {"LastUserId": "u2", "Name": "LG Smart TV", "AppName": "Jellyfin Web",
+             "DateLastActivity": "2026-07-14T14:58:00Z"},
+        ]
+
+    def test_appli_nominale(self):
+        from datetime import datetime, timezone
+        from bot.cogs.jellyfin_activity import _appli_pour
+        ref = datetime(2026, 8, 29, 17, 3, tzinfo=timezone.utc)
+        self.assertEqual(_appli_pour(self._devs(), "u1", "iPhone", ref),
+                         "**Streamyfin** (iPhone)")
+        self.assertEqual(_appli_pour(self._devs(), "u1", "Ordi-Nico", ref),
+                         "**Jellyfin Desktop** (Ordi-Nico)")
+        # « iPhone de Nico » ≠ « iPhone » : pas de confusion entre les deux applis
+        self.assertEqual(_appli_pour(self._devs(), "u1", "iPhone de Nico", ref),
+                         "**Jellyfin iOS** (iPhone de Nico)")
+
+    def test_homonymes_par_date(self):
+        from datetime import datetime, timezone
+        from bot.cogs.jellyfin_activity import _appli_pour
+        tv = datetime(2026, 8, 15, 22, 50, tzinfo=timezone.utc)
+        web = datetime(2026, 7, 14, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(_appli_pour(self._devs(), "u2", "LG Smart TV", tv),
+                         "**Jellyfin for WebOS** (LG Smart TV)")
+        self.assertEqual(_appli_pour(self._devs(), "u2", "LG Smart TV", web),
+                         "**Jellyfin Web** (LG Smart TV)")
+
+    def test_inconnu_et_autre_utilisateur(self):
+        from datetime import datetime, timezone
+        from bot.cogs.jellyfin_activity import _appli_pour
+        ref = datetime(2026, 8, 29, tzinfo=timezone.utc)
+        self.assertIsNone(_appli_pour(self._devs(), "u1", "Salon", ref))
+        self.assertIsNone(_appli_pour(self._devs(), "u2", "iPhone", ref))
+        self.assertIsNone(_appli_pour(self._devs(), None, "iPhone", ref))
+        self.assertIsNone(_appli_pour([], "u1", "iPhone", ref))
