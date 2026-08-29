@@ -45,8 +45,7 @@ import logging
 
 import discord
 
-from .permissions import (can_read, cap_label, cap_ok, deny_2fa, is_admin, log_refusal,
-                          may_lock, session_2fa_ok)
+from .permissions import cap_label, deny_2fa, gate_allows, log_refusal, session_2fa_ok
 
 log = logging.getLogger("discord-bot.gates")
 
@@ -115,6 +114,8 @@ class GatedView(discord.ui.View):
                     "mod": f"aux gestionnaires de **{srv}** (rôle M ou O)",
                     "owner": "aux rôles **M** ou **O** du nœud (ou au propriétaire)"}
             msg = f"🔒 Action réservée {tier.get(self.gate, 'aux gestionnaires')}."
+            if cap:
+                msg += " L'Owner du serveur peut l'ouvrir à ton niveau via `/gestion perms`."
         if why in ("role", "cap", "user"):
             log_refusal(interaction, why, f"{type(self).__name__} serveur={srv}"
                         + (f" cap={cap}" if cap else ""))
@@ -147,36 +148,26 @@ class GatedView(discord.ui.View):
             await self.on_denied(interaction, "role")
             return False
 
-        # 3) tier, borné au SERVEUR de la vue (None = serveur de cette instance)
+        # 3) tier + capacité, en UNE décision (permissions.gate_allows), bornée au
+        #    SERVEUR de la vue (None = serveur de cette instance ; « owner » = serveur du
+        #    nœud). Une capacité accordée à G par l'Owner ouvre le bouton à G — avant le
+        #    29/08 au soir, le test « M/O ? » précédait la capacité et G était toujours
+        #    refusé (« REFUS [role] DlRefreshView »), quoi que l'Owner ait coché.
         srv = None
         cap = None
         try:
             srv = await self.resolve_server(interaction)
-            if self.gate == "read":
-                ok = can_read(cfg, interaction, server=srv)
-            elif self.gate == "owner":
-                ok = may_lock(cfg, interaction)
+            if self.gate == "owner":
                 srv = srv or getattr(cfg, "node_server_key", None)
-            else:
-                ok = is_admin(cfg, interaction, server=srv)
+            cap = self.resolve_cap(interaction)
+            ok, why, _tier = gate_allows(cfg, interaction, server=srv, gate=self.gate,
+                                         cap=cap)
         except Exception:  # noqa: BLE001 — une erreur d'évaluation = refus, jamais accès
             log.exception("%s: évaluation de la porte en échec — refus",
                           type(self).__name__)
-            ok = False
+            ok, why = False, "role"
         if not ok:
-            await self.on_denied(interaction, "role")
-            return False
-
-        # 3b) capacité fine (Owner-réglable par tier et par serveur)
-        try:
-            cap = self.resolve_cap(interaction)
-            if cap is not None and not cap_ok(cfg, interaction, server=srv, cap=cap):
-                await self.on_denied(interaction, "cap", cap=cap)
-                return False
-        except Exception:  # noqa: BLE001
-            log.exception("%s: évaluation de la capacité en échec — refus",
-                          type(self).__name__)
-            await self.on_denied(interaction, "cap", cap=cap)
+            await self.on_denied(interaction, why or "role", cap=cap)
             return False
 
         # 4) session 2FA — les boutons ne passent pas par GatedTree, c'est ICI que le

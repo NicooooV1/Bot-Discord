@@ -58,7 +58,7 @@ class Actions(commands.Cog):
     @app_commands.describe(action="start, stop ou restart", name="Conteneur ou VM")
     @app_commands.choices(action=ACTIONS)
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check(scope="channel")
+    @admin_check(scope="channel", cap=("start", "stop", "reboot"))
     async def ctctl(self, itx: discord.Interaction,
                     action: app_commands.Choice[str], name: str):
         if not self.bot.pve.actions_enabled:
@@ -108,7 +108,7 @@ class Actions(commands.Cog):
     @backup.command(name="create", description="Lancer une sauvegarde vzdump d'un conteneur vers PBS.")
     @app_commands.describe(name="Conteneur à sauvegarder")
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check(scope="channel")
+    @admin_check(scope="channel", cap="backup")
     async def backup_create(self, itx: discord.Interaction, name: str):
         if not self.bot.pve.actions_enabled:
             await itx.response.send_message("Token d'action PVE non configuré.", ephemeral=True)
@@ -153,7 +153,7 @@ class Actions(commands.Cog):
                     description="Supprimer une sauvegarde PBS d'un conteneur (confirmation requise).")
     @app_commands.describe(name="Conteneur dont supprimer une sauvegarde")
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check(scope="channel")
+    @admin_check(scope="channel", cap="backup_delete")
     async def backup_delete(self, itx: discord.Interaction, name: str):
         if not self.bot.pve.actions_enabled:
             await itx.response.send_message("Token d'action PVE non configuré.", ephemeral=True)
@@ -198,7 +198,7 @@ class Actions(commands.Cog):
 
     @app_commands.command(description="Dernières actions du journal d'audit.")
     @app_commands.describe(limit="Nombre de lignes (def 20)")
-    @admin_check()
+    @admin_check(cap="read")
     async def audit(self, itx: discord.Interaction, limit: int = 20):
         await itx.response.defer(ephemeral=True)
         lines = self.bot.audit.tail(max(1, min(50, limit)))

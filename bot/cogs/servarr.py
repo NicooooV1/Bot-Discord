@@ -926,6 +926,7 @@ class RatioRefreshView(GatedView):
     de bouton ne passe jamais par lui (la vue n'avait aucune porte avant le 2026-08-11)."""
 
     gate = "read"
+    gate_cap = "refresh"
 
     def __init__(self, cog):
         super().__init__(timeout=None)

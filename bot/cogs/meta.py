@@ -266,6 +266,7 @@ class HelpRefreshView(GatedView):
     (2026-08-11)."""
 
     gate = "read"
+    gate_cap = "refresh"
 
     def __init__(self, cog):
         super().__init__(timeout=None)

@@ -269,7 +269,7 @@ class Logs(commands.Cog):
         return st
 
     @logstream.command(name="stats", description="Statistiques du flux de logs live.")
-    @admin_check()
+    @admin_check(cap="services")
     async def logstream_stats(self, itx: discord.Interaction):
         st = self._stream_or_none()
         if st is None:
@@ -305,7 +305,7 @@ class Logs(commands.Cog):
                        description="Change la sévérité minimale du flux (runtime).")
     @app_commands.describe(niveau="Sévérité minimale (emerg = le plus grave)")
     @app_commands.choices(niveau=SEV_CHOICES)
-    @admin_check()
+    @admin_check(cap="services")
     async def logstream_severity(self, itx: discord.Interaction,
                                  niveau: app_commands.Choice[str]):
         st = self._stream_or_none()
@@ -320,7 +320,7 @@ class Logs(commands.Cog):
             "dans config.env pour rendre le changement permanent).", ephemeral=True)
 
     @logstream.command(name="pause", description="Met le flux de logs en pause.")
-    @admin_check()
+    @admin_check(cap="services")
     async def logstream_pause(self, itx: discord.Interaction):
         st = self._stream_or_none()
         if st is None:
@@ -334,7 +334,7 @@ class Logs(commands.Cog):
             "_(état persistant — conservé après redémarrage)_", ephemeral=True)
 
     @logstream.command(name="resume", description="Reprend le flux de logs.")
-    @admin_check()
+    @admin_check(cap="services")
     async def logstream_resume(self, itx: discord.Interaction):
         st = self._stream_or_none()
         if st is None:

@@ -132,7 +132,7 @@ class Dashboard(commands.Cog):
 
     @app_commands.command(description="Crée/épingle le dashboard live, ou l'arrête.")
     @app_commands.choices(action=ACTIONS)
-    @admin_check()
+    @admin_check(cap="refresh")
     async def dashboard(self, itx: discord.Interaction, action: app_commands.Choice[str] = None):
         await itx.response.defer(ephemeral=True)
         act = action.value if action else "create"

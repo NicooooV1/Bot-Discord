@@ -163,10 +163,14 @@ def reset(state, server, tier=None):
         _write(state, server, tier, {})
 
 
-def tier_has_slash_caps(state, server, tier):
-    """True si le tier peut lancer au moins une COMMANDE slash (sert à provision pour
-    lui rendre `use_application_commands` dans les salons du serveur)."""
-    return any(cap_allowed(state, server, tier, c) for c in ("read", "graph", "services"))
+def tier_has_any_cap(state, server, tier):
+    """True si le tier dispose d'au moins UNE capacité sur ce serveur (sert à provision
+    pour rendre `use_application_commands` au tier G dans les salons du serveur, et à
+    l'autocomplétion pour lui proposer les cibles)."""
+    return any(cap_allowed(state, server, tier, c) for c in CAPS)
+
+
+tier_has_slash_caps = tier_has_any_cap      # rétrocompat
 
 
 def summary_lines(state, server, tier):

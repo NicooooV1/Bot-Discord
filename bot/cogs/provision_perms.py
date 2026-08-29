@@ -211,7 +211,7 @@ def _tiered_for_key(guild, cfg, key, state=None):
         log.warning("rôles M/O %s introuvables — overwrites NON modifiés", key)
         return None
     view_ids = [roles.get("view", 0)] + list(cfg.viewer_role_ids)
-    g_slash = srvperms.tier_has_slash_caps(state, key, "G") if state is not None else False
+    g_slash = srvperms.tier_has_any_cap(state, key, "G") if state is not None else False
     return _tiered_ow(guild, mo_ids, view_ids, g_slash=g_slash)
 
 

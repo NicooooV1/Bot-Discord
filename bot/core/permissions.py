@@ -153,21 +153,74 @@ def can_read(cfg, interaction, server=None) -> bool:
     return bool(_member_role_ids(interaction) & set(cfg.read_role_ids))
 
 
-def cap_ok(cfg, interaction, server=None, cap=None) -> bool:
-    """True si l'invocateur dispose de la CAPACITÉ `cap` sur `server` (cf. srvperms).
-    `cap=None` = pas de capacité particulière exigée. Break-glass et tier O = tout."""
+def _caps_tuple(cap):
+    """Normalise `cap` : None, "stop" ou ("start", "stop") -> None ou tuple."""
     if cap is None:
+        return None
+    if isinstance(cap, str):
+        return (cap,)
+    return tuple(cap)
+
+
+def cap_ok(cfg, interaction, server=None, cap=None) -> bool:
+    """True si l'invocateur dispose d'AU MOINS UNE des capacités `cap` sur `server`
+    (cf. srvperms). `cap=None` = pas de capacité particulière exigée. Break-glass et
+    tier O = tout ; G comme M : ce que l'Owner du serveur a accordé à ce niveau."""
+    caps = _caps_tuple(cap)
+    if caps is None:
         return True
     tier = tier_of(cfg, interaction, server)
     if tier is None:
         return False
     state = getattr(getattr(interaction, "client", None), "state", None)
-    return srvperms.cap_allowed(state, server or _primary_key(cfg), tier, cap)
+    key = server or _primary_key(cfg)
+    return any(srvperms.cap_allowed(state, key, tier, c) for c in caps)
+
+
+def gate_allows(cfg, interaction, server=None, gate="mod", cap=None):
+    """DÉCISION UNIQUE « tier + capacité » de toutes les portes (commandes ET boutons).
+    Renvoie (ok, why, tier) avec why ∈ {None, "role", "cap"}.
+
+    Règles (Nico 2026-08-29, corrigées le soir même) :
+      - propriétaire du guild / ADMIN_IDS / tier O du serveur : toujours ;
+      - tier M : passe si la capacité exigée lui est laissée par l'Owner (défauts :
+        tout sauf « node_terminal ») ; sans capacité déclarée, M passe (rien à régler) ;
+      - tier G : passe UNIQUEMENT pour une capacité que l'Owner lui a explicitement
+        accordée via /gestion perms — sans capacité déclarée, G est refusé (« role ») ;
+      - porte « read » sans capacité = capacité « read » ; rôle READ_ROLE_IDS (legacy)
+        accepté pour la lecture quand le membre n'a aucun tier sur ce serveur ;
+      - aucun tier sur ce serveur : refus (« role »).
+
+    ⚠️ Avant cette fonction, la porte des boutons testait « M/O ? » AVANT la capacité :
+    une capacité accordée à G (ex. « rafraîchir ») n'était jamais consultée — c'est le
+    défaut constaté par Nico le 29/08 au soir (REFUS [role] DlRefreshView)."""
+    caps = _caps_tuple(cap)
+    if gate == "read" and caps is None:
+        caps = ("read",)
+    tier = tier_of(cfg, interaction, server)
+    if tier is None:
+        if gate == "read" and cfg.read_role_ids \
+                and (_member_role_ids(interaction) & set(cfg.read_role_ids)):
+            return True, None, "R"
+        return False, "role", None
+    if tier == "O":
+        return True, None, tier
+    if caps is None:
+        # rien de réglable : M passe, G non (une vue « mod » sans capacité déclarée)
+        return (tier == "M"), (None if tier == "M" else "role"), tier
+    state = getattr(getattr(interaction, "client", None), "state", None)
+    key = server or _primary_key(cfg)
+    ok = any(srvperms.cap_allowed(state, key, tier, c) for c in caps)
+    return ok, (None if ok else "cap"), tier
 
 
 def cap_label(cap):
-    spec = srvperms.CAPS.get(cap)
-    return spec[0] if spec else cap
+    caps = _caps_tuple(cap) or ()
+    labels = []
+    for c in caps:
+        spec = srvperms.CAPS.get(c)
+        labels.append(spec[0] if spec else str(c))
+    return " / ".join(labels) if labels else str(cap)
 
 
 def channel_server(interaction):
@@ -332,15 +385,17 @@ def admin_check(require_admin_channel=True, scope="primary", cap=None):
             if not ok_chan:
                 raise app_commands.CheckFailure(
                     f"Action réservée aux salons de la catégorie **🔒 Lock {srv}**.")
-        if not is_admin(cfg, interaction, server=srv):
+        ok, why, tier = gate_allows(cfg, interaction, server=srv, gate="mod", cap=cap)
+        if not ok and why == "cap":
+            raise app_commands.CheckFailure(
+                f"Capacité **{cap_label(cap)}** non accordée à ton niveau **{tier}** sur "
+                f"**{srv}** (réglable par l'Owner du serveur : `/gestion perms`).")
+        if not ok:
             # ⚠️ Ne PAS mentionner la permission Discord « Administrateur » : elle n'est
             # plus honorée depuis 2026-07-16 (seul le rôle M/O du serveur ouvre les actions).
             raise app_commands.CheckFailure(
-                f"Réservé aux gestionnaires de **{srv}** (rôle M ou O, accordé via /gestion).")
-        if not cap_ok(cfg, interaction, server=srv, cap=cap):
-            raise app_commands.CheckFailure(
-                f"Capacité **{cap_label(cap)}** non accordée à ton niveau sur **{srv}** "
-                "(réglable par l'Owner du serveur : `/gestion perms`).")
+                f"Réservé aux gestionnaires de **{srv}** (rôle M ou O, accordé via /gestion"
+                + (" — ou G avec cette capacité accordée par l'Owner)." if cap else ")."))
         return True
 
     predicate.__qualname__ = "admin_check.<locals>.predicate"
@@ -360,13 +415,16 @@ def read_check(scope="primary", cap="read"):
                 allowed.add(cfg.admin_channel_id)
             if interaction.channel_id not in allowed:
                 raise app_commands.CheckFailure("Commande non autorisée dans ce salon.")
-        if not can_read(cfg, interaction, server=srv):
+        ok, why, tier = gate_allows(cfg, interaction, server=srv, gate="read", cap=cap)
+        if not ok and why == "cap":
+            raise app_commands.CheckFailure(
+                f"Capacité **{cap_label(cap or 'read')}** non accordée à ton niveau "
+                f"**{tier}** sur **{srv}** (réglable par l'Owner du serveur : "
+                "`/gestion perms`).")
+        if not ok:
             raise app_commands.CheckFailure(
                 f"Réservé aux membres autorisés sur **{srv}** (rôle M/O, ou G avec la "
-                "lecture ouverte par l'Owner).")
-        if cap and cap != "read" and not cap_ok(cfg, interaction, server=srv, cap=cap):
-            raise app_commands.CheckFailure(
-                f"Capacité **{cap_label(cap)}** non accordée à ton niveau sur **{srv}**.")
+                "capacité accordée par l'Owner).")
         return True
 
     predicate.__qualname__ = "read_check.<locals>.predicate"

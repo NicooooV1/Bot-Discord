@@ -424,3 +424,136 @@ class TestGestion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================ capacités accordées à G (29/08 soir)
+class FauxResponse:
+    def __init__(self):
+        self.sent = []
+
+    def is_done(self):
+        return False
+
+    async def send_message(self, *a, **k):
+        self.sent.append((a, k))
+
+
+class TestCapaciteAccordeeAG(unittest.TestCase):
+    """Nico 29/08 soir : « G R820 a la permission de rafraîchir mais ça ne fonctionne pas ».
+    La porte testait « M/O ? » AVANT la capacité : une capacité cochée pour G n'était
+    jamais consultée. Désormais gate_allows décide tier + capacité d'un coup."""
+
+    def setUp(self):
+        self.cfg = cfg()
+        self.bot = FauxBot(self.cfg, CATS)
+        self.G = (1,)
+        self.M = (2,)
+
+    def test_gate_allows_G_seulement_avec_capacite_explicite(self):
+        g = Itx(self.bot, roles=self.G)
+        ok, why, tier = permissions.gate_allows(self.cfg, g, gate="mod", cap="refresh")
+        self.assertEqual((ok, why, tier), (False, "cap", "G"))
+        srvperms.set_caps(self.bot.state, "R820", "G", {"refresh"})
+        self.assertEqual(permissions.gate_allows(self.cfg, g, gate="mod", cap="refresh")[0], True)
+        # une vue « mod » SANS capacité déclarée reste fermée à G
+        self.assertEqual(permissions.gate_allows(self.cfg, g, gate="mod", cap=None)[:2], (False, "role"))
+        # et un autre serveur n'hérite de rien
+        self.assertFalse(permissions.gate_allows(self.cfg, g, server="AVY-NAS", gate="mod", cap="refresh")[0])
+
+    def test_gate_allows_M_restreint_par_owner(self):
+        m = Itx(self.bot, roles=self.M)
+        self.assertTrue(permissions.gate_allows(self.cfg, m, gate="mod", cap="stop")[0])
+        allowed = {c for c, v in srvperms.effective_caps(self.bot.state, "R820", "M").items() if v}
+        srvperms.set_caps(self.bot.state, "R820", "M", allowed - {"stop"})
+        self.assertEqual(permissions.gate_allows(self.cfg, m, gate="mod", cap="stop")[:2], (False, "cap"))
+        self.assertTrue(permissions.gate_allows(self.cfg, m, gate="mod", cap=("start", "stop"))[0])  # any
+        self.assertTrue(permissions.gate_allows(self.cfg, m, gate="mod", cap=None)[0])
+
+    def test_porte_read_et_legacy(self):
+        g = Itx(self.bot, roles=self.G)
+        self.assertEqual(permissions.gate_allows(self.cfg, g, gate="read")[:2], (False, "cap"))
+        srvperms.set_caps(self.bot.state, "R820", "G", {"graph"})
+        self.assertTrue(permissions.gate_allows(self.cfg, g, gate="read", cap="graph")[0])   # graph seul suffit
+        self.assertFalse(permissions.gate_allows(self.cfg, g, gate="read")[0])              # mais pas « read »
+        c = Config(env=dict(ENV, READ_ROLE_IDS="77"))
+        b = FauxBot(c, CATS)
+        self.assertTrue(permissions.gate_allows(c, Itx(b, roles=(77,)), gate="read")[0])
+        self.assertFalse(permissions.gate_allows(c, Itx(b, roles=(77,)), gate="mod", cap="refresh")[0])
+
+    def test_admin_check_et_read_check_ouvrent_a_G(self):
+        async def chk(deco, itx):
+            try:
+                return await _pred(deco, itx)
+            except app_commands.CheckFailure as e:
+                return str(e)
+        g = Itx(self.bot, roles=self.G, channel=None)
+        docker = permissions.admin_check(require_admin_channel=False, cap="services")
+        ctctl = permissions.admin_check(require_admin_channel=False, scope="channel",
+                                        cap=("start", "stop", "reboot"))
+        graph = permissions.read_check(scope="channel", cap="graph")
+        self.assertIn("Capacité", run(chk(docker, g)))
+        self.assertIn("Capacité", run(chk(ctctl, g)))
+        srvperms.set_caps(self.bot.state, "R820", "G", {"services", "start", "graph"})
+        self.assertIs(run(chk(docker, g)), True)
+        self.assertIs(run(chk(ctctl, g)), True)
+        self.assertIs(run(chk(graph, g)), True)
+        # la commande /audit (mod + cap read) reste fermée sans « read »
+        audit = permissions.admin_check(require_admin_channel=False, cap="read")
+        self.assertIn("Capacité", run(chk(audit, g)))
+
+    def test_vue_mod_avec_gate_caps_ouverte_a_G(self):
+        from bot.core.gates import GatedView
+
+        class Vue(GatedView):
+            gate = "mod"
+            gate_caps = {"x:refresh": "refresh", "x:stop": "stop"}
+
+        bot, cfg_, G, M = self.bot, self.cfg, self.G, self.M
+
+        async def go():
+            v = Vue(timeout=None)                      # discord.ui.View exige une boucle
+            g = Itx(bot, roles=G)
+            g.response = FauxResponse()
+            g.data = {"custom_id": "x:refresh"}
+            assert not await v.interaction_check(g)
+            assert g.response.sent, "le refus doit être répondu"
+            srvperms.set_caps(bot.state, "R820", "G", {"refresh"})
+            assert await v.interaction_check(g)
+            g.data = {"custom_id": "x:stop"}
+            assert not await v.interaction_check(g)      # stop non accordé
+            m = Itx(bot, roles=M)
+            m.response = FauxResponse()
+            m.data = {"custom_id": "x:stop"}
+            assert await v.interaction_check(m)
+            allowed = {c for c, v_ in srvperms.effective_caps(bot.state, "R820", "M").items() if v_}
+            srvperms.set_caps(bot.state, "R820", "M", allowed - {"stop"})
+            assert not await v.interaction_check(m)
+            assert bot.audit.rows[-1]["action"] == "refus"
+            return True
+        self.assertTrue(run(go()))
+
+    def test_terminal_ouvert_a_G_par_capacite(self):
+        from bot.cogs.terminal import Terminal
+
+        class Dummy:
+            cfg = self.cfg
+            _tier_terminal = Terminal._tier_terminal
+        d = Dummy()
+        g = Itx(self.bot, roles=self.G)
+        self.assertFalse(Terminal._may_open(d, g))
+        srvperms.set_caps(self.bot.state, "R820", "G", {"terminal"})
+        self.assertTrue(Terminal._may_open(d, g))
+        m = Itx(self.bot, roles=self.M)
+        self.assertTrue(Terminal._may_open(d, m))
+        self.assertFalse(Terminal._may_open_node(d, m))          # node_terminal refusé par défaut
+        allowed = {c for c, v in srvperms.effective_caps(self.bot.state, "R820", "M").items() if v}
+        srvperms.set_caps(self.bot.state, "R820", "M", allowed | {"node_terminal"})
+        self.assertTrue(Terminal._may_open_node(d, m))
+        self.assertTrue(Terminal._may_open_node(d, Itx(self.bot, roles=(3,))))   # O toujours
+
+    def test_autocomplete_G_avec_capacite(self):
+        from bot.core import ui
+        g = Itx(self.bot, roles=self.G, channel=FauxChannel(1, C_R820))
+        self.assertFalse(ui._ac_allowed(g))
+        srvperms.set_caps(self.bot.state, "R820", "G", {"start"})
+        self.assertTrue(ui._ac_allowed(g))

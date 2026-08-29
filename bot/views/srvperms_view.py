@@ -60,7 +60,8 @@ class SrvPermsView(GatedView):
             title=f"🛂 Permissions — {self.server} · niveau {self.tier}",
             description=("Réglages de l'Owner pour ce niveau, **sur ce serveur seulement**. "
                          "Le niveau O n'est jamais restreint ; le propriétaire du bot non plus.\n"
-                         "*(modifié)* = différent du défaut."),
+                         "Une capacité cochée ouvre le bouton/la commande à ce niveau — y compris "
+                         "à **G**, qui n'a rien par défaut. *(modifié)* = différent du défaut."),
             color=0x5865F2)
         lines = srvperms.summary_lines(st, self.server, self.tier)
         emb.add_field(name="Capacités", value="\n".join(lines)[:1024], inline=False)

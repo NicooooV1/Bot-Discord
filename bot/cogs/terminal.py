@@ -546,6 +546,7 @@ class TerminalView(GatedView):
     """
 
     gate = "mod"
+    gate_cap = "terminal"
 
     def __init__(self, cog, thread_id, owner_id):
         super().__init__(timeout=None)
@@ -647,6 +648,7 @@ class NodeTerminalView(TerminalView):
     """
 
     gate = "owner"
+    gate_cap = "node_terminal"
 
     async def interaction_check(self, itx) -> bool:
         if not await super().interaction_check(itx):
@@ -725,17 +727,29 @@ class Terminal(commands.Cog):
                 except discord.HTTPException:
                     pass
 
+    def _tier_terminal(self, itx):
+        """Tier de l'invocateur sur le serveur primaire (la console LXC ne couvre que le
+        R820). Legacy : un porteur de TERMINAL_OWNER_ROLE_IDS sans tier est traité « M »."""
+        from ..core.permissions import tier_of
+        tier = tier_of(self.cfg, itx, None)
+        if tier is None:
+            roles = self.cfg.terminal_owner_role_ids
+            if roles and ({r.id for r in getattr(itx.user, "roles", [])} & set(roles)):
+                tier = "M"
+        return tier
+
     def _may_open(self, itx):
-        """Console LXC (R820 uniquement) : TERMINAL_OWNER_IDS toujours ; sinon un porteur
-        de TERMINAL_OWNER_ROLE_IDS (= M/O R820) À CONDITION que son niveau ait la
-        capacité « terminal » sur le serveur (réglable par l'Owner, core/srvperms)."""
-        from ..core.permissions import cap_ok, is_breakglass
-        if itx.user.id in self.cfg.terminal_owner_ids or is_breakglass(self.cfg, itx):
+        """Console LXC (R820 uniquement) : TERMINAL_OWNER_IDS / break-glass toujours ;
+        sinon le tier de l'invocateur (O toujours ; M par défaut ; G si l'Owner lui a
+        accordé la capacité « terminal » via /gestion perms — 2026-08-29)."""
+        from ..core import srvperms
+        if itx.user.id in self.cfg.terminal_owner_ids:
             return True
-        roles = self.cfg.terminal_owner_role_ids
-        if not (roles and ({r.id for r in getattr(itx.user, "roles", [])} & set(roles))):
+        tier = self._tier_terminal(itx)
+        if tier is None:
             return False
-        return cap_ok(self.cfg, itx, server=None, cap="terminal")
+        return srvperms.cap_allowed(getattr(itx.client, "state", None),
+                                    getattr(self.cfg, "server_key", "R820"), tier, "terminal")
 
     def _precheck(self, itx, name):
         """Contrôles d'ouverture d'une console LXC, SANS aucune I/O (donc utilisables
@@ -900,22 +914,22 @@ class Terminal(commands.Cog):
 
     # ------------------------------------------------------------ console du NŒUD
     def _may_open_node(self, itx):
-        """Shell root de l'hyperviseur : PROPRIÉTAIRE ou tier **O** du serveur du nœud —
-        PAS M. Raison (revue sécu 2026-07-16) : le shell root du nœud permet `pct enter`
-        vers N'IMPORTE quel conteneur (dont vaultwarden/bdd/mailserver), contournant les
-        exclusions `terminal_excluded_guests` de la console LXC. On réserve donc ce pouvoir
-        à O/owner ; M garde les boutons Lock (rafraîchir/sauvegarder) + la console LXC (qui,
-        elle, respecte les exclusions). Session 2FA exigée en plus (open_node_for)."""
-        from ..core.permissions import cap_ok, is_breakglass, tier_of
-        if itx.user.id in self.cfg.node_terminal_owner_ids or is_breakglass(self.cfg, itx):
+        """Shell root de l'hyperviseur : NODE_TERMINAL_OWNER_IDS / break-glass toujours ;
+        tier **O** du serveur du nœud toujours ; M ou G seulement si l'Owner leur a
+        accordé la capacité « node_terminal » (refusée par défaut — revue sécu 2026-07-16 :
+        le shell root du nœud permet `pct enter` vers N'IMPORTE quel conteneur, dont
+        vaultwarden/bdd/mailserver, contournant les exclusions de la console LXC).
+        Session 2FA exigée en plus (open_node_for)."""
+        from ..core import srvperms
+        from ..core.permissions import tier_of
+        if itx.user.id in self.cfg.node_terminal_owner_ids:
             return True
         key = getattr(self.cfg, "node_server_key", None)
         tier = tier_of(self.cfg, itx, key)
-        if tier == "O":
-            return True
-        # 2026-08-29 : l'Owner du serveur peut l'ouvrir à M via /gestion perms
-        # (capacité « node_terminal », refusée par défaut)
-        return tier == "M" and cap_ok(self.cfg, itx, server=key, cap="node_terminal")
+        if tier is None:
+            return False
+        return srvperms.cap_allowed(getattr(itx.client, "state", None), key, tier,
+                                    "node_terminal")
 
     def _precheck_node(self, itx):
         """Idem `_precheck`, pour le shell root de l'hyperviseur. Sans I/O."""

@@ -100,12 +100,19 @@ def _ac_allowed(interaction):
     mais elle livrait l'inventaire (noms, vmid, état) à tout membre ayant une session
     2FA, rôle ou pas (audit 2026-08-29). On ne propose rien à qui ne peut pas lire le
     serveur du salon."""
-    from .permissions import can_read
-    from . import channels as _ch
+    from .permissions import can_read, tier_of
+    from . import channels as _ch, srvperms
     bot = interaction.client
     try:
         srv = _ch.server_of_channel(bot, getattr(interaction, "channel", None))
-        return can_read(bot.cfg, interaction, server=srv)
+        tier = tier_of(bot.cfg, interaction, srv)
+        if tier in ("O", "M"):
+            return True
+        if tier == "G":
+            # G voit les cibles dès que l'Owner lui a accordé une capacité (start,
+            # refresh, graph…) — pas seulement « read » (2026-08-29 soir)
+            return srvperms.tier_has_any_cap(getattr(bot, "state", None), srv, "G")
+        return can_read(bot.cfg, interaction, server=srv)      # legacy READ_ROLE_IDS
     except Exception:  # noqa: BLE001 — une autocomplétion ne doit jamais lever
         return False
 
