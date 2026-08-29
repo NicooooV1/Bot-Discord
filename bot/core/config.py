@@ -141,6 +141,11 @@ class Config:
         # Journal d'activité Jellyfin (lecture démarrée, compte créé, connexion…) dans
         # la catégorie 🔒 Lock — propriétaire uniquement (demande Nico 2026-07-18).
         self.jellyfin_logs_enabled = _bool(g("JELLYFIN_LOGS_ENABLED"), True)
+        # Journal Dolibarr (CT108) dans #doli-logs (🔒 Lock) via Loki {job="dolibarr"}
+        # (demande Nico 2026-08-29). Inactif si LOKI_URL est vide.
+        self.dolibarr_logs_enabled = _bool(g("DOLIBARR_LOGS_ENABLED"), True)
+        self.dolibarr_logs_channel_id = _int(g("DOLIBARR_LOGS_CHANNEL_ID"))  # repli si non provisionné
+        self.dolibarr_logs_poll_seconds = max(10, _int(g("DOLIBARR_LOGS_POLL_SECONDS", "30"), 30))
         # Heartbeat externe (dead-man's-switch) : URL de ping healthchecks.io/ntfy
         self.heartbeat_url = g("HEARTBEAT_URL", "").strip()
 

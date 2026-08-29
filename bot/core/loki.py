@@ -7,7 +7,7 @@ Label contract (FROZEN — must match the Alloy/Promtail config on the Loki side
 - host : machine hostname (pve, jellyfin, reverseproxy, discord-bot, ...)
 - unit : systemd unit
 - level: journald vocabulary (emerg alert crit err warning notice info debug)
-- job  : systemd-journal | jellyfin | caddy
+- job  : systemd-journal | jellyfin | caddy | adguard | dolibarr (unit = source)
 Endpoint: http://10.3.10.123:3100 (LOKI_URL).
 """
 import logging
@@ -103,6 +103,22 @@ class Loki:
             "direction": "backward",
         }
         return self._parse_result(await self._get("/loki/api/v1/query_range", params))
+
+    async def query_since(self, logql, start_ns, limit=400):
+        """Lignes depuis `start_ns` (inclus), ORDRE CHRONOLOGIQUE côté serveur : avec
+        `limit` atteint, la suite se lit au prochain appel depuis la dernière ligne
+        rendue (curseur sans perte). None = requête en échec (≠ liste vide)."""
+        params = {
+            "query": logql,
+            "start": str(int(start_ns)),
+            "end": str(int(time.time() * 1e9)),
+            "limit": str(limit),
+            "direction": "forward",
+        }
+        data = await self._get("/loki/api/v1/query_range", params)
+        if data is None:
+            return None
+        return self._parse_result(data)
 
     async def instant(self, logql):
         """Instant (metric) query — e.g. topk over count_over_time."""

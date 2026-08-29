@@ -29,7 +29,7 @@ COGS = ["status", "graphs", "hardware", "storage", "backups", "sysinfo",
         "reports", "servarr", "medias", "requests", "youtube", "meta", "provision", "terminal",
         "heartbeat", "twofa", "docker", "gestion", "avy", "avy_metrics",
         "jellyfin_activity", "seerr_activity", "dist", "netrates", "transfert", "sso",
-        "dns"]
+        "dns", "dolibarr_logs"]
 
 # Seule famille de commandes exemptée de 2FA. Sans elle, impossible de s'inscrire ni de
 # déverrouiller : la clé serait enfermée à l'intérieur. NE PAS retirer.
