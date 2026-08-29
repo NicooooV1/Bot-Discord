@@ -440,7 +440,7 @@ class Status(commands.Cog):
     @app_commands.command(description="Fiche d'un conteneur (status + graphe CPU 6h).")
     @app_commands.describe(name="Nom du conteneur")
     @app_commands.autocomplete(name=ct_autocomplete)
-    @read_check()
+    @read_check(scope="channel")
     async def ct(self, itx: discord.Interaction, name: str):
         await itx.response.defer()
         bot = self.bot
@@ -516,7 +516,7 @@ class Status(commands.Cog):
             await itx.followup.send(embed=emb)
 
     @app_commands.command(description="Liste de tous les conteneurs.")
-    @read_check()
+    @read_check(scope="channel")
     async def cts(self, itx: discord.Interaction):
         await itx.response.defer()
         bot = self.bot

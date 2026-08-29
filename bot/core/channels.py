@@ -144,6 +144,94 @@ def server_of_channel(bot, channel):
     return srv
 
 
+def _category_of(channel):
+    if channel is None:
+        return None
+    if isinstance(channel, discord.CategoryChannel):
+        return channel
+    parent = getattr(channel, "parent", None)
+    return getattr(channel, "category", None) or getattr(parent, "category", None)
+
+
+def lock_server_of_channel(bot, channel):
+    """Clé serveur si `channel` est dans une catégorie « 🔒 Lock <srv> » (celle du
+    R820, d'un nœud Aveyron ou du NAS), sinon None. Sans I/O.
+
+    Sert de « salon admin » PAR SERVEUR (audit 2026-08-29) : les commandes destructives
+    (/ctctl, /backup…) se lancent depuis la catégorie Lock du serveur visé, visible des
+    seuls M/O de ce serveur — plus depuis un unique ADMIN_CHANNEL_ID global."""
+    cat = _category_of(channel)
+    if cat is None:
+        return None
+    srv = getattr(bot.cfg, "server_key", "R820")
+    cats = ((bot.state.get("prov") or {}).get("categories") or {})
+    for key, cid in cats.items():
+        if cid != cat.id:
+            continue
+        if key == "lock":
+            return srv
+        if key.startswith("avy_lock_"):
+            return bot.pve.avy_server_key(key[len("avy_lock_"):])
+        if key == "syno_lock":
+            return "SYNO"
+        return None
+    n = norm(cat.name)
+    if not n.startswith("lock"):
+        return None
+    # repli sur le NOM : « 🔒 Lock <clé> » avec une clé déclarée (GESTION_SERVERS ou
+    # nœud Aveyron connu) — la plus longue d'abord, pour que « AVY-MS01 » ne soit pas
+    # attrapée par une clé qui en serait un suffixe.
+    keys = set(getattr(bot.cfg, "gestion_servers", {}) or {}) | {srv, "SYNO"}
+    for node in (getattr(bot.cfg, "avy_nodes", None) or []):
+        keys.add(bot.pve.avy_server_key(node))
+    for k in sorted(keys, key=lambda x: -len(norm(x))):
+        if norm(k) and n.endswith(norm(k)):
+            return k
+    return None
+
+
+def server_categories(bot, guild, server):
+    """Catégories provisionnées appartenant au serveur `server`, sous la forme
+    [(clé prov, catégorie, genre)] avec genre ∈ {"tiered", "lock"} — c'est le schéma
+    d'overwrites à leur appliquer. Sert à /gestion perms (liste des salons du serveur)
+    et à provision.enforce_server_perms (réapplication immédiate)."""
+    if guild is None:
+        return []
+    srv = getattr(bot.cfg, "server_key", "R820")
+    cats = ((bot.state.get("prov") or {}).get("categories") or {})
+    out = []
+    for key, cid in cats.items():
+        cat = _by_id(guild, cid)
+        if cat is None:
+            continue
+        if server == srv and key in ("supervision", "containers"):
+            out.append((key, cat, "tiered"))
+        elif server == srv and key == "lock":
+            out.append((key, cat, "lock"))
+        elif server == "SYNO" and key == "syno_sup":
+            out.append((key, cat, "tiered"))
+        elif server == "SYNO" and key == "syno_lock":
+            out.append((key, cat, "lock"))
+        elif key.startswith(("avy_sup_", "avy_gest_")):
+            node = key.split("_", 2)[2]
+            if bot.pve.avy_server_key(node) == server:
+                out.append((key, cat, "tiered"))
+        elif key.startswith("avy_lock_"):
+            node = key[len("avy_lock_"):]
+            if bot.pve.avy_server_key(node) == server:
+                out.append((key, cat, "lock"))
+    return out
+
+
+def server_channel_ids(bot, guild, server):
+    """Ids de tous les salons texte des catégories du serveur (pour valider une
+    sélection de salons à masquer : jamais un salon d'un autre serveur)."""
+    ids = set()
+    for _key, cat, _genre in server_categories(bot, guild, server):
+        ids.update(ch.id for ch in cat.text_channels)
+    return ids
+
+
 def same_server(channel_srv, target_srv, default="R820"):
     """True si une cible de serveur `target_srv` (None = cluster primaire) peut être
     montrée dans un salon de serveur `channel_srv`. « AVY » (catégorie générique

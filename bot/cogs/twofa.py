@@ -18,7 +18,7 @@ from discord.ext import commands
 
 from ..core.durations import clamp_duration, fmt_duration, parse_duration
 from ..core.gates import GatedView
-from ..core.permissions import deny_2fa, is_admin, session_2fa_ok
+from ..core.permissions import deny_2fa, is_breakglass, session_2fa_ok
 from ..core.twofa import TwoFAStoreError
 from ..views.twofa_view import CodeModal
 
@@ -147,9 +147,11 @@ class TwoFACog(commands.Cog):
         en « illimité ». On exige donc admin **et** une session de confiance ouverte.
         """
         tf = self.bot.twofa
-        if not is_admin(self.bot.cfg, itx):
+        # réglage GLOBAL (toutes les sessions, tous les serveurs) : aucun rôle M/O d'un
+        # serveur ne doit pouvoir l'allonger — propriétaire / ADMIN_IDS seuls (2026-08-29)
+        if not is_breakglass(self.bot.cfg, itx):
             await itx.response.send_message(
-                "⛔ Réservé à l'administrateur du bot.", ephemeral=True)
+                "⛔ Réservé au propriétaire du bot.", ephemeral=True)
             return
         if duree is None:
             await itx.response.send_message(

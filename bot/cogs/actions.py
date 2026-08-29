@@ -12,8 +12,9 @@ from discord.ext import commands
 
 from ..core import format as fmt
 from ..core.gates import GatedView
-from ..core.permissions import admin_check
-from ..core.ui import ct_autocomplete
+from ..core import srvperms
+from ..core.permissions import admin_check, cap_label, cap_ok, channel_server, log_refusal
+from ..core.ui import ct_autocomplete, guard_target
 from ..views.confirm import ConfirmView
 
 log = logging.getLogger("discord-bot.actions")
@@ -31,6 +32,16 @@ class Actions(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    def _cap_refusal(self, itx, cap):
+        """Message de refus si le niveau de l'invocateur n'a pas la capacité `cap` sur
+        le serveur du salon (réglage Owner, core/srvperms), None sinon."""
+        srv = channel_server(itx)
+        if cap_ok(self.bot.cfg, itx, server=srv, cap=cap):
+            return None
+        log_refusal(itx, "cap", f"{cap} serveur={srv}")
+        return (f"⛔ Capacité **{cap_label(cap)}** non accordée à ton niveau sur **{srv}** "
+                "(réglable par l'Owner du serveur : `/gestion perms`).")
+
     async def _confirm(self, itx, description):
         # caller has already deferred (ephemeral) -> send the prompt via followup
         view = ConfirmView(itx.user.id)
@@ -47,7 +58,7 @@ class Actions(commands.Cog):
     @app_commands.describe(action="start, stop ou restart", name="Conteneur ou VM")
     @app_commands.choices(action=ACTIONS)
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check()
+    @admin_check(scope="channel")
     async def ctctl(self, itx: discord.Interaction,
                     action: app_commands.Choice[str], name: str):
         if not self.bot.pve.actions_enabled:
@@ -55,6 +66,13 @@ class Actions(commands.Cog):
                                             "(`PVE_ACTION_TOKEN_SECRET`).", ephemeral=True)
             return
         await itx.response.defer(ephemeral=True)
+        # Cible rattachée au serveur du salon (audit 2026-08-29 : un M R820 pouvait
+        # arrêter une VM d'Aveyron) + capacité start/stop/reboot du niveau sur ce serveur.
+        refus = await guard_target(self.bot, itx, name) or self._cap_refusal(
+            itx, srvperms.ACTION_CAP.get(action.value, action.value))
+        if refus:
+            await itx.followup.send(refus, ephemeral=True)
+            return
         vmid = await self.bot.pve.avmid_of(name)
         if not vmid:
             await itx.followup.send("VM/conteneur introuvable.", ephemeral=True)
@@ -90,12 +108,16 @@ class Actions(commands.Cog):
     @backup.command(name="create", description="Lancer une sauvegarde vzdump d'un conteneur vers PBS.")
     @app_commands.describe(name="Conteneur à sauvegarder")
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check()
+    @admin_check(scope="channel")
     async def backup_create(self, itx: discord.Interaction, name: str):
         if not self.bot.pve.actions_enabled:
             await itx.response.send_message("Token d'action PVE non configuré.", ephemeral=True)
             return
         await itx.response.defer(ephemeral=True)
+        refus = await guard_target(self.bot, itx, name) or self._cap_refusal(itx, 'backup')
+        if refus:
+            await itx.followup.send(refus, ephemeral=True)
+            return
         vmid = await self.bot.pve.avmid_of(name)
         if not vmid:
             await itx.followup.send("Conteneur introuvable.", ephemeral=True)
@@ -131,12 +153,16 @@ class Actions(commands.Cog):
                     description="Supprimer une sauvegarde PBS d'un conteneur (confirmation requise).")
     @app_commands.describe(name="Conteneur dont supprimer une sauvegarde")
     @app_commands.autocomplete(name=ct_autocomplete)
-    @admin_check()
+    @admin_check(scope="channel")
     async def backup_delete(self, itx: discord.Interaction, name: str):
         if not self.bot.pve.actions_enabled:
             await itx.response.send_message("Token d'action PVE non configuré.", ephemeral=True)
             return
         await itx.response.defer(ephemeral=True)
+        refus = await guard_target(self.bot, itx, name) or self._cap_refusal(itx, 'backup_delete')
+        if refus:
+            await itx.followup.send(refus, ephemeral=True)
+            return
         vmid = await self.bot.pve.avmid_of(name)
         if not vmid:
             await itx.followup.send("Conteneur introuvable.", ephemeral=True)
@@ -153,7 +179,8 @@ class Actions(commands.Cog):
                 ephemeral=True)
             return
         snaps.sort(key=lambda s: s.get("ctime", 0) or 0, reverse=True)
-        view = BackupDeleteView(self, name, snaps[:25], itx.user.id)
+        view = BackupDeleteView(self, name, snaps[:25], itx.user.id,
+                                server=channel_server(itx))
         if not view.options_count:
             # Discord refuse un menu vide (400) : mieux vaut le dire que se prendre le rejet.
             await itx.followup.send(
@@ -187,12 +214,16 @@ class BackupDeleteView(GatedView):
     `GatedTree` — la porte doit être ICI (2026-08-11)."""
 
     gate = "mod"
+    gate_cap = "backup_delete"
 
-    def __init__(self, cog, name, snaps, user_id=None):
+    def __init__(self, cog, name, snaps, user_id=None, server=None):
         super().__init__(timeout=120)
         self.cog = cog
         self.name = name
         self.gate_user_id = user_id
+        # serveur de l'invité (clé GESTION_SERVERS ; None = R820) : la porte du menu est
+        # bornée au MÊME serveur que la commande qui l'a ouvert (audit 2026-08-29)
+        self.gate_server = server
         self.message = None      # posé par l'appelant pour que on_timeout grise le menu
         options = []
         for s in snaps:

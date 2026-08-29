@@ -47,6 +47,7 @@ class AlertActionView(GatedView):
     pendant 4 h sur ipmi_temp — la seule alerte que Grafana ne couvre PAS."""
 
     gate = "mod"
+    gate_cap = "alerts"
 
     def __init__(self):
         super().__init__(timeout=None)

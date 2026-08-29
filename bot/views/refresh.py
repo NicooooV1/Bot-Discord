@@ -16,6 +16,7 @@ class RefreshView(GatedView):
     déclencher en rafale."""
 
     gate = "mod"
+    gate_cap = "refresh"
 
     def __init__(self, bot=None):
         super().__init__(timeout=None)  # persistante

@@ -71,12 +71,55 @@ def server_mismatch(bot, interaction, target, target_srv):
             f"un salon de **{target_srv or default}**.")
 
 
+async def guard_target(bot, interaction, name):
+    """Garde COMMUNE des commandes qui nomment un invité (/ctctl, /backup…) : message de
+    refus si `name` n'appartient pas au serveur du salon (donc au serveur dont la porte
+    admin_check(scope="channel") a déjà vérifié le rôle), None sinon.
+
+    Audit 2026-08-29 : `/ctctl stop xxx-avy` passait avec un simple rôle M R820 parce
+    que la porte ne regardait qu'un rôle global et que la cible n'était jamais rattachée
+    à un serveur. Un nom « -avy » dont le nœud est inconnu (guest_map partiel, lien
+    Aveyron coupé) est REFUSÉ (« AVY » n'est pas une clé), jamais rattaché au R820."""
+    try:
+        gm = await asyncio.to_thread(bot.pve.guest_map) if bot.pve.enabled else {}
+    except Exception:  # noqa: BLE001 — inventaire indisponible = on ne peut pas situer
+        return ("⛔ Inventaire PVE indisponible : impossible de vérifier à quel serveur "
+                f"appartient `{name}`. Réessaie dans une minute.")
+    info = gm.get(name)
+    if info is None:
+        return None            # la commande répondra elle-même « introuvable »
+    tgt = guest_server(bot, name, info)
+    if tgt == "AVY":
+        return (f"⏳ Serveur de `{name}` non résolu (supervision AVEYRON en cours de "
+                "synchronisation) — réessaie dans une minute.")
+    return server_mismatch(bot, interaction, name, tgt)
+
+
+def _ac_allowed(interaction):
+    """L'autocomplétion n'est PAS une porte (la valeur saisie n'est jamais filtrée),
+    mais elle livrait l'inventaire (noms, vmid, état) à tout membre ayant une session
+    2FA, rôle ou pas (audit 2026-08-29). On ne propose rien à qui ne peut pas lire le
+    serveur du salon."""
+    from .permissions import can_read
+    from . import channels as _ch
+    bot = interaction.client
+    try:
+        srv = _ch.server_of_channel(bot, getattr(interaction, "channel", None))
+        return can_read(bot.cfg, interaction, server=srv)
+    except Exception:  # noqa: BLE001 — une autocomplétion ne doit jamais lever
+        return False
+
+
 async def ct_autocomplete(interaction, current):
+    if not _ac_allowed(interaction):
+        return []
     return await _lxc_choices(interaction.client, current, include_host=False,
                               channel=getattr(interaction, "channel", None))
 
 
 async def target_autocomplete(interaction, current):
+    if not _ac_allowed(interaction):
+        return []
     return await _lxc_choices(interaction.client, current, include_host=True,
                               channel=getattr(interaction, "channel", None))
 

@@ -397,13 +397,15 @@ class NodeControlView(GatedView):
     propriétaire break-glass (2026-07-16)."""
 
     gate = "owner"
+    gate_caps = {"nodechannel:refresh": "refresh", "nodechannel:backup": "node_backup",
+                 "nodechannel:terminal": "node_terminal"}
 
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
 
     async def interaction_check(self, itx) -> bool:
-        if not await super().interaction_check(itx):     # rôle M/O + 2FA
+        if not await super().interaction_check(itx):     # rôle M/O + capacité + 2FA
             return False
         # `node_channel_enabled` doit être un interrupteur RUNTIME : la vue est
         # persistante, donc les boutons d'un message déjà posté survivent à un

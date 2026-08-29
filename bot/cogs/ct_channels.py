@@ -589,6 +589,11 @@ class CtControlView(GatedView):
     demandent une confirmation (comme /ctctl)."""
 
     gate = "mod"
+    # capacité exigée PAR BOUTON (réglable par l'Owner du serveur, core/srvperms)
+    gate_caps = {"ctchannels:refresh": "refresh", "ctchannels:start": "start",
+                 "ctchannels:stop": "stop", "ctchannels:reboot": "reboot",
+                 "ctchannels:backup": "backup", "ctchannels:graph": "graph",
+                 "ctchannels:terminal": "terminal"}
 
     def __init__(self, cog):
         super().__init__(timeout=None)

@@ -138,9 +138,14 @@ class TestIsAdminFailClosed(unittest.TestCase):
         admin = FauxInteraction(uid=999, roles=())
         self.assertTrue(self.perms.is_admin(self.cfg, admin, server="AVY-INCONNU"))
 
-    def test_sans_serveur_utilise_les_roles_globaux(self):
+    def test_sans_serveur_veut_dire_serveur_primaire(self):
+        """2026-08-29 : `server=None` = SERVER_KEY (R820) et SES rôles M/O dans
+        GESTION_SERVERS — plus jamais le rôle global ADMIN_ROLE_IDS (qui mélangeait les
+        M/O de plusieurs serveurs en production)."""
         itx = FauxInteraction(uid=42, roles=(500,))
-        self.assertTrue(self.perms.is_admin(self.cfg, itx))
+        self.assertFalse(self.perms.is_admin(self.cfg, itx))
+        self.assertTrue(self.perms.is_admin(self.cfg, FauxInteraction(uid=42, roles=(2,))))
+        self.assertFalse(self.perms.is_admin(self.cfg, FauxInteraction(uid=42, roles=(5,))))
 
     def test_can_read_fail_closed_si_aucun_role_lecture(self):
         cfg = Config(env={"DISCORD_TOKEN": "x", "GUILD_ID": "100"})

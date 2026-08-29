@@ -76,6 +76,7 @@ class RefusedActionView(GatedView):
     exigence (rôle Gestion + session 2FA revalidée au clic) que /dist autoriser."""
 
     gate = "mod"
+    gate_cap = "services"
 
     def __init__(self, cog=None):
         super().__init__(timeout=None)
@@ -598,7 +599,7 @@ class Dist(commands.Cog):
 
     @dist.command(name="autoriser", description="Whitelister une IP sur le serveur de distribution Fronote.")
     @app_commands.describe(ip="IP publique du client", note="Mémo (ex. nom de l'établissement)")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def autoriser(self, itx: discord.Interaction, ip: str, note: str = ""):
         if not await self._guard_enabled(itx):
             return
@@ -621,7 +622,7 @@ class Dist(commands.Cog):
 
     @dist.command(name="retirer", description="Retirer une IP de la whitelist du serveur de distribution.")
     @app_commands.describe(ip="IP à retirer")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def retirer(self, itx: discord.Interaction, ip: str):
         if not await self._guard_enabled(itx):
             return
@@ -645,7 +646,7 @@ class Dist(commands.Cog):
 
     @dist.command(name="statut", description="Statut d'une IP sur le serveur de distribution (whitelistée ?).")
     @app_commands.describe(ip="IP à consulter")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def statut(self, itx: discord.Interaction, ip: str):
         if not await self._guard_enabled(itx):
             return
@@ -668,7 +669,7 @@ class Dist(commands.Cog):
             await itx.followup.send(f"🚫 `{ip}` n'est **pas** whitelistée.")
 
     @dist.command(name="liste", description="Whitelist complète du serveur de distribution.")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def liste(self, itx: discord.Interaction):
         if not await self._guard_enabled(itx):
             return
@@ -690,7 +691,7 @@ class Dist(commands.Cog):
         await itx.followup.send(embed=emb)
 
     @dist.command(name="refus", description="Dernières tentatives d'installation refusées (IP non whitelistées).")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def refus(self, itx: discord.Interaction):
         if not await self._guard_enabled(itx):
             return
@@ -726,7 +727,7 @@ class Dist(commands.Cog):
         await itx.followup.send(embed=emb)
 
     @dist.command(name="licences", description="Licences émises (usage, révocation, expiration).")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def licences(self, itx: discord.Interaction):
         if not await self._guard_enabled(itx):
             return
@@ -761,7 +762,7 @@ class Dist(commands.Cog):
         await itx.followup.send(embed=emb)
 
     @dist.command(name="parc", description="État du parc des écoles installées (versions, santé, sauvegardes).")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def parc(self, itx: discord.Interaction):
         if not await self._guard_enabled(itx):
             return
@@ -806,7 +807,7 @@ class Dist(commands.Cog):
         await itx.followup.send(embed=emb)
 
     @dist.command(name="propositions", description="Dernières demandes reçues via le site vitrine dist.nicov1.fr.")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def propositions(self, itx: discord.Interaction):
         if not await self._guard_enabled(itx):
             return

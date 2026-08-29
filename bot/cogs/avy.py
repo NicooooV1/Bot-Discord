@@ -813,6 +813,7 @@ class AvyNodeView(GatedView):
     clé, mais la porte ne peut plus être oubliée sur un bouton ajouté plus tard."""
 
     gate = "mod"
+    gate_caps = {"avy:refresh": "refresh", "avy:graph": "graph", "avy:backup": "node_backup"}
 
     def __init__(self, cog):
         super().__init__(timeout=None)

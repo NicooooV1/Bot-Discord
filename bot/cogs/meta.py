@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from ..core import channels
 from ..core import format as fmt
 from ..core.gates import GatedView
-from ..core.permissions import read_check, is_admin, can_read
+from ..core.permissions import read_check, is_admin, can_read, is_breakglass, tier_of
 from ..core.ui import pin_edit
 
 log = logging.getLogger("discord-bot.meta")
@@ -240,11 +240,20 @@ class Meta(commands.Cog):
         if len(rtxt) > 1024:
             rtxt = rtxt[:1000].rsplit(",", 1)[0] + f", … (+{len(roles)} au total)"
         emb.add_field(name="Rôles", value=rtxt, inline=False)
-        emb.add_field(name="Actions admin", value="✅ autorisé" if admin else "❌ refusé")
-        emb.add_field(name="Lecture", value="✅ autorisé" if read else "❌ refusé")
-        if cfg.admin_role_ids:
-            emb.set_footer(text="Rôle(s) requis: "
-                                + ", ".join(str(x) for x in cfg.admin_role_ids))
+        # 2026-08-29 : niveau PAR SERVEUR (chaque serveur est indépendant) — et plus
+        # aucun id de rôle en pied de page (ils étaient livrés à tout membre).
+        lines = []
+        for srv in (getattr(cfg, "gestion_servers", {}) or {}):
+            t = tier_of(cfg, itx, srv)
+            lines.append(f"• **{srv}** : " + ({"O": "O — owner", "M": "M — modérateur",
+                                               "G": "G — gestion (voir)"}.get(t, "aucun")))
+        if is_breakglass(cfg, itx):
+            lines.insert(0, "• 🔑 propriétaire du bot (break-glass, tout serveur)")
+        emb.add_field(name="Niveau par serveur", value="\n".join(lines) or "—", inline=False)
+        emb.add_field(name=f"Actions ({cfg.server_key})", value="✅ autorisé" if admin else "❌ refusé")
+        emb.add_field(name=f"Lecture ({cfg.server_key})", value="✅ autorisé" if read else "❌ refusé")
+        emb.set_footer(text="Les commandes s'exécutent sur le serveur du salon d'où tu les "
+                            "lances ; ton niveau y est celui de CE serveur.")
         await itx.response.send_message(embed=emb, ephemeral=True)
 
 

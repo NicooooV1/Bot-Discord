@@ -605,6 +605,7 @@ class DlRefreshView(GatedView):
     rôle Gestion + 2FA), pas le rôle A « vision »."""
 
     gate = "mod"
+    gate_cap = "refresh"
 
     def __init__(self, cog):
         super().__init__(timeout=None)

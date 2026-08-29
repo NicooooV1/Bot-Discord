@@ -14,33 +14,39 @@ Ici la porte devient une **donnée déclarée**, pas une décision reprise à ch
 
     class DockerPanelView(GatedView):
         gate = "mod"                      # rôle M/O du serveur + session 2FA
+        gate_cap = "services"             # capacité srvperms exigée (Owner-réglable)
 
-    class RatioRefreshView(GatedView):
-        gate = "read"                     # simple lecture + session 2FA
+    class CtControlView(GatedView):
+        gate = "mod"
+        gate_caps = {"ctchannels:stop": "stop", "ctchannels:start": "start", …}
 
     class UnlockView(GatedView):
         gate = None                       # exemption EXPLICITE...
         gate_reason = "c'est le bouton de déverrouillage 2FA lui-même"
 
 Oublier la porte devient impossible : `__init_subclass__` refuse une valeur de `gate`
-inconnue, et exige une justification écrite pour toute exemption. `tests/test_gates.py`
+inconnue, et exige une justification écrite pour toute exemption. `tests/test_edmine.py`
 échoue si une `discord.ui.View` n'hérite pas de `GatedView`.
 
 TIERS DISPONIBLES
-  "read"  — lecture (rôle READ_ROLE_IDS ou mieux) + session 2FA
+  "read"  — lecture (M/O du serveur, G si « read » ouvert, READ_ROLE_IDS) + session 2FA
   "mod"   — actions (rôle M/O du serveur visé, ou break-glass) + session 2FA
   "owner" — catégorie Lock / nœud (rôle M ou O du serveur du nœud) + session 2FA
   None    — aucune porte, avec `gate_reason` obligatoire
 
-⚠️ Choisir le BON tier. Mettre "mod" partout casserait l'accès légitime du tier lecture
-aux boutons de `#ratio`, `/yt` ou `/logs` — c'est l'erreur que l'audit a explicitement
-signalée.
+SERVEUR (audit 2026-08-29) : `resolve_server()` renvoie la clé GESTION_SERVERS que la
+porte exige. `None` signifie « le serveur de CETTE instance » (SERVER_KEY = R820) — et
+plus jamais « n'importe quel rôle global » : un M AVY-NAS ne clique pas un panneau R820.
+
+CAPACITÉS : `gate_cap` (toute la vue) ou `gate_caps` ({custom_id: cap}) désignent la
+capacité srvperms exigée ; l'Owner du serveur les ouvre/ferme par tier via /gestion perms.
 """
 import logging
 
 import discord
 
-from .permissions import (can_read, deny_2fa, is_admin, may_lock, session_2fa_ok)
+from .permissions import (can_read, cap_label, cap_ok, deny_2fa, is_admin, log_refusal,
+                          may_lock, session_2fa_ok)
 
 log = logging.getLogger("discord-bot.gates")
 
@@ -52,8 +58,10 @@ class GatedView(discord.ui.View):
 
     Attributs de classe (surchargeables par instance dans `__init__`) :
       gate          — "read" | "mod" | "owner" | None
-      gate_server   — clé GESTION_SERVERS bornant le tier (ex. « AVY-PVE »). None = R820.
+      gate_server   — clé GESTION_SERVERS bornant le tier (ex. « AVY-NAS »). None = R820.
       gate_user_id  — si posé, seul cet utilisateur peut cliquer (vues éphémères).
+      gate_cap      — capacité srvperms exigée pour toute la vue (None = aucune).
+      gate_caps     — {custom_id: capacité} pour des boutons de capacités différentes.
       gate_reason   — obligatoire quand gate vaut None.
 
     Pour un serveur qui dépend de l'interaction (salon d'invité Aveyron), surcharger
@@ -63,6 +71,8 @@ class GatedView(discord.ui.View):
     gate = "mod"
     gate_server = None
     gate_user_id = None
+    gate_cap = None
+    gate_caps = {}
     gate_reason = ""
 
     def __init_subclass__(cls, **kwargs):
@@ -80,20 +90,34 @@ class GatedView(discord.ui.View):
         """Clé GESTION_SERVERS à exiger pour CETTE interaction. None = serveur primaire."""
         return self.gate_server
 
-    async def on_denied(self, interaction, why):
-        """Réponse au refus. `why` ∈ {"user", "role", "2fa"}. Surchargeable."""
+    def resolve_cap(self, interaction):
+        """Capacité exigée pour CE clic : `gate_caps[custom_id]`, sinon `gate_cap`."""
+        cid = (getattr(interaction, "data", None) or {}).get("custom_id")
+        if cid and cid in (self.gate_caps or {}):
+            return self.gate_caps[cid]
+        return self.gate_cap
+
+    async def on_denied(self, interaction, why, cap=None):
+        """Réponse au refus. `why` ∈ {"user", "role", "2fa", "cap"}. Surchargeable."""
         if why == "2fa":
             await deny_2fa(interaction)
             return
+        srv = await self.resolve_server(interaction)
+        cfg = getattr(interaction.client, "cfg", None)
+        srv = srv or getattr(cfg, "server_key", "R820")
         if why == "user":
             msg = "🔒 Ces boutons appartiennent à la personne qui a lancé la commande."
+        elif why == "cap":
+            msg = (f"🔒 Capacité **{cap_label(cap)}** non accordée à ton niveau sur "
+                   f"**{srv}** (réglable par l'Owner du serveur : `/gestion perms`).")
         else:
-            srv = await self.resolve_server(interaction)
-            tier = {"read": "aux membres autorisés",
-                    "mod": "aux gestionnaires (rôle Gestion"
-                           + (f" {srv}" if srv else "") + ")",
-                    "owner": "aux rôles **M** ou **O** (ou au propriétaire)"}
+            tier = {"read": f"aux membres autorisés sur **{srv}**",
+                    "mod": f"aux gestionnaires de **{srv}** (rôle M ou O)",
+                    "owner": "aux rôles **M** ou **O** du nœud (ou au propriétaire)"}
             msg = f"🔒 Action réservée {tier.get(self.gate, 'aux gestionnaires')}."
+        if why in ("role", "cap", "user"):
+            log_refusal(interaction, why, f"{type(self).__name__} serveur={srv}"
+                        + (f" cap={cap}" if cap else ""))
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -123,14 +147,17 @@ class GatedView(discord.ui.View):
             await self.on_denied(interaction, "role")
             return False
 
-        # 3) tier
+        # 3) tier, borné au SERVEUR de la vue (None = serveur de cette instance)
+        srv = None
+        cap = None
         try:
+            srv = await self.resolve_server(interaction)
             if self.gate == "read":
-                ok = can_read(cfg, interaction)
+                ok = can_read(cfg, interaction, server=srv)
             elif self.gate == "owner":
                 ok = may_lock(cfg, interaction)
+                srv = srv or getattr(cfg, "node_server_key", None)
             else:
-                srv = await self.resolve_server(interaction)
                 ok = is_admin(cfg, interaction, server=srv)
         except Exception:  # noqa: BLE001 — une erreur d'évaluation = refus, jamais accès
             log.exception("%s: évaluation de la porte en échec — refus",
@@ -138,6 +165,18 @@ class GatedView(discord.ui.View):
             ok = False
         if not ok:
             await self.on_denied(interaction, "role")
+            return False
+
+        # 3b) capacité fine (Owner-réglable par tier et par serveur)
+        try:
+            cap = self.resolve_cap(interaction)
+            if cap is not None and not cap_ok(cfg, interaction, server=srv, cap=cap):
+                await self.on_denied(interaction, "cap", cap=cap)
+                return False
+        except Exception:  # noqa: BLE001
+            log.exception("%s: évaluation de la capacité en échec — refus",
+                          type(self).__name__)
+            await self.on_denied(interaction, "cap", cap=cap)
             return False
 
         # 4) session 2FA — les boutons ne passent pas par GatedTree, c'est ICI que le

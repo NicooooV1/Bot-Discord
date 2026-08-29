@@ -130,6 +130,7 @@ class SsoPanelView(GatedView):
     2FA ou de reset un mot de passe, il ne doit pas rester lisible dans le salon."""
 
     gate = "mod"
+    gate_cap = "services"
 
     def __init__(self, cog):
         super().__init__(timeout=300)
@@ -232,7 +233,7 @@ class Sso(commands.Cog):
     @app_commands.command(
         name="sso",
         description="Portail SSO (Authelia CT123) : pile, connexions, 2FA, lien en attente.")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def sso(self, itx: discord.Interaction):
         await itx.response.defer()
         emb = discord.Embed(title="🔐 Portail SSO — auth.nicov1.fr", color=fmt.GREEN)

@@ -557,7 +557,7 @@ class YouTube(commands.Cog):
     @app_commands.command(name="yt-config", description="Voir/régler le délai global d'auto-suppression des téléchargements /yt")
     @app_commands.describe(delai="Nouveau délai global (laisser vide pour afficher le réglage actuel)")
     @app_commands.choices(delai=DELAY_CHOICES)
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def yt_config(self, itx: discord.Interaction, delai: Optional[int] = None):
         overrides = self._delays()
         if delai is None:
@@ -585,7 +585,7 @@ class YouTube(commands.Cog):
         await itx.response.send_message(embed=emb)
 
     @app_commands.command(name="dl", description="Téléchargements en cours : reprendre le suivi et le pilotage.")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def dl(self, itx: discord.Interaction):
         """Filet de sécurité après un redémarrage du bot.
 

@@ -76,6 +76,7 @@ class DockerPanelView(GatedView):
     concernées — c'est précisément celles qui pilotent gluetun."""
 
     gate = "mod"
+    gate_cap = "services"
 
     def __init__(self, cog, items, owner_id):
         super().__init__(timeout=900)
@@ -243,6 +244,7 @@ class ConfirmActionView(GatedView):
     confirmation expirer (value reste None = action annulée)."""
 
     gate = "mod"
+    gate_cap = "services"
 
     def __init__(self, user_id, timeout=60):
         super().__init__(timeout=timeout)
@@ -322,7 +324,7 @@ class Docker(commands.Cog):
     # ------------------------------------------------------------------ commande
     @app_commands.command(name="docker",
                           description="Gérer les conteneurs Docker de CT120 (servarr, gluetun, pinchflat…)")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def docker(self, itx: discord.Interaction):
         if not getattr(self.bot.cfg, "docker_ctl_enabled", True):
             await itx.response.send_message("⛔ /docker est désactivé (DOCKER_CTL_ENABLED=false).",

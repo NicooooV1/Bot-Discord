@@ -13,7 +13,8 @@ DÉLÉGATION (/gestion add|remove|list) :
 - Le PROPRIÉTAIRE (guild owner / ADMIN_IDS) accorde/retire G, M et O sur tout serveur.
 - Un porteur de « O <srv> » accorde/retire G et M sur SON serveur (pas O).
 - Personne d'autre.
-Commande : /gestion add (membre) (serveur) (niveau, défaut G).
+Commande : /gestion add (membre) (serveur) (niveau) — les trois OBLIGATOIRES (Nico 2026-08-29).
+Réglages fins par serveur : /gestion perms (serveur) — panneau de l'Owner (core/srvperms).
 
 La réconciliation (boucle 3 min + après chaque add/remove + au démarrage) est la SEULE
 source de vérité : elle POSE/RETIRE les rôles pour que l'état Discord = état voulu, même
@@ -407,19 +408,23 @@ class Gestion(commands.Cog):
 
     @group.command(name="add", description="Donner un accès de gestion à un membre sur un serveur")
     @app_commands.describe(membre="Le membre à autoriser", serveur="Ex : R820",
-                           niveau="G = voir · M = tout faire · O = owner (défaut : G)")
+                           niveau="G = voir · M = modérer (agir) · O = owner — OBLIGATOIRE")
     @app_commands.choices(niveau=[app_commands.Choice(name=LEVEL_LABEL[l], value=l) for l in LEVELS])
     @app_commands.autocomplete(serveur=_server_ac)
     async def add(self, itx: discord.Interaction, membre: discord.Member, serveur: str,
-                  niveau: Optional[str] = "G"):
+                  niveau: str):
         await itx.response.defer(ephemeral=True)
         cfg = self.bot.cfg
         if cfg.guild_id and itx.guild_id != cfg.guild_id:
             await itx.followup.send("Serveur non autorisé.", ephemeral=True)
             return
-        niveau = (niveau or "G").upper()
+        # niveau OBLIGATOIRE et explicite (Nico 2026-08-29) : plus de « défaut G » qui
+        # laissait une délégation ambiguë passer sans que l'appelant ait choisi.
+        niveau = (niveau or "").upper()
         if niveau not in LEVELS:
-            niveau = "G"
+            await itx.followup.send(
+                f"⛔ Niveau invalide « {niveau} » — attendu G, M ou O.", ephemeral=True)
+            return
         allowed = self._grantable(itx, serveur)
         # niveau VOULU autorisé ? (contrôle AVANT le message « serveur inconnu », qui
         # énumère les serveurs : sur une clé inconnue _grantable ne rend {G,M,O} qu'au
@@ -621,6 +626,41 @@ class Gestion(commands.Cog):
         emb.set_footer(text="G voir · M tout faire · O owner (les rôles G/M/O + 2FA Complet "
                             "ne sont posés que pendant une session 2FA active)")
         await itx.response.send_message(embed=emb, ephemeral=True)
+
+
+    @group.command(name="perms",
+                   description="Owner : régler ce que G et M peuvent faire/voir sur TON serveur")
+    @app_commands.describe(serveur="Serveur dont tu es Owner (ex : R820)")
+    @app_commands.autocomplete(serveur=_server_ac)
+    async def perms(self, itx: discord.Interaction, serveur: str):
+        """Panneau de l'Owner (Nico 2026-08-29) : capacités par tier (start/stop/terminal/
+        sauvegardes/panneaux…) + salons masqués, par SERVEUR — les réglages d'un serveur
+        n'ont aucun effet sur les autres. Les défauts restent ceux du modèle G/M/O."""
+        from ..core.permissions import is_breakglass, tier_of
+        from ..views.srvperms_view import SrvPermsView
+        cfg = self.bot.cfg
+        if cfg.guild_id and itx.guild_id != cfg.guild_id:
+            await itx.response.send_message("Serveur non autorisé.", ephemeral=True)
+            return
+        if not (is_breakglass(cfg, itx) or tier_of(cfg, itx, serveur) == "O"):
+            await itx.response.send_message(
+                "⛔ Réservé à l'Owner du serveur (rôle O) ou au propriétaire du bot.",
+                ephemeral=True)
+            return
+        if serveur not in cfg.gestion_servers:
+            await itx.response.send_message(
+                f"⛔ Serveur inconnu « {serveur} ». Connus : "
+                f"{', '.join(self._server_choices()) or 'aucun'}.", ephemeral=True)
+            return
+        guild = self.bot.get_guild(cfg.guild_id) or itx.guild
+        view = SrvPermsView(self.bot, serveur, itx.user.id, guild)
+        await itx.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        try:
+            view.message = await itx.original_response()
+        except discord.HTTPException:
+            view.message = None
+        self.bot.audit.record(user=f"{itx.user} ({itx.user.id})", action="srvperms-open",
+                              target=serveur, result="ok")
 
 
 async def setup(bot):

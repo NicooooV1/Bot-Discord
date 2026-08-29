@@ -726,10 +726,16 @@ class Terminal(commands.Cog):
                     pass
 
     def _may_open(self, itx):
-        if itx.user.id in self.cfg.terminal_owner_ids:
+        """Console LXC (R820 uniquement) : TERMINAL_OWNER_IDS toujours ; sinon un porteur
+        de TERMINAL_OWNER_ROLE_IDS (= M/O R820) À CONDITION que son niveau ait la
+        capacité « terminal » sur le serveur (réglable par l'Owner, core/srvperms)."""
+        from ..core.permissions import cap_ok, is_breakglass
+        if itx.user.id in self.cfg.terminal_owner_ids or is_breakglass(self.cfg, itx):
             return True
         roles = self.cfg.terminal_owner_role_ids
-        return bool(roles and ({r.id for r in getattr(itx.user, "roles", [])} & set(roles)))
+        if not (roles and ({r.id for r in getattr(itx.user, "roles", [])} & set(roles))):
+            return False
+        return cap_ok(self.cfg, itx, server=None, cap="terminal")
 
     def _precheck(self, itx, name):
         """Contrôles d'ouverture d'une console LXC, SANS aucune I/O (donc utilisables
@@ -900,10 +906,16 @@ class Terminal(commands.Cog):
         exclusions `terminal_excluded_guests` de la console LXC. On réserve donc ce pouvoir
         à O/owner ; M garde les boutons Lock (rafraîchir/sauvegarder) + la console LXC (qui,
         elle, respecte les exclusions). Session 2FA exigée en plus (open_node_for)."""
-        if itx.user.id in self.cfg.node_terminal_owner_ids:
+        from ..core.permissions import cap_ok, is_breakglass, tier_of
+        if itx.user.id in self.cfg.node_terminal_owner_ids or is_breakglass(self.cfg, itx):
             return True
-        o = getattr(self.cfg, "node_owner_role_id", 0)
-        return bool(o and o in {r.id for r in getattr(itx.user, "roles", [])})
+        key = getattr(self.cfg, "node_server_key", None)
+        tier = tier_of(self.cfg, itx, key)
+        if tier == "O":
+            return True
+        # 2026-08-29 : l'Owner du serveur peut l'ouvrir à M via /gestion perms
+        # (capacité « node_terminal », refusée par défaut)
+        return tier == "M" and cap_ok(self.cfg, itx, server=key, cap="node_terminal")
 
     def _precheck_node(self, itx):
         """Idem `_precheck`, pour le shell root de l'hyperviseur. Sans I/O."""

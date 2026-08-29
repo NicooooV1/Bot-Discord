@@ -167,7 +167,7 @@ class Graphs(commands.Cog):
     @app_commands.describe(metric="Métrique", target="Conteneur, VM ou hôte", range="Période")
     @app_commands.choices(metric=METRICS, range=RANGES)
     @app_commands.autocomplete(target=target_autocomplete)
-    @read_check()
+    @read_check(scope="channel", cap="graph")
     async def graph(self, itx: discord.Interaction,
                     metric: app_commands.Choice[str],
                     target: str = None,

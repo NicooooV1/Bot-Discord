@@ -816,7 +816,7 @@ class Servarr(commands.Cog):
         await itx.followup.send(embed=await self._emb_ratio(), ephemeral=True)
 
     @app_commands.command(description="Torrents en téléchargement : mettre en pause / reprendre.")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def torrents(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)
         dl = await self._qbit_downloads()
@@ -835,7 +835,7 @@ class Servarr(commands.Cog):
     @app_commands.command(description="Mettre à jour tes vraies stats C411 (ratio, upload, download, bonus).")
     @app_commands.describe(ratio="Ton ratio C411 (ex. 27.86)", upload_to="Upload en To (ex. 46.355)",
                            download_go="Download en Go (ex. 898.1)", bonus_go="Bonus en Go (optionnel)")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def setratio(self, itx: discord.Interaction, ratio: float, upload_to: float,
                        download_go: float, bonus_go: float = 0.0):
         await itx.response.defer(ephemeral=True)
@@ -1005,6 +1005,7 @@ class TorrentsView(GatedView):
     fait dans cet ordre), sinon le seul utilisateur concerné court-circuiterait la porte."""
 
     gate = "mod"
+    gate_cap = "services"
 
     def __init__(self, cog, owner_id, itx=None):
         super().__init__(timeout=300)

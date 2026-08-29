@@ -587,7 +587,7 @@ class Dns(commands.Cog):
         await itx.followup.send(embed=emb)
 
     @dns.command(name="pause", description="Met en pause / reprend le flux DNS dans Discord (persistant).")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def dns_pause(self, itx: discord.Interaction):
         self.paused = not self.paused
         self.bot.state.set("dns_paused", self.paused)
@@ -599,13 +599,13 @@ class Dns(commands.Cog):
 
     @dns.command(name="bloquer", description="Bloque un domaine (règle utilisateur AdGuard ||domaine^).")
     @app_commands.describe(domaine="Domaine à bloquer, ex. telemetry.example.com")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def dns_block(self, itx: discord.Interaction, domaine: str):
         await self._toggle_rule(itx, domaine, True)
 
     @dns.command(name="debloquer", description="Retire une règle utilisateur ||domaine^ d'AdGuard.")
     @app_commands.describe(domaine="Domaine à débloquer")
-    @admin_check(require_admin_channel=False)
+    @admin_check(require_admin_channel=False, cap="services")
     async def dns_unblock(self, itx: discord.Interaction, domaine: str):
         await self._toggle_rule(itx, domaine, False)
 

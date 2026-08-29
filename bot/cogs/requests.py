@@ -64,6 +64,7 @@ class GateView(GatedView):
     """
 
     gate = "owner"
+    gate_cap = "requests"
 
     def __init__(self, cog):
         super().__init__(timeout=None)

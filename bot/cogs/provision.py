@@ -131,7 +131,7 @@ class Provision(commands.Cog):
         # et prennent `cfg` en argument explicite — ils ne dépendent plus du cog).
         # ⚠️ Ils renvoient None quand un rôle M/O manque : « ne touche à rien », JAMAIS
         # « aucun overwrite » (cf. l'en-tête de provision_perms).
-        self._managed_fn = perms.managed_overwrites_fn(self.cfg)
+        self._managed_fn = perms.managed_overwrites_fn(self.cfg, bot.state)
         self._lock_fn = perms.node_lock_overwrites_fn(self.cfg)
         self._done_once = False
         self._lock = asyncio.Lock()
@@ -259,10 +259,15 @@ class Provision(commands.Cog):
         if self.bot.state.get("twofa_log_channel_id") != ch.id:
             self.bot.state.set("twofa_log_channel_id", ch.id)
 
-    async def _enforce_perms(self, guild, cat, want_fn):
+    async def _enforce_perms(self, guild, cat, want_fn, server=None):
         """Applique want_fn(guild) à la catégorie ET à chacun de ses salons texte, mais
         SEULEMENT en cas de dérive : à l'état stable, zéro appel API (pas de rate-limit).
-        `edit(overwrites=)` REMPLACE l'ensemble -> on POSE exactement le schéma voulu."""
+        `edit(overwrites=)` REMPLACE l'ensemble -> on POSE exactement le schéma voulu.
+
+        `server` (clé GESTION_SERVERS) : les salons MASQUÉS à un tier par l'Owner de ce
+        serveur (/gestion perms, core/srvperms) reçoivent le schéma de la catégorie moins
+        la vue de ce tier (perms.for_channel) — la catégorie elle-même garde le schéma
+        complet, sinon Discord masquerait tout."""
         if cat is None:
             return
         want = want_fn(guild)
@@ -270,11 +275,47 @@ class Provision(commands.Cog):
             return
         for ch in [cat] + list(cat.text_channels):
             try:
-                if perms.ovw_drifted(ch, want):
-                    await ch.edit(overwrites=want, reason="permissions R820 (cahier des charges)")
+                w = want if ch is cat else perms.for_channel(
+                    want, guild, self.cfg, self.bot.state, server, ch.id)
+                if perms.ovw_drifted(ch, w):
+                    await ch.edit(overwrites=w, reason=f"permissions {server or 'bot'} (cahier des charges)")
                     log.info("permissions (ré)appliquées: %s", getattr(ch, "name", "?"))
             except discord.HTTPException:
                 log.warning("permissions non appliquées: %s", getattr(ch, "name", "?"))
+
+    def _lock_want(self, guild, ch):
+        """Overwrites voulus pour UN salon de la catégorie Lock du nœud (schéma Lock +
+        masquages Owner). None = rôles non résolus, ne rien toucher."""
+        want = self._lock_fn(guild)
+        if want is None:
+            return None
+        return perms.for_channel(want, guild, self.cfg, self.bot.state,
+                                 getattr(self.cfg, "node_server_key", None), ch.id)
+
+    async def enforce_server_perms(self, server):
+        """Réapplique IMMÉDIATEMENT le schéma d'overwrites de toutes les catégories du
+        serveur `server` (appelé par /gestion perms après un réglage de l'Owner ; la
+        boucle de réconciliation de 5 min reste le filet). Renvoie le nombre de
+        catégories traitées."""
+        from ..core import channels as _ch
+        guild = self._guild()
+        if guild is None:
+            return 0
+        mine = getattr(self.cfg, "server_key", "R820")
+        done = 0
+        async with self._lock:
+            for key, cat, genre in _ch.server_categories(self.bot, guild, server):
+                if genre == "lock":
+                    fn = self._lock_fn if server == mine else perms.lock_overwrites_fn(self.cfg, server)
+                else:
+                    fn = self._managed_fn if server == mine else perms.srv_overwrites_fn(
+                        self.cfg, server, self.bot.state)
+                try:
+                    await self._enforce_perms(guild, cat, fn, server=server)
+                    done += 1
+                except Exception:  # noqa: BLE001
+                    log.exception("réapplication des permissions %s/%s", server, key)
+        return done
 
     # ------------------------------------------------- catégorie « 🔒 Lock » (nœud)
     # Le SCHÉMA d'overwrites vit dans provision_perms (`lock_overwrites`) ; ici, seule
@@ -344,7 +385,8 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("salon du nœud : rangement dans Lock impossible")
-            if perms.lock_perms_drifted(ch, guild, self.cfg):
+            ow = self._lock_want(guild, ch)
+            if ow is not None and perms.ovw_drifted(ch, ow):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon du nœud : propriétaire uniquement")
@@ -391,7 +433,8 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("#jelly-logs : rangement dans Lock impossible")
-            if perms.lock_perms_drifted(ch, guild, self.cfg):
+            ow = self._lock_want(guild, ch)
+            if ow is not None and perms.ovw_drifted(ch, ow):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon jelly-logs : propriétaire uniquement")
@@ -430,7 +473,8 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("#doli-logs : rangement dans Lock impossible")
-            if perms.lock_perms_drifted(ch, guild, self.cfg):
+            ow = self._lock_want(guild, ch)
+            if ow is not None and perms.ovw_drifted(ch, ow):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon doli-logs : propriétaire uniquement")
@@ -473,7 +517,8 @@ class Provision(commands.Cog):
                                   reason="auto-provision: rangement dans Lock")
                 except discord.HTTPException:
                     log.warning("#ptero-logs : rangement dans Lock impossible")
-            if perms.lock_perms_drifted(ch, guild, self.cfg):
+            ow = self._lock_want(guild, ch)
+            if ow is not None and perms.ovw_drifted(ch, ow):
                 try:
                     await ch.edit(overwrites=ow,
                                   reason="salon ptero-logs : propriétaire uniquement")
@@ -574,7 +619,8 @@ class Provision(commands.Cog):
                     await self._ensure_text(guild, cname, sup_cat, self.prov["super"],
                                             key, topic)
                 # accès : @everyone rien, rôle A vision, rôle Gestion boutons (tous les salons)
-                await self._enforce_perms(guild, sup_cat, self._managed_fn)
+                await self._enforce_perms(guild, sup_cat, self._managed_fn,
+                                          server=self.cfg.server_key)
 
                 # 1b) ressources PARTAGÉES (#général, #logs-2fa) : primaire uniquement — une
                 #     instance secondaire n'y touche pas (elles sont communes à tout le guild).
@@ -615,7 +661,7 @@ class Provision(commands.Cog):
                                     key, key)
                         continue
                     try:
-                        ow_fn = perms.srv_overwrites_fn(self.cfg, key)
+                        ow_fn = perms.srv_overwrites_fn(self.cfg, key, self.bot.state)
                         lock_fn = perms.lock_overwrites_fn(self.cfg, key)
                         seed = perms.private_seed_overwrites(guild)
                         sup = await self._ensure_category(
@@ -630,9 +676,9 @@ class Provision(commands.Cog):
                         await self._ensure_avy_sup_channels(guild, node, sup)
                         await self._ensure_avy_lock_hyperviseur(guild, node, lock)
                         avy_cats[key] = gest
-                        await self._enforce_perms(guild, sup, ow_fn)
-                        await self._enforce_perms(guild, gest, ow_fn)
-                        await self._enforce_perms(guild, lock, lock_fn)
+                        await self._enforce_perms(guild, sup, ow_fn, server=key)
+                        await self._enforce_perms(guild, gest, ow_fn, server=key)
+                        await self._enforce_perms(guild, lock, lock_fn, server=key)
                     except Exception:
                         log.exception("provisioning serveur %s", key)
 
@@ -649,7 +695,8 @@ class Provision(commands.Cog):
             #    que peut lever la limite Discord des 50 salons par catégorie.
             try:
                 await self._reconcile_containers(guild, cont_cat, avy_cats)
-                await self._enforce_perms(guild, cont_cat, self._managed_fn)
+                await self._enforce_perms(guild, cont_cat, self._managed_fn,
+                                          server=self.cfg.server_key)
             except Exception:
                 log.exception("réconciliation des salons d'invités")
 
@@ -663,7 +710,8 @@ class Provision(commands.Cog):
                 await self._provision_dolibarr_log_channel(guild)
                 await self._provision_pterodactyl_log_channel(guild)
                 # toute la catégorie Lock (salon nœud + salons persos) = Gestion+O R820
-                await self._enforce_perms(guild, lock_cat, self._lock_fn)
+                await self._enforce_perms(guild, lock_cat, self._lock_fn,
+                                          server=getattr(self.cfg, 'node_server_key', None))
             except Exception:
                 log.exception("provisioning du salon du nœud")
 
@@ -764,7 +812,7 @@ class Provision(commands.Cog):
         store = self.prov.setdefault("syno", {})
         # overwrites dès la création (2026-08-11) : une catégorie créée nue est publique
         # et ses salons héritent de cette visibilité (fiche NAS = n° de série, SMART).
-        srv_fn = perms.srv_overwrites_fn(self.cfg, self.syno_key)
+        srv_fn = perms.srv_overwrites_fn(self.cfg, self.syno_key, self.bot.state)
         lock_fn = perms.lock_overwrites_fn(self.cfg, self.syno_key)
         seed = perms.private_seed_overwrites(guild)
         sup = await self._ensure_category(guild, self.CAT_SYNO_SUP, "syno_sup",
@@ -784,8 +832,8 @@ class Provision(commands.Cog):
             guild, "synology", lock, store, "fiche",
             topic="NAS Synology — fiche détaillée (série, DSM, SMART). M/O uniquement.",
             global_fallback=False)
-        await self._enforce_perms(guild, sup, srv_fn)
-        await self._enforce_perms(guild, lock, lock_fn)
+        await self._enforce_perms(guild, sup, srv_fn, server=self.syno_key)
+        await self._enforce_perms(guild, lock, lock_fn, server=self.syno_key)
 
     async def _reconcile_containers(self, guild, cont_cat, avy_cats=None):
         """Crée les salons des VM/conteneurs présents, ordonne par VMID — chacun dans
@@ -1248,6 +1296,7 @@ class TopicalRefreshView(GatedView):
     ouvrent le bouton, pas ceux du R820 (cf. resolve_server)."""
 
     gate = "mod"
+    gate_cap = "refresh"
 
     def __init__(self, cog):
         super().__init__(timeout=None)
