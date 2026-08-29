@@ -46,6 +46,14 @@ class TestFiltre(unittest.TestCase):
         self.assertTrue(dl.wanted("dolibarr", "notice", APP))
         self.assertFalse(dl.wanted("dolibarr", "info", "2026-… INFO 127.0.0.1 1 1 --- End access to /index.php"))
 
+    def test_app_info_mecanique_tue(self):
+        base = "2026-08-29 07:14:12 INFO    127.0.0.1          8284     33 "
+        self.assertFalse(dl.wanted("dolibarr", "info", base + "box_lastlogin::showBox"))
+        self.assertFalse(dl.wanted("dolibarr", "info", base + "DolGraph::draw_chart this->type=pie"))
+        self.assertTrue(dl.wanted("dolibarr", "info", base + "This is a new started user session."))
+        # le même texte en WARNING passe toujours (le filtre ne vise que INFO)
+        self.assertTrue(dl.wanted("dolibarr", "warning", base + "box_lastlogin::showBox"))
+
     def test_cron_seulement_en_echec(self):
         self.assertTrue(dl.wanted("dolibarr-cron", "err", CRON_BAD))
         self.assertFalse(dl.wanted("dolibarr-cron", "info", "***** cron_run_jobs.php (24.0.0) …"))
@@ -75,6 +83,12 @@ class TestRendu(unittest.TestCase):
         self.assertIn("PHP Fatal error", first)
         self.assertIn("```", out)
         self.assertIn("⤷ +", out)               # plus de TRACE_LINES lignes de suite
+
+    def test_session_id_masque(self):
+        out = dl.render(0, "dolibarr", "info", "2026-08-29 07:14:12 INFO    10.3.20.116 1 1 "
+                        "This is a new started user session. _SESSION['dol_login']=X Session id=lunqhanla8u15")
+        self.assertNotIn("lunqhanla8u15", out)
+        self.assertIn("Session id=…", out)
 
     def test_longueur_bornee(self):
         out = dl.render(0, "apache-error", "err", "[x] [php:error] " + "A" * 2000)

@@ -20,8 +20,11 @@ FETCH_LIMIT lignes, le suivant reprend là où il s'est arrêté.
 
 CE QUI EST PUBLIÉ (« complet » côté application, sans bruit mécanique)
 ----------------------------------------------------------------------
-  • journal applicatif : TOUTES les lignes ≥ INFO, sauf les « --- End access to … »
-    (chaque page en produit une, sans information : le « --- Access to » suffit) ;
+  • journal applicatif : TOUTES les lignes ≥ NOTICE, plus les INFO qui disent quelque
+    chose (session ouverte, mail, document…) ; sont TUES les INFO purement mécaniques
+    d'un rendu de page (NOISE_INFO : « box_x::showBox », « DolGraph::draw_chart »,
+    lectures de cache, « checkLoginPassEntity »…, ≈25 lignes par page d'accueil
+    mesurées le 29/08) et les « --- End access to … » (le « --- Access to » suffit) ;
   • apache-error : toutes les lignes ;
   • apache-access : seulement les réponses ≥ 400 (les 2xx/3xx doublonnent l'applicatif) ;
   • cron : seulement les passages en ÉCHEC (PHP Fatal, job KO). Un passage OK toutes
@@ -48,6 +51,7 @@ et ne touche jamais à Dolibarr — lecture seule de Loki.
 """
 import datetime as dt
 import logging
+import re
 import time
 from collections import Counter
 
@@ -71,6 +75,14 @@ ALERT_KEY = "dolibarr_incident"
 LEVEL_ICON = {"emerg": "🔥", "alert": "🔥", "crit": "🔥", "err": "🔴",
               "warning": "🟠", "notice": "🔵", "info": "▫️", "debug": "▪️"}
 SEVERE = frozenset({"emerg", "alert", "crit", "err"})
+# INFO mécaniques d'un rendu de page (mesuré 2026-08-29 : ~25 lignes par page d'accueil).
+NOISE_INFO = ("::showBox", "DolGraph::", "Stats::get", "checkLoginPassEntity",
+              "functions_http::check_user_password_http", "Save lastsearch_values",
+              "read data from cache file", "ModeleBoxes::", "::loadRights", "Conf::setValues",
+              "::fetch ", "::fetch_", "::getNomUrl", "::_load_ldap", "run_jobs.php search qualified")
+
+
+_SESSION_ID = re.compile(r"(Session id=)\S+")
 
 
 # ============================================================ fonctions pures (testées)
@@ -78,6 +90,7 @@ SEVERE = frozenset({"emerg", "alert", "crit", "err"})
 def _safe(s, n=LINE_MAX):
     """Texte venu d'un journal : pas de backtick, pas de saut de ligne, borné."""
     s = str(s or "").replace("`", "'").replace("\r", "").strip()
+    s = _SESSION_ID.sub(r"\1…", s)            # jamais un id de session dans Discord
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
@@ -118,7 +131,12 @@ def strip_apache_prefix(line):
 def wanted(unit, level, line):
     """Filtre de publication (cf. docstring du module)."""
     if unit == "dolibarr":
-        return "--- End access to" not in line.split("\n", 1)[0]
+        first = line.split("\n", 1)[0]
+        if "--- End access to" in first:
+            return False
+        if level == "info" and any(p in first for p in NOISE_INFO):
+            return False
+        return True
     if unit == "dolibarr-cron":
         return level in SEVERE
     if unit == "apache-access":
