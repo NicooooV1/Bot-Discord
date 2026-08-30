@@ -395,7 +395,7 @@ overwrites, jobs jamais branchés) : rien n'a été copié.
 
 | Cog | Commandes | Ce que ça fait |
 |---|---|---|
-| `discord_logs` | `/journal-discord statut\|test` | `#discord-logs` (🔒 Lock) : messages supprimés/édités, arrivées/départs (kick/ban via journal d'audit), rôles, salons et **overwrites**, rôles et **permissions**, invitations, webhooks, threads, emojis, vocal ; signaux de sécurité relayés dans `#alertes` ; rôle de bienvenue `WELCOME_ROLE_ID`. Sans intent `members`, il dit lui-même ce qu'il ne voit pas. |
+| `discord_logs` | `/journal-discord statut\|test` | `#discord-logs` (🗄️ Archive, privé — journaux Discord en Archive, règle Nico 30/08) : messages supprimés/édités, arrivées/départs (kick/ban via journal d'audit), rôles, salons et **overwrites**, rôles et **permissions**, invitations, webhooks, threads, emojis, vocal ; signaux de sécurité relayés dans `#alertes` ; rôle de bienvenue `WELCOME_ROLE_ID`. Sans intent `members`, il dit lui-même ce qu'il ne voit pas. |
 | `snapshot` | `/snapshot creer\|liste\|voir\|diff\|supprimer` | instantané JSON déterministe rôles/salons/**overwrites** + diff lisible ; quotidien 04:00 si changement, `#alertes` si des permissions bougent. Pas de restauration automatique (volontaire). Owner. |
 | `sondage` | `/sondage creer\|fermer\|resultats\|liste` | sondages persistants (votes par personne, choix multiple, anonymat réel, clôture programmée idempotente, boutons survivant au redémarrage). |
 | `rappel` | `/rappel creer\|liste\|supprimer` | rappels en salon ou DM, récurrence, anti-doublon au redémarrage, repli DM si le salon disparaît. |

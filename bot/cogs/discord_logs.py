@@ -6,9 +6,9 @@ et surtout : le diff des PERMISSIONS (overwrites de salon, permissions de rôle)
 le signal de sécurité n°1 sur un serveur privé où famille et amis sont invités.
 
 CE QUE FAIT CE COG
-  - salon `#discord-logs` dans « 🔒 Lock R820 » (contenu de messages supprimés, codes
-    d'invitation, raisons de ban : sensible), créé via `channels.ensure_channel` s'il
-    manque, id persisté dans `state["discord_logs"]["channel"]` ; message ÉPINGLÉ d'état
+  - salon `#discord-logs` dans « 🗄️ Archive » (règle Nico 2026-08-30, comme #logs-2fa :
+    les journaux du serveur Discord vont en Archive ; contenu de messages supprimés, codes
+    d'invitation, raisons de ban : sensible, overwrites privés portés par le salon), id persisté dans `state["discord_logs"]["channel"]` ; message ÉPINGLÉ d'état
     (`ui.pin_edit`) : intents actifs, permissions du bot, compteurs, taille de la file ;
   - journalise (listeners) : messages supprimés / édités / supprimés en masse, arrivées
     (âge du compte, ⚠️ si < 7 j, rôle de bienvenue `WELCOME_ROLE_ID`), départs (expulsion
@@ -72,6 +72,7 @@ from ..core.bg import guard_cog_loops
 from ..core.permissions import is_breakglass, read_check
 from ..core.ui import pin_edit
 from ..views.alertaction import alert_snoozed
+from .provision_perms import ovw_drifted, twofa_overwrites as journal_overwrites
 
 log = logging.getLogger("discord-bot.discord_logs")
 
@@ -444,7 +445,12 @@ class DiscordLogs(commands.Cog):
         return bool(lid) and (cid == lid or getattr(parent, "id", None) == lid)
 
     async def _log_channel(self):
-        """#discord-logs dans « 🔒 Lock R820 » — jamais hors catégorie (règle 2026-08-11)."""
+        """#discord-logs dans « 🗄️ Archive » — règle Nico 2026-08-30 : les journaux du serveur
+        Discord lui-même (comme #logs-2fa) vont en Archive, pas en Lock (Lock = services du
+        R820). La catégorie Archive est créée SANS overwrites par provision : le salon porte
+        les siens (`twofa_overwrites` : @everyone ne voit rien, le bot écrit, le propriétaire
+        voit par bypass). Un salon retrouvé ailleurs (il a d'abord vécu en Lock) est déplacé
+        SANS `sync_permissions`, puis ses overwrites réalignés s'ils dérivent."""
         guild = self._guild()
         if guild is None:
             return None
@@ -452,19 +458,37 @@ class DiscordLogs(commands.Cog):
         ch = guild.get_channel(info["channel"]) if info.get("channel") else None
         if ch is None and getattr(self.cfg, "discord_logs_channel_id", 0):
             ch = guild.get_channel(self.cfg.discord_logs_channel_id)
-        cat = channels.lock_category(self.bot, guild)
         if ch is None:
-            ch = await channels.ensure_channel(
-                self.bot, guild, "discord-logs", cat,
-                topic="📓 Journal du serveur Discord : messages supprimés/édités, arrivées/départs, "
-                      "rôles, permissions, invitations, webhooks, vocal. Lecture seule, par lots.",
-                reason="journal des événements Discord (demande Nico 2026-08-30)")
-            if ch is None:
-                if not self._warned_no_channel:
-                    log.warning("discord_logs: #discord-logs non créé (pas de catégorie Lock) — réessai plus tard")
-                    self._warned_no_channel = True
+            ch = discord.utils.get(guild.text_channels, name="discord-logs")
+        arch = channels.resolve(self.bot, guild, "archive", "Archive")
+        if arch is None:
+            if not self._warned_no_channel:
+                log.warning("discord_logs: catégorie Archive absente — réessai plus tard")
+                self._warned_no_channel = True
+            return None
+        ow = journal_overwrites(guild)
+        if ch is None:
+            try:
+                ch = await guild.create_text_channel(
+                    "discord-logs", category=arch, overwrites=ow,
+                    topic="📓 Journal du serveur Discord : messages supprimés/édités, arrivées/départs, "
+                          "rôles, permissions, invitations, webhooks, vocal. Privé, le bot seul y écrit.",
+                    reason="journal des événements Discord (règle Nico 2026-08-30 : journaux Discord en Archive)")
+                log.info("discord_logs: #discord-logs créé dans « %s »", arch.name)
+            except discord.HTTPException as e:
+                log.warning("discord_logs: #discord-logs non créé: %s", e)
                 return None
-        await channels.seal_if_public(self.bot, ch, cat, why="contenu de messages supprimés et codes d'invitation")
+        else:
+            try:
+                if ch.category_id != arch.id:
+                    await ch.edit(category=arch, sync_permissions=False,
+                                  reason="règle Nico 2026-08-30 : journaux Discord en Archive")
+                    log.info("discord_logs: #discord-logs rangé dans « %s »", arch.name)
+                if ovw_drifted(ch, ow):
+                    await ch.edit(overwrites=ow, reason="journal Discord : schéma #logs-2fa (visible par personne)")
+                    log.info("discord_logs: overwrites (schéma journal) posés sur #discord-logs")
+            except discord.HTTPException as e:
+                log.warning("discord_logs: #discord-logs non rangé/scellé: %s", e)
         if info.get("channel") != ch.id:
             info["channel"] = ch.id
             self.bot.state.set(STATE_KEY, info)
