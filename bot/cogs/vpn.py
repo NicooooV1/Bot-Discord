@@ -57,7 +57,7 @@ from ..core.nodeshell import run_readonly
 from ..core.permissions import admin_check
 from ..core.ui import pin_edit
 from ..views.alertaction import alert_snoozed
-from .provision_perms import twofa_overwrites as journal_overwrites
+from .provision_perms import ovw_drifted, twofa_overwrites as journal_overwrites
 
 log = logging.getLogger("discord-bot.vpn")
 
@@ -427,7 +427,7 @@ class Vpn(commands.Cog):
                     await ch.edit(category=arch, sync_permissions=False,
                                   reason="règle Nico 2026-08-30 : journaux transverses en Archive")
                     log.info("vpn: #logs-vpn rangé dans « %s »", arch.name)
-                if channels.is_public(ch) is not False:
+                if ovw_drifted(ch, ow):  # overwrites hérités de Lock ou posés à la main ≠ schéma journal
                     await ch.edit(overwrites=ow, reason="journal VPN : visible par personne (schéma #logs-2fa)")
                     log.info("vpn: #logs-vpn overwrites (schéma journal) posés")
             except discord.HTTPException as e:
