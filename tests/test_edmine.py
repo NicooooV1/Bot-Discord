@@ -976,6 +976,17 @@ class TestSondeTransfert(unittest.TestCase):
         sortie = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
         e = self.t.parse_sonde(sortie)
         self.assertEqual(e["eta"], 23 * 3600 + 4 * 60 + 46, sortie)
+        # bouton « Rafraîchir » : vue persistante, porte justifiée, custom_id stable
+        v = self.t.TransfertRefreshView
+        import asyncio
+        async def _fabrique():
+            return v(cog=None)
+        vue = asyncio.run(_fabrique())
+        self.assertIsNone(vue.timeout, "vue persistante = timeout None")
+        self.assertEqual([c.custom_id for c in vue.children], ["transfert:rafraichir"])
+        self.assertIsNone(v.gate)
+        self.assertTrue(v.gate_reason)
+        self.assertGreaterEqual(v.RAFRAICHIR_MIN_SEC, 5, "anti-rafale sur la sonde SSH")
         e = self.t.parse_sonde("etat=failed\nresultat=exit-code\n")
         self.assertEqual(e["etat"], "failed")
         self.assertIsNone(e["pct_fin"])

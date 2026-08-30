@@ -32,6 +32,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core import format as fmt
+from ..core.gates import GatedView
 
 log = logging.getLogger("discord-bot.transfert")
 
@@ -219,6 +220,40 @@ def embed_transfert(etat, cfg):
     return emb
 
 
+class TransfertRefreshView(GatedView):
+    """Bouton « Rafraîchir » sous l'embed de suivi (Nico 2026-08-30 : « ajoute aussi un
+    bouton pour rafraîchir, sinon 1 minute de délai de base »).
+
+    Porte : `gate = None` volontairement — le salon est PUBLIC et en lecture seule, et le
+    bouton ne fait que rejouer la sonde de LECTURE (les mêmes `systemctl show` / `tail`
+    que la boucle) puis réécrire l'embed ; il n'y a rien à protéger. Anti-rafale : un
+    relevé au plus toutes les `RAFRAICHIR_MIN_SEC` s, sinon on répond « déjà à jour »."""
+
+    gate = None
+    gate_reason = ("salon public en lecture seule ; le bouton rejoue la sonde de lecture "
+                   "et réécrit l'embed, aucune action — limité à 1 relevé / 10 s")
+    RAFRAICHIR_MIN_SEC = 10
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)          # persistante : survit au redémarrage
+        self.cog = cog
+
+    @discord.ui.button(label="Rafraîchir", emoji="🔄", style=discord.ButtonStyle.secondary,
+                       custom_id="transfert:rafraichir")
+    async def rafraichir(self, interaction, _button):
+        cog = self.cog
+        depuis = time.time() - cog._dernier_releve
+        if depuis < self.RAFRAICHIR_MIN_SEC:
+            await interaction.response.send_message(
+                f"⏱️ Déjà relevé il y a {int(depuis)} s — l'embed est à jour.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok = await cog.relever()
+        await interaction.followup.send(
+            "✅ Relevé rafraîchi." if ok else "⚠️ Hôte injoignable pour l'instant, "
+            "l'embed n'a pas été modifié.", ephemeral=True)
+
+
 class Transfert(commands.Cog):
     """Salon éphémère de suivi du transfert média (lecture seule, visible de tous)."""
 
@@ -229,7 +264,11 @@ class Transfert(commands.Cog):
                             and self.cfg.node_ssh_key)
         self._etat = dict(bot.state.get("transfert", {}) or {})
         self._ssh = None       # connexion SSH RÉUTILISÉE entre les relevés (cf. _run)
+        self._dernier_releve = 0.0
+        self._verrou = asyncio.Lock()   # un seul relevé à la fois (boucle + bouton)
+        self._view = TransfertRefreshView(self)
         if self.enabled:
+            self.bot.add_view(self._view)   # boutons persistants au reboot
             self.poll.change_interval(seconds=max(30, self.cfg.transfert_poll_sec))
             self.poll.start()
         else:
@@ -307,7 +346,7 @@ class Transfert(commands.Cog):
         if mid:
             try:
                 msg = await ch.fetch_message(mid)
-                await msg.edit(embed=emb)
+                await msg.edit(embed=emb, view=self._view)
                 return
             except discord.NotFound:
                 pass
@@ -315,7 +354,7 @@ class Transfert(commands.Cog):
                 log.debug("édition du message de suivi échouée", exc_info=True)
                 return
         try:
-            msg = await ch.send(embed=emb)
+            msg = await ch.send(embed=emb, view=self._view)
             try:
                 await msg.pin()
             except discord.HTTPException:
@@ -381,16 +420,27 @@ class Transfert(commands.Cog):
 
     @tasks.loop(seconds=60)
     async def poll(self):
+        await self.relever()
+
+    async def relever(self):
+        """Un relevé complet (sonde + salon + embed). Appelé par la boucle (60 s par
+        défaut) ET par le bouton « Rafraîchir ». Retourne False si l'hôte est muet."""
         guild = self._guild()
         if guild is None:
-            return
-        try:
-            etat = await self.sonde()
-        except Exception:
-            # l'hôte injoignable ne doit ni supprimer le salon ni figer un « terminé » :
-            # on ne conclut RIEN et on repasse au cycle suivant.
-            log.warning("relevé du transfert impossible", exc_info=True)
-            return
+            return False
+        async with self._verrou:
+            try:
+                etat = await self.sonde()
+            except Exception:
+                # l'hôte injoignable ne doit ni supprimer le salon ni figer un « terminé » :
+                # on ne conclut RIEN et on repasse au cycle suivant.
+                log.warning("relevé du transfert impossible", exc_info=True)
+                return False
+            self._dernier_releve = time.time()
+            await self._appliquer(guild, etat)
+            return True
+
+    async def _appliquer(self, guild, etat):
         actif = etat["etat"] in ETATS_ACTIFS
         if actif:
             self._etat.pop("fin_ts", None)
