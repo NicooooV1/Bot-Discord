@@ -35,6 +35,9 @@ from ..core import format as fmt
 
 log = logging.getLogger("discord-bot.transfert")
 
+# 2026-08-30 : les lignes de FIN DE FICHIER de rsync « (xfr#N, ir-chk=…) » portent un ETA
+# recalculé sur une autre base (0:06:59 pour 2,3 Tio restants) : relevées entre deux films,
+# elles faisaient annoncer « Reste ≈ 10 Go » (question de Nico). On les ignore.
 # Une seule commande, une seule connexion SSH par relevé. `tr` : rsync écrit sa
 # progression avec des retours CHARIOT (une seule « ligne » de plusieurs Mo sinon).
 SONDE = r"""
@@ -43,7 +46,7 @@ echo "etat=$(systemctl is-active "$unite" 2>&1)"
 echo "resultat=$(systemctl show "$unite" -p Result --value 2>/dev/null)"
 echo "debut=$(systemctl show "$unite" -p InactiveExitTimestamp --value 2>/dev/null)"
 tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' \
-  | grep -E '^[[:space:]]*[0-9][0-9.,]*[KMGT]?[[:space:]]+[0-9]+%%' | tail -1 \
+  | grep -E '^[[:space:]]*[0-9][0-9.,]*[KMGT]?[[:space:]]+[0-9]+%%' | grep -v 'xfr#' | tail -1 \
   | sed 's/^/progres=/'
 tail -n 200 "$journal" 2>/dev/null | tr '\r' '\n' \
   | grep -E '^(====|[0-9]{4}-[0-9]{2}-[0-9]{2} )' | tail -3 | sed 's/^/ligne=/'

@@ -965,6 +965,17 @@ class TestSondeTransfert(unittest.TestCase):
                          "chemin réseau (VLAN25/mgmt) doit remonter jusqu'à l'embed")
         self.assertEqual(self.t.parse_sonde(self.SORTIE)["hote"], "",
                          "absent = vide, pas d'exception")
+        # la sonde shell doit écarter les lignes de fin de fichier « xfr# » de rsync
+        self.assertIn("grep -v 'xfr#'", self.t.SONDE,
+                      "ligne (xfr#N) = ETA fantaisiste -> « Reste 10 Go » entre deux films")
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("         16.33G   0%   28.62MB/s   23:04:46  \r"
+                    "         16.34G   0%   12.80MB/s    0:20:17 (xfr#3, ir-chk=1022/1251)\r")
+        cmd = self.t.SONDE % {"unite": "inexistant.service", "journal": f.name, "cible": "/"}
+        sortie = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
+        e = self.t.parse_sonde(sortie)
+        self.assertEqual(e["eta"], 23 * 3600 + 4 * 60 + 46, sortie)
         e = self.t.parse_sonde("etat=failed\nresultat=exit-code\n")
         self.assertEqual(e["etat"], "failed")
         self.assertIsNone(e["pct_fin"])
