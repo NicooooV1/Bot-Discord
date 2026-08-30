@@ -357,6 +357,25 @@ logs ≥ warning). Le pare-feu `106.fw` autorise la sortie TCP/3100 vers Loki.
 - Quand l'hôte est éteint la nuit, CT106 (et le bot) le sont aussi ; reprise auto via `onboot=1`
   + rattrapage du rapport au réveil. L'alerting critique reste assuré par Grafana.
 
+### `#vpn` (🔒 Lock)
+
+État des VPN WireGuard, règle Nico 2026-08-30 : **tous les VPN se terminent sur le R820**
+(`wg-vpn` udp/39671 nomades Pierre + PC Nico, `wg-avy` udp/39672 site-à-site Aveyron) ; le
+MikroTik CRS305 (`wg0`, même clé) ne prend le relais que si son netwatch voit le R820 injoignable
+(dst-nat udp/39671 désactivé, pair « Hub Aveyron » activé). Le cog `vpn` :
+
+- exécute `tools/vpn-status` **sur l'hyperviseur** (clé SSH restreinte) toutes les 60 s ; c'est ce
+  script qui lit `wg show … dump` et le MikroTik (mot de passe `/root/.mt_pw` jamais copié dans CT106) ;
+- tient un message épinglé : mode PRIMAIRE / SECOURS, chaque pair (🟢 handshake < 3 min, 🟠 dernier
+  handshake il y a …, ⚪ jamais vu depuis le démarrage de l'interface), endpoint, ping min/moy/max +
+  perte depuis le R820, rx/tx cumulés et débit (delta entre relevés, ignoré si compteurs remis à zéro),
+  hub Aveyron + PVE 10.0.10.10, MikroTik (netwatch, dst-nat, route 10.3.99.0/24, pairs wg0), IP WAN et
+  cohérence DNS `nicov1.fr` ;
+- poste un événement par transition (connexion, fin de session, changement d'endpoint, bascule,
+  MikroTik (in)joignable, DNS ≠ WAN) ; relaie dans #alertes : mode secours, hub Aveyron sans handshake,
+  MikroTik injoignable, DNS ≠ WAN ;
+- `/vpn` (cap `services`) : le même tableau, éphémère. Lecture seule : rien n'est modifié.
+
 ### `#ptero-logs` (🔒 Lock)
 Journaux Pterodactyl : panel CT101 (Laravel `storage/logs/laravel.log`, apache erreurs + HTTP ≥ 400,
 via Alloy `/etc/alloy/20-pterodactyl.alloy`, `{job="pterodactyl"}`) et Wings CT100 (journald

@@ -151,6 +151,12 @@ class Config:
         self.pterodactyl_logs_enabled = _bool(g("PTERODACTYL_LOGS_ENABLED"), True)
         self.pterodactyl_logs_channel_id = _int(g("PTERODACTYL_LOGS_CHANNEL_ID"))  # repli si non provisionné
         self.pterodactyl_logs_poll_seconds = max(10, _int(g("PTERODACTYL_LOGS_POLL_SECONDS", "30"), 30))
+        # VPN WireGuard : tableau #vpn (R820 wg-vpn/wg-avy + MikroTik wg0 en secours), demande Nico 2026-08-30
+        self.vpn_enabled = _bool(g("VPN_ENABLED"), True)
+        self.vpn_channel_id = _int(g("VPN_CHANNEL_ID"))  # repli si le salon n'est pas retrouvé par son id persisté
+        self.vpn_poll_seconds = max(30, _int(g("VPN_POLL_SECONDS", "60"), 60))
+        self.vpn_status_cmd = g("VPN_STATUS_CMD", "/usr/local/sbin/vpn-status")  # exécuté SUR L'HYPERVISEUR (clé SSH restreinte)
+        self.vpn_events = _bool(g("VPN_EVENTS"), True)
         # Heartbeat externe (dead-man's-switch) : URL de ping healthchecks.io/ntfy
         self.heartbeat_url = g("HEARTBEAT_URL", "").strip()
 

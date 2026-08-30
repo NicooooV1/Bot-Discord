@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Etat des VPN WireGuard (R820 wg-vpn + wg-avy, MikroTik wg0/netwatch/dst-nat) en JSON.
+Consomme par le bot Edmine (cog vpn) via SSH. Aucun secret dans la sortie."""
+import json, os, re, subprocess, time, concurrent.futures as cf
+
+MT_HOST = "10.3.0.1"
+IFACES = {"wg-vpn": "VPN nomade (Pierre + PC Nico)", "wg-avy": "Site-à-site Aveyron"}
+
+def run(cmd, timeout=8, env=None, inp=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, input=inp)
+        return r.stdout
+    except Exception:
+        return ""
+
+def peer_names(iface):
+    """pubkey -> nom, d'après les commentaires '# nom' qui précèdent PublicKey dans le .conf."""
+    names, last = {}, None
+    try:
+        for line in open(f"/etc/wireguard/{iface}.conf"):
+            s = line.strip()
+            if s.startswith("#") and "Peer" not in s and "=" not in s:
+                last = s.lstrip("# ").split(" (")[0].split(" —")[0].strip()
+            elif s.startswith("PublicKey"):
+                names[s.split("=", 1)[1].strip()] = last or "?"
+                last = None
+    except OSError:
+        pass
+    return names
+
+def ping(ip, count=3, timeout=1):
+    out = run(["ping", "-nq", "-c", str(count), "-W", str(timeout), "-i", "0.2", ip], timeout=count * timeout + 3)
+    m = re.search(r"(\d+)% packet loss", out); loss = int(m.group(1)) if m else 100
+    m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)", out)
+    return {"loss_pct": loss, "min_ms": float(m.group(1)) if m else None,
+            "avg_ms": float(m.group(2)) if m else None, "max_ms": float(m.group(3)) if m else None}
+
+def wg_iface(iface):
+    names = peer_names(iface)
+    out = run(["wg", "show", iface, "dump"])
+    lines = [l.split("\t") for l in out.strip().splitlines()]
+    if not lines:
+        return {"present": False, "label": IFACES.get(iface, iface)}
+    head, peers, now = lines[0], [], int(time.time())
+    for p in lines[1:]:
+        pub, _psk, endpoint, allowed, hs, rx, tx, ka = p[:8]
+        hs = int(hs); age = now - hs if hs else None
+        tunnel_ip = allowed.split(",")[0].split("/")[0] if allowed != "(none)" else None
+        if iface == "wg-avy":
+            tunnel_ip = "10.99.0.1"
+        peers.append({"name": names.get(pub, pub[:8] + "…"), "pubkey_short": pub[:8] + "…",
+                      "endpoint": None if endpoint == "(none)" else endpoint,
+                      "allowed_ips": allowed, "tunnel_ip": tunnel_ip,
+                      "handshake_age_s": age, "connected": age is not None and age < 180,
+                      "rx_bytes": int(rx), "tx_bytes": int(tx), "keepalive_s": None if ka == "off" else int(ka)})
+    # latence vers les pairs connectés (en parallèle)
+    with cf.ThreadPoolExecutor(8) as ex:
+        futs = {ex.submit(ping, p["tunnel_ip"]): p for p in peers if p["connected"] and p["tunnel_ip"]}
+        for f, p in futs.items():
+            p["ping"] = f.result()
+    return {"present": True, "label": IFACES.get(iface, iface), "listen_port": int(head[2]),
+            "pubkey_short": head[1][:8] + "…", "peers": peers}
+
+def mikrotik():
+    try:
+        pw = open("/root/.mt_pw").read().strip()
+    except OSError:
+        return {"reachable": False, "error": "pas de /root/.mt_pw"}
+    env = dict(os.environ, SSHPASS=pw)
+    def mt(cmd):
+        return run(["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                    "-o", "BatchMode=no", f"nico@{MT_HOST}", cmd], timeout=15, env=env)
+    ident = mt("/system identity print")
+    if "name:" not in ident:
+        return {"reachable": False, "error": "SSH MikroTik KO"}
+    res = {"reachable": True}
+    # netwatch
+    nw = mt('/tool netwatch print detail where host=10.3.10.200')
+    m = re.search(r"status=(\w+)", nw); res["netwatch_status"] = m.group(1) if m else None
+    m = re.search(r"since=(\S+ \S+|\S+)", nw); res["netwatch_since"] = m.group(1) if m else None
+    # dst-nat prioritaire (X = désactivé => mode secours)
+    nat = mt('/ip firewall nat print stats where comment~"wg-vpn"')
+    res["dstnat_enabled"] = not re.search(r"^\s*\d+\s+X", nat, re.M)
+    m = re.search(r"dst-nat\s+([\d ]+?)\s{2,}([\d ]+)\s*$", nat, re.M)
+    res["dstnat_packets"] = int(m.group(2).replace(" ", "")) if m else None
+    # routes 10.3.99.0/24 : laquelle est active
+    rt = mt('/ip route print where dst-address=10.3.99.0/24')
+    res["route_vpn_via"] = "R820" if re.search(r"^\s*\d+\s+As\s+10\.3\.99\.0/24\s+10\.3\.10\.200", rt, re.M) else ("wg0" if re.search(r"^\s*\d+\s+As\s+10\.3\.99\.0/24\s+wg0", rt, re.M) else "?")
+    # pair hub Aveyron (X = désactivé en mode normal)
+    hub = mt('/interface wireguard peers print where comment="Hub Aveyron"')
+    res["hub_peer_enabled"] = not re.search(r"^\s*\d+\s+X", hub, re.M)
+    # pairs wg0
+    peers, cur = [], None
+    for line in mt("/interface wireguard peers print detail").splitlines():
+        s = line.strip()
+        if re.match(r"^\d+\s", s):
+            if cur: peers.append(cur)
+            cur = {"disabled": " X " in s[:8] or s.split()[1] == "X", "name": None}
+        if cur is None: continue
+        m = re.search(r'name="([^"]+)"', s)
+        if m: cur["name"] = m.group(1)
+        m = re.search(r";;; (.+)$", s)
+        if m and not cur.get("comment"): cur["comment"] = m.group(1)
+        m = re.search(r"current-endpoint-address=([\d.]+) current-endpoint-port=(\d+)", s)
+        if m and m.group(1): cur["endpoint"] = f"{m.group(1)}:{m.group(2)}"
+        m = re.search(r"(?<![\w-])allowed-address=([^\s]+)", s)
+        if m: cur["allowed"] = m.group(1)
+        m = re.search(r"rx=([\d.]+\w*) tx=([\d.]+\w*)", s)
+        if m: cur["rx"], cur["tx"] = m.group(1), m.group(2)
+        m = re.search(r"last-handshake=(\S+)", s)
+        if m: cur["last_handshake"] = m.group(1)
+    if cur: peers.append(cur)
+    for p in peers:
+        n = p.get("name") or ""
+        p["name"] = {"peer3": "Hub Aveyron", "peer11": "nico-pc2", "peer12": "nico-pc3"}.get(n, n)
+    res["wg0_peers"] = peers
+    m = re.search(r"uptime:\s*(\S+)", mt("/system resource print")); res["uptime"] = m.group(1) if m else None
+    m = re.search(r"public-address:\s*([\d.]+)", mt("/ip cloud print")); res["wan_ip"] = m.group(1) if m else None
+    inp = mt('/ip firewall filter print stats where chain=input and dst-port=39671')
+    m = re.search(r"accept\s+([\d ]+?)\s{2,}([\d ]+)\s*$", inp, re.M); res["wg0_input_packets"] = int(m.group(2).replace(" ", "")) if m else None
+    return res
+
+def main():
+    t0 = time.time()
+    with cf.ThreadPoolExecutor(4) as ex:
+        f_vpn, f_avy, f_mt = ex.submit(wg_iface, "wg-vpn"), ex.submit(wg_iface, "wg-avy"), ex.submit(mikrotik)
+        f_av = ex.submit(lambda: {"hub_10.99.0.1": ping("10.99.0.1"), "pve_10.0.10.10": ping("10.0.10.10")})
+        data = {"ts": int(t0), "host": "R820", "wg-vpn": f_vpn.result(), "wg-avy": f_avy.result(),
+                "mikrotik": f_mt.result(), "aveyron": f_av.result()}
+    mt = data["mikrotik"]
+    if mt.get("reachable"):
+        primary = mt.get("dstnat_enabled") and mt.get("route_vpn_via") == "R820"
+        data["mode"] = "primaire" if primary else "secours"
+    else:
+        data["mode"] = "inconnu"
+    data["public_dns_nicov1"] = run(["dig", "+short", "+time=2", "@8.8.8.8", "nicov1.fr", "A"]).strip() or None
+    data["dns_matches_wan"] = (data["public_dns_nicov1"] == mt.get("wan_ip")) if mt.get("wan_ip") else None
+    data["duration_s"] = round(time.time() - t0, 2)
+    print(json.dumps(data, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
