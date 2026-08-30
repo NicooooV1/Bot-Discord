@@ -366,7 +366,7 @@ trackers morts en **bilan quotidien** (le script n'agit qu'après 3 relevés « 
 ~3 h de grâce, fini le retrait au premier hoquet d'un tracker public). Lecture seule via la clé
 SSH restreinte (`pct exec 120 -- cat …`), curseurs dans le state du bot.
 
-### `#vpn` (📊 Supervision) + `#logs-vpn` (🔒 Lock)
+### `#vpn` + `#logs-vpn` (🔒 Lock)
 
 État des VPN WireGuard, règle Nico 2026-08-30 : **tous les VPN se terminent sur le R820**
 (`wg-vpn` udp/39671 nomades Pierre + PC Nico, `wg-avy` udp/39672 site-à-site Aveyron) ; le
@@ -375,7 +375,7 @@ MikroTik CRS305 (`wg0`, même clé) ne prend le relais que si son netwatch voit 
 
 - exécute `tools/vpn-status` **sur l'hyperviseur** (clé SSH restreinte) toutes les 60 s ; c'est ce
   script qui lit `wg show … dump` et le MikroTik (mot de passe `/root/.mt_pw` jamais copié dans CT106) ;
-- tient dans `#vpn` (Supervision, règle Nico 30/08) un message épinglé : mode PRIMAIRE / SECOURS, chaque pair (🟢 handshake < 3 min, 🟠 dernier
+- tient dans `#vpn` (🔒 Lock R820, décision finale Nico 30/08) un message épinglé : mode PRIMAIRE / SECOURS, chaque pair (🟢 handshake < 3 min, 🟠 dernier
   handshake il y a …, ⚪ jamais vu depuis le démarrage de l'interface), endpoint, ping min/moy/max +
   perte depuis le R820, rx/tx cumulés et débit (delta entre relevés, ignoré si compteurs remis à zéro),
   hub Aveyron + PVE 10.0.10.10, MikroTik (netwatch, dst-nat, route 10.3.99.0/24, pairs wg0), IP WAN et

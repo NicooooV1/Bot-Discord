@@ -16,7 +16,7 @@ CE QUE FAIT CE COG
     script y lit `wg show … dump` (R820) et interroge le MikroTik en SSH avec le mot de passe
     `/root/.mt_pw` qui NE QUITTE JAMAIS l'hyperviseur (CT106 ne le voit pas, son pare-feu
     `106.fw` n'autorise d'ailleurs pas 10.3.0.1) ;
-  - tient à jour UN message épinglé dans #vpn (📊 Supervision R820, règle Nico 2026-08-30) : mode, chaque pair (connecté /
+  - tient à jour UN message épinglé dans #vpn (🔒 Lock R820, décision finale Nico 2026-08-30) : mode, chaque pair (connecté /
     dernier handshake / jamais vu), endpoint, ping min/moy/max + perte, volumes rx/tx cumulés
     et débit instantané (delta entre deux relevés), hub Aveyron, MikroTik (netwatch, dst-nat,
     route, pairs wg0 avec leurs compteurs), IP WAN et cohérence DNS `nicov1.fr` ;
@@ -287,7 +287,7 @@ def _mt_recent(s):
 
 # ============================================================ cog
 class Vpn(commands.Cog):
-    """#vpn (Supervision) : tableau épinglé ; #logs-vpn (Lock R820) : événements ; #alertes ; /vpn."""
+    """#vpn (Lock R820) : tableau épinglé ; #logs-vpn (Lock R820) : événements ; #alertes ; /vpn."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -341,9 +341,9 @@ class Vpn(commands.Cog):
     async def _managed_channel(self, name, state_key, category_fn, topic, why):
         """Salon géré par le cog dans SA catégorie (jamais hors catégorie — règle 2026-08-11).
 
-        Règle Nico 2026-08-30 : `#vpn` (tableau) en « 📊 Supervision R820 », `#logs-vpn`
-        (journal d'un service du R820) en « 🔒 Lock R820 ». Un salon retrouvé dans une autre
-        catégorie (les deux ont déjà déménagé) est RANGÉ dans la bonne via
+        Décision finale Nico 2026-08-30 (soir) : `#vpn` (tableau) ET `#logs-vpn` (journal)
+        vivent tous deux en « 🔒 Lock R820 ». Un salon retrouvé dans une autre
+        catégorie (les deux ont déjà déménagé plusieurs fois) est RANGÉ dans la bonne via
         `edit(category=…, sync_permissions=True)` (héritage des overwrites, jamais
         `overwrites=`)."""
         gid = getattr(self.bot.cfg, "guild_id", None)
@@ -378,9 +378,9 @@ class Vpn(commands.Cog):
         return ch
 
     async def _vpn_channel(self):
-        """#vpn (tableau épinglé) — 📊 Supervision R820."""
+        """#vpn (tableau épinglé) — 🔒 Lock R820 (décision finale Nico 2026-08-30 soir)."""
         return await self._managed_channel(
-            "vpn", "vpn_msg", channels.supervision_category,
+            "vpn", "vpn_msg", channels.lock_category,
             "🛡️ VPN WireGuard : tableau épinglé (pairs nomades wg-vpn, site-à-site Aveyron wg-avy, "
             "secours MikroTik wg0). Événements dans #logs-vpn. Lecture seule.",
             "état des VPN")
