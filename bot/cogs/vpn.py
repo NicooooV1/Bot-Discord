@@ -20,7 +20,7 @@ CE QUE FAIT CE COG
     dernier handshake / jamais vu), endpoint, ping min/moy/max + perte, volumes rx/tx cumulés
     et débit instantané (delta entre deux relevés), hub Aveyron, MikroTik (netwatch, dst-nat,
     route, pairs wg0 avec leurs compteurs), IP WAN et cohérence DNS `nicov1.fr` ;
-  - poste dans #logs-vpn (🔒 Lock R820) un ÉVÉNEMENT à chaque transition : pair qui se connecte / dont le
+  - poste dans #logs-vpn (🗄️ Archive, journal privé comme #logs-2fa) un ÉVÉNEMENT à chaque transition : pair qui se connecte / dont le
     handshake devient ancien, changement d'endpoint, bascule primaire↔secours, MikroTik
     (in)joignable, hub Aveyron (dé)connecté, DNS ≠ WAN ;
   - relaie dans #alertes (edge-trigger + snooze) : bascule en mode secours, hub Aveyron sans
@@ -57,6 +57,7 @@ from ..core.nodeshell import run_readonly
 from ..core.permissions import admin_check
 from ..core.ui import pin_edit
 from ..views.alertaction import alert_snoozed
+from .provision_perms import twofa_overwrites as journal_overwrites
 
 log = logging.getLogger("discord-bot.vpn")
 
@@ -287,7 +288,7 @@ def _mt_recent(s):
 
 # ============================================================ cog
 class Vpn(commands.Cog):
-    """#vpn (Supervision) : tableau épinglé ; #logs-vpn (Lock) : événements ; #alertes ; /vpn."""
+    """#vpn (Supervision) : tableau épinglé ; #logs-vpn (Archive) : événements ; #alertes ; /vpn."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -341,9 +342,9 @@ class Vpn(commands.Cog):
     async def _managed_channel(self, name, state_key, category_fn, topic, why):
         """Salon géré par le cog dans SA catégorie (jamais hors catégorie — règle 2026-08-11).
 
-        Règle Nico 2026-08-30 : le tableau `#vpn` vit dans « 📊 Supervision R820 », le fil
-        d'événements `#logs-vpn` dans « 🔒 Lock R820 ». Un salon retrouvé dans une autre
-        catégorie (ex. #vpn créé d'abord dans Lock) est RANGÉ dans la bonne via
+        Règle Nico 2026-08-30 : le tableau `#vpn` vit dans « 📊 Supervision R820 » (le fil
+        d'événements `#logs-vpn` a son propre schéma, voir `_logs_channel`). Un salon retrouvé
+        dans une autre catégorie (ex. #vpn créé d'abord dans Lock) est RANGÉ dans la bonne via
         `edit(category=…, sync_permissions=True)` (héritage des overwrites, jamais
         `overwrites=`)."""
         gid = getattr(self.bot.cfg, "guild_id", None)
@@ -366,7 +367,7 @@ class Vpn(commands.Cog):
         if cat is not None and ch.category_id != cat.id:
             try:
                 await ch.edit(category=cat, sync_permissions=True,
-                              reason="règle Nico 2026-08-30 : #vpn en Supervision, #logs-vpn en Lock")
+                              reason="règle Nico 2026-08-30 : #vpn en Supervision")
                 log.info("vpn: #%s rangé dans « %s »", ch.name, cat.name)
             except discord.HTTPException as e:
                 log.warning("vpn: impossible de ranger #%s dans « %s »: %s", ch.name, cat.name, e)
@@ -386,12 +387,55 @@ class Vpn(commands.Cog):
             "état des VPN")
 
     async def _logs_channel(self):
-        """#logs-vpn (événements : connexions, bascules…) — 🔒 Lock R820."""
-        return await self._managed_channel(
-            "logs-vpn", "vpn_logs", channels.lock_category,
-            "🛡️ Événements VPN WireGuard : connexions / fins de session des pairs, changements "
-            "d'endpoint, bascule R820 ↔ MikroTik, MikroTik injoignable, DNS ≠ WAN. Tableau dans #vpn.",
-            "endpoints publics des pairs VPN")
+        """#logs-vpn (événements) — « 🗄️ Archive », comme #logs-2fa.
+
+        Règle Nico 2026-08-30 (2e) : « ce qui concerne l'ensemble des serveurs, comme les
+        journaux Discord, doit être dans Archive ». Le VPN couvre R820 + Aveyron. La
+        catégorie Archive est créée SANS overwrites par provision : le salon porte donc les
+        siens, copiés de #logs-2fa (`twofa_overwrites` : @everyone ne voit rien, le bot
+        écrit, le propriétaire voit par bypass). Un salon retrouvé ailleurs (ex. créé en Lock
+        avant cette règle) est déplacé SANS `sync_permissions` puis ses overwrites posés."""
+        gid = getattr(self.bot.cfg, "guild_id", None)
+        guild = self.bot.get_guild(gid) if gid else None
+        if guild is None:
+            return None
+        info = self.bot.state.get("vpn_logs") or {}
+        ch = guild.get_channel(info["channel"]) if info.get("channel") else None
+        if ch is None:
+            ch = discord.utils.get(guild.text_channels, name="logs-vpn")
+        arch = channels.resolve(self.bot, guild, "archive", "Archive")
+        if arch is None:
+            if not self._warned_no_channel:
+                log.warning("vpn: #logs-vpn : catégorie Archive absente — réessai au prochain cycle")
+                self._warned_no_channel = True
+            return None
+        ow = journal_overwrites(guild)
+        topic = ("🛡️ Événements VPN WireGuard (R820 + Aveyron) : connexions / fins de session des pairs, "
+                 "changements d'endpoint, bascule R820 ↔ MikroTik, MikroTik injoignable, DNS ≠ WAN. "
+                 "Tableau dans #vpn. Journal privé, le bot seul y écrit.")
+        if ch is None:
+            try:
+                ch = await guild.create_text_channel("logs-vpn", category=arch, overwrites=ow, topic=topic,
+                                                     reason="journal VPN (règle Nico 2026-08-30 : journaux transverses en Archive)")
+                log.info("vpn: #logs-vpn créé dans « %s »", arch.name)
+            except discord.HTTPException as e:
+                log.warning("vpn: #logs-vpn non créé: %s", e)
+                return None
+        else:
+            try:
+                if ch.category_id != arch.id:
+                    await ch.edit(category=arch, sync_permissions=False,
+                                  reason="règle Nico 2026-08-30 : journaux transverses en Archive")
+                    log.info("vpn: #logs-vpn rangé dans « %s »", arch.name)
+                if channels.is_public(ch) is not False:
+                    await ch.edit(overwrites=ow, reason="journal VPN : visible par personne (schéma #logs-2fa)")
+                    log.info("vpn: #logs-vpn overwrites (schéma journal) posés")
+            except discord.HTTPException as e:
+                log.warning("vpn: #logs-vpn non rangé/scellé: %s", e)
+        if info.get("channel") != ch.id:
+            info["channel"] = ch.id
+            self.bot.state.set("vpn_logs", info)
+        return ch
 
     async def _publish(self, data, rate_map, stale=None):
         ch = await self._vpn_channel()
