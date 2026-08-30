@@ -461,7 +461,6 @@ class DiscordLogs(commands.Cog):
         if ch is None:
             ch = discord.utils.get(guild.text_channels, name="discord-logs")
         arch = channels.resolve(self.bot, guild, "archive", "Archive")
-        ow = journal_overwrites(guild)
         if ch is None:
             if arch is None:
                 # pas de catégorie Archive résoluble : on ne crée RIEN (règle 2026-08-11,
@@ -472,7 +471,7 @@ class DiscordLogs(commands.Cog):
                 return None
             try:
                 ch = await guild.create_text_channel(
-                    "discord-logs", category=arch, overwrites=ow,
+                    "discord-logs", category=arch, overwrites=journal_overwrites(guild),
                     topic="📓 Journal du serveur Discord : messages supprimés/édités, arrivées/départs, "
                           "rôles, permissions, invitations, webhooks, vocal. Privé, le bot seul y écrit.",
                     reason="journal des événements Discord (règle Nico 2026-08-30 : journaux Discord en Archive)")
@@ -486,6 +485,7 @@ class DiscordLogs(commands.Cog):
                     await ch.edit(category=arch, sync_permissions=False,
                                   reason="règle Nico 2026-08-30 : journaux Discord en Archive")
                     log.info("discord_logs: #discord-logs rangé dans « %s »", arch.name)
+                ow = journal_overwrites(guild)  # paresseux : les faux guilds des tests n ont pas de vrai `me`
                 if ovw_drifted(ch, ow):
                     await ch.edit(overwrites=ow, reason="journal Discord : schéma #logs-2fa (visible par personne)")
                     log.info("discord_logs: overwrites (schéma journal) posés sur #discord-logs")
