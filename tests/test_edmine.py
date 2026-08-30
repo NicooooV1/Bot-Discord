@@ -960,6 +960,11 @@ class TestSondeTransfert(unittest.TestCase):
 
     def test_journal_tronque_sans_progression(self):
         """Journal sans ligne de progression : on garde l'état, pas de plantage."""
+        e = self.t.parse_sonde(self.SORTIE + "hote=10.0.25.10\nchemin=vlan25\n")
+        self.assertEqual((e["hote"], e["chemin"]), ("10.0.25.10", "vlan25"),
+                         "chemin réseau (VLAN25/mgmt) doit remonter jusqu'à l'embed")
+        self.assertEqual(self.t.parse_sonde(self.SORTIE)["hote"], "",
+                         "absent = vide, pas d'exception")
         e = self.t.parse_sonde("etat=failed\nresultat=exit-code\n")
         self.assertEqual(e["etat"], "failed")
         self.assertIsNone(e["pct_fin"])

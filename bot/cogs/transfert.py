@@ -50,6 +50,8 @@ tail -n 200 "$journal" 2>/dev/null | tr '\r' '\n' \
 tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' | grep -o 'ir-chk=[0-9/]*\|to-chk=[0-9/]*' \
   | tail -1 | sed 's/^/chk=/'
 timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
+echo "hote=$(findmnt -n -o SOURCE "$cible" 2>/dev/null | cut -d: -f1)"
+echo "chemin=$(cat /run/avy-media.path 2>/dev/null)"
 """
 
 #: un `Type=oneshot` qui dure reste dans l'état « activating » de bout en bout —
@@ -100,7 +102,8 @@ def parse_sonde(sortie):
     montage absent) : c'est justement pendant les ennuis qu'on regarde ce salon."""
     out = {"etat": "inconnu", "resultat": "", "debut": "", "lignes": [],
            "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
-           "analyse": None}   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
+           "analyse": None,   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
+           "hote": "", "chemin": ""}   # 2026-08-30 : serveur NFS réel + vlan25/mgmt
     for ligne in (sortie or "").splitlines():
         cle, _, val = ligne.partition("=")
         val = val.strip()
@@ -114,6 +117,10 @@ def parse_sonde(sortie):
             out["lignes"].append(val)
         elif cle == "libre":
             out["libre"] = int(val) if val.isdigit() else None
+        elif cle == "hote":
+            out["hote"] = val
+        elif cle == "chemin":
+            out["chemin"] = val
         elif cle == "chk":
             # rsync affiche « ir-chk » tant que la récursion INCRÉMENTALE analyse encore
             # l'arborescence : son total (donc notre %) ne couvre que le DÉJÀ-analysé et
@@ -191,6 +198,14 @@ def embed_transfert(etat, cfg):
                       value=fmt.humanize_duration(etat["eta"]) + " restantes")
     if etat["libre"] is not None:
         emb.add_field(name="Libre à l'arrivée", value=fmt.humanize_bytes(etat["libre"]))
+    if etat.get("hote"):
+        # 2026-08-30 (Nico : « en passant par sa VLAN25 ») : le nas exporte le pool sur
+        # 10.0.25.10 (VLAN25) ET 10.0.10.10 (mgmt) ; l'hôte préfère le VLAN25 et retombe
+        # sur le mgmt s'il n'est pas routé — on le DIT, sinon on croit que c'est réglé.
+        chemin = etat.get("chemin")
+        libelle = {"vlan25": "VLAN25 ✅", "mgmt": "mgmt (repli, VLAN25 injoignable)"}.get(
+            chemin, chemin or "?")
+        emb.add_field(name="Chemin réseau", value=f"`{etat['hote']}` · {libelle}")
     if etat["debut"]:
         emb.add_field(name="Démarré", value=etat["debut"], inline=False)
     if etat["lignes"]:
