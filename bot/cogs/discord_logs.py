@@ -461,13 +461,15 @@ class DiscordLogs(commands.Cog):
         if ch is None:
             ch = discord.utils.get(guild.text_channels, name="discord-logs")
         arch = channels.resolve(self.bot, guild, "archive", "Archive")
-        if arch is None:
-            if not self._warned_no_channel:
-                log.warning("discord_logs: catégorie Archive absente — réessai plus tard")
-                self._warned_no_channel = True
-            return None
         ow = journal_overwrites(guild)
         if ch is None:
+            if arch is None:
+                # pas de catégorie Archive résoluble : on ne crée RIEN (règle 2026-08-11,
+                # un salon hors catégorie naît public) ; on réessaiera.
+                if not self._warned_no_channel:
+                    log.warning("discord_logs: catégorie Archive absente — salon non créé, réessai plus tard")
+                    self._warned_no_channel = True
+                return None
             try:
                 ch = await guild.create_text_channel(
                     "discord-logs", category=arch, overwrites=ow,
@@ -478,7 +480,7 @@ class DiscordLogs(commands.Cog):
             except discord.HTTPException as e:
                 log.warning("discord_logs: #discord-logs non créé: %s", e)
                 return None
-        else:
+        elif arch is not None:
             try:
                 if ch.category_id != arch.id:
                     await ch.edit(category=arch, sync_permissions=False,
