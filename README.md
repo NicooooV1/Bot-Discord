@@ -357,6 +357,15 @@ logs ≥ warning). Le pare-feu `106.fw` autorise la sortie TCP/3100 vers Loki.
 - Quand l'hôte est éteint la nuit, CT106 (et le bot) le sont aussi ; reprise auto via `onboot=1`
   + rattrapage du rapport au réveil. L'alerting critique reste assuré par Grafana.
 
+### seed-clean → `#rapports` (cog `seedclean`)
+
+Le script `seed-clean` (CT120, horaire) ne poste plus de webhook #medias (règle Nico 30/08) :
+il consigne ses actions dans `/opt/servarr/scripts/seed-clean-state.json` et le cog les publie
+dans `#rapports` — purges d'anciennes versions et arrêts de sécurité immédiatement, retraits de
+trackers morts en **bilan quotidien** (le script n'agit qu'après 3 relevés « mort » consécutifs,
+~3 h de grâce, fini le retrait au premier hoquet d'un tracker public). Lecture seule via la clé
+SSH restreinte (`pct exec 120 -- cat …`), curseurs dans le state du bot.
+
 ### `#vpn` (📊 Supervision) + `#logs-vpn` (🔒 Lock)
 
 État des VPN WireGuard, règle Nico 2026-08-30 : **tous les VPN se terminent sur le R820**

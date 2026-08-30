@@ -33,7 +33,7 @@ COGS = ["status", "graphs", "hardware", "storage", "backups", "sysinfo",
         # 2026-08-30 : fonctionnalités « serveur Discord » reprises (en idée) du projet
         # Ultra Suite de Nico — journal d'événements, sondages, rappels, instantanés,
         # FAQ, modération légère. Voir chaque cog pour ce qu'il fait / ne fait pas.
-        "discord_logs", "sondage", "rappel", "snapshot", "faq", "moderation"]
+        "discord_logs", "sondage", "rappel", "snapshot", "faq", "moderation", "seedclean"]
 
 # Seule famille de commandes exemptée de 2FA. Sans elle, impossible de s'inscrire ni de
 # déverrouiller : la clé serait enfermée à l'intérieur. NE PAS retirer.

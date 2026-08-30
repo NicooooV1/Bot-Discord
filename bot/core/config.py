@@ -157,6 +157,12 @@ class Config:
         self.vpn_poll_seconds = max(30, _int(g("VPN_POLL_SECONDS", "60"), 60))
         self.vpn_status_cmd = g("VPN_STATUS_CMD", "/usr/local/sbin/vpn-status")  # exécuté SUR L'HYPERVISEUR (clé SSH restreinte)
         self.vpn_events = _bool(g("VPN_EVENTS"), True)
+        # seed-clean (CT120) relayé dans #rapports par le bot — demande Nico 2026-08-30
+        self.seedclean_enabled = _bool(g("SEEDCLEAN_ENABLED"), True)
+        self.seedclean_poll_seconds = max(60, _int(g("SEEDCLEAN_POLL_SECONDS", "300"), 300))
+        self.seedclean_state_cmd = g("SEEDCLEAN_STATE_CMD",
+                                     "pct exec 120 -- cat /opt/servarr/scripts/seed-clean-state.json")
+        self.seedclean_digest_hour = min(23, max(0, _int(g("SEEDCLEAN_DIGEST_HOUR", "9"), 9)))
         # Heartbeat externe (dead-man's-switch) : URL de ping healthchecks.io/ntfy
         self.heartbeat_url = g("HEARTBEAT_URL", "").strip()
 
