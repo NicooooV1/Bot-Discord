@@ -46,6 +46,9 @@ CAPS = {
     "requests":      ("🎬 Demandes médias",    "approuver/refuser dans #demandes",                  False, True),
     "services":      ("🧩 Panneaux services",  "/docker, /dns, /dist, /sso, /torrents, /yt-config…", False, True),
     "alerts":        ("🔕 Alertes",            "mettre une alerte en sommeil (#alertes)",           False, True),
+    # 2026-08-30 — fonctionnalités « serveur Discord »
+    "faq":           ("📚 FAQ",                "gérer les réponses enregistrées (/faq ajouter…)",  False, True),
+    "moderation":    ("🛡️ Modération",         "/purge, /lock, /unlock, /slowmode, /note",          False, True),
 }
 
 # actions /ctctl -> capacité

@@ -287,6 +287,27 @@ class Config:
         # pas pris pour la taille finale (question de Nico 2026-08-18)
         self.transfert_total_hint = g("TRANSFERT_TOTAL_HINT", "").strip()
 
+        # --- Fonctionnalités « serveur Discord » (2026-08-30) ---------------------
+        # Intents privilégiés : à cocher dans le portail développeur AVANT de passer à true.
+        self.intent_members = _bool(g("DISCORD_INTENT_MEMBERS"), False)
+        self.intent_message_content = _bool(g("DISCORD_INTENT_MESSAGE_CONTENT"), False)
+        # journal des événements Discord (#discord-logs dans 🔒 Lock)
+        self.discord_logs_enabled = _bool(g("DISCORD_LOGS_ENABLED"), True)
+        self.discord_logs_channel_id = _int(g("DISCORD_LOGS_CHANNEL_ID"))
+        self.discord_logs_voice = _bool(g("DISCORD_LOGS_VOICE"), True)
+        self.discord_logs_alert_cooldown = _int(g("DISCORD_LOGS_ALERT_COOLDOWN", "300"), 300)
+        self.welcome_role_id = _int(g("WELCOME_ROLE_ID"))      # 0 = pas de rôle auto
+        # instantanés de la configuration du serveur (rôles/salons/overwrites)
+        self.snapshot_auto = _bool(g("SNAPSHOT_AUTO"), True)
+        self.snapshot_keep = _int(g("SNAPSHOT_KEEP", "30"), 30)
+        # sondages / rappels / FAQ / notes
+        self.sondage_duree_max_jours = _int(g("SONDAGE_DUREE_MAX_JOURS", "30"), 30)
+        self.sondage_max_ouverts = _int(g("SONDAGE_MAX_OUVERTS", "20"), 20)
+        self.rappel_purge_jours = _int(g("RAPPEL_PURGE_JOURS", "7"), 7)
+        self.rappel_max_par_utilisateur = _int(g("RAPPEL_MAX_PAR_UTILISATEUR", "25"), 25)
+        self.faq_max_len = _int(g("FAQ_MAX_LEN", "1800"), 1800)
+        self.note_max_len = _int(g("NOTE_MAX_LEN", "500"), 500)
+
         # durée de vie ABSOLUE d'une console du nœud, même active (0 = illimité)
         self.node_terminal_max_min = max(0, _int(g("NODE_TERMINAL_MAX_MIN", "120"), 120))
         # plafond de l'inactivité SAISIE pour le shell root de l'hyperviseur. Défaut plus

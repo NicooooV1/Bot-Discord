@@ -29,7 +29,11 @@ COGS = ["status", "graphs", "hardware", "storage", "backups", "sysinfo",
         "reports", "servarr", "medias", "requests", "youtube", "meta", "provision", "terminal",
         "heartbeat", "twofa", "docker", "gestion", "avy", "avy_metrics",
         "jellyfin_activity", "seerr_activity", "dist", "netrates", "transfert", "sso",
-        "dns", "dolibarr_logs", "pterodactyl_logs", "grafana_alerts", "vpn"]
+        "dns", "dolibarr_logs", "pterodactyl_logs", "grafana_alerts", "vpn",
+        # 2026-08-30 : fonctionnalités « serveur Discord » reprises (en idée) du projet
+        # Ultra Suite de Nico — journal d'événements, sondages, rappels, instantanés,
+        # FAQ, modération légère. Voir chaque cog pour ce qu'il fait / ne fait pas.
+        "discord_logs", "sondage", "rappel", "snapshot", "faq", "moderation"]
 
 # Seule famille de commandes exemptée de 2FA. Sans elle, impossible de s'inscrire ni de
 # déverrouiller : la clé serait enfermée à l'intérieur. NE PAS retirer.
@@ -82,9 +86,13 @@ class GatedTree(app_commands.CommandTree):
 class MonitorBot(commands.Bot):
     def __init__(self, cfg: Config):
         intents = discord.Intents.default()
-        # Aucun intent privilégié : le bot n'a plus aucun listener on_message depuis
-        # le retrait de l'assistant IA (2026-08-18). MESSAGE CONTENT peut être décoché
-        # côté portail développeur.
+        # Intents PRIVILÉGIÉS pilotés par config (2026-08-30, cog discord_logs) : ils
+        # doivent être cochés dans le portail développeur AVANT d'être activés ici,
+        # sinon discord.py refuse de se connecter (PrivilegedIntentsRequired) et le bot
+        # est absent. Défaut = désactivés ; sans `members` le journal Discord dit
+        # lui-même ce qu'il ne voit pas (arrivées/départs/rôles).
+        intents.members = bool(getattr(cfg, "intent_members", False))
+        intents.message_content = bool(getattr(cfg, "intent_message_content", False))
         super().__init__(command_prefix=commands.when_mentioned,
                          intents=intents, help_command=None,
                          tree_cls=GatedTree,

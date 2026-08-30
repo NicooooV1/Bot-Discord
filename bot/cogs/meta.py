@@ -41,6 +41,9 @@ CATEGORIES = [
     ("📥 Téléchargements YouTube/Twitch", ["yt", "tw", "musique", "yt-config", "dl"]),
     ("🔐 Sécurité & accès", ["2fa", "gestion"]),
     ("🔧 Actions (admin)", ["ctctl", "backup", "audit"]),
+    ("🛡️ Serveur Discord", ["journal-discord", "snapshot", "purge", "lock", "unlock",
+                             "slowmode", "note", "faq"]),
+    ("🗳️ Communauté", ["sondage", "rappel"]),
     ("🪪 Divers", ["whoami", "help"]),
 ]
 # Repli pour les commandes gardées par du code INLINE et non par @admin_check :

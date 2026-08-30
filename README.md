@@ -357,7 +357,7 @@ logs ≥ warning). Le pare-feu `106.fw` autorise la sortie TCP/3100 vers Loki.
 - Quand l'hôte est éteint la nuit, CT106 (et le bot) le sont aussi ; reprise auto via `onboot=1`
   + rattrapage du rapport au réveil. L'alerting critique reste assuré par Grafana.
 
-### `#vpn` (📊 Supervision) + `#logs-vpn` (🔒 Lock)
+### `#vpn` (🔒 Lock)
 
 État des VPN WireGuard, règle Nico 2026-08-30 : **tous les VPN se terminent sur le R820**
 (`wg-vpn` udp/39671 nomades Pierre + PC Nico, `wg-avy` udp/39672 site-à-site Aveyron) ; le
@@ -366,13 +366,13 @@ MikroTik CRS305 (`wg0`, même clé) ne prend le relais que si son netwatch voit 
 
 - exécute `tools/vpn-status` **sur l'hyperviseur** (clé SSH restreinte) toutes les 60 s ; c'est ce
   script qui lit `wg show … dump` et le MikroTik (mot de passe `/root/.mt_pw` jamais copié dans CT106) ;
-- tient dans `#vpn` (Supervision, règle Nico 30/08) un message épinglé : mode PRIMAIRE / SECOURS, chaque pair (🟢 handshake < 3 min, 🟠 dernier
+- tient un message épinglé : mode PRIMAIRE / SECOURS, chaque pair (🟢 handshake < 3 min, 🟠 dernier
   handshake il y a …, ⚪ jamais vu depuis le démarrage de l'interface), endpoint, ping min/moy/max +
   perte depuis le R820, rx/tx cumulés et débit (delta entre relevés, ignoré si compteurs remis à zéro),
   hub Aveyron + PVE 10.0.10.10, MikroTik (netwatch, dst-nat, route 10.3.99.0/24, pairs wg0), IP WAN et
   cohérence DNS `nicov1.fr` ;
-- poste dans `#logs-vpn` (Lock) un événement par transition (connexion, fin de session, changement d'endpoint,
-  bascule, MikroTik (in)joignable, DNS ≠ WAN) ; relaie dans #alertes : mode secours, hub Aveyron sans handshake,
+- poste un événement par transition (connexion, fin de session, changement d'endpoint, bascule,
+  MikroTik (in)joignable, DNS ≠ WAN) ; relaie dans #alertes : mode secours, hub Aveyron sans handshake,
   MikroTik injoignable, DNS ≠ WAN ;
 - `/vpn` (cap `services`) : le même tableau, éphémère. Lecture seule : rien n'est modifié.
 
@@ -384,3 +384,23 @@ via Alloy `/etc/alloy/20-pterodactyl.alloy`, `{job="pterodactyl"}`) et Wings CT1
 utiles (power/install/backup/SFTP), incidents (Laravel ≥ err, Wings ERROR/FATAL, 5xx, PHP Fatal) →
 `#alertes` edge-trigger + « Résolu » après 60 min. Config : `PTERODACTYL_LOGS_ENABLED`,
 `PTERODACTYL_LOGS_CHANNEL_ID`, `PTERODACTYL_LOGS_POLL_SECONDS`.
+
+## Fonctionnalités « serveur Discord » (2026-08-30)
+
+Reprises **en idée** du projet Ultra Suite (bot JS de Nico, archivé sur GitHub sous le tag
+`ultra-suite-v2.1`) et réécrites pour Edmine : état JSON local, permissions G/M/O, 2FA, pas de
+PostgreSQL/Redis. Ultra Suite avait le concept juste mais l'exécution cassée (table `guild_config`
+absente de toute migration → 9 fichiers d'événements ne postaient jamais rien, backup sans
+overwrites, jobs jamais branchés) : rien n'a été copié.
+
+| Cog | Commandes | Ce que ça fait |
+|---|---|---|
+| `discord_logs` | `/journal-discord statut\|test` | `#discord-logs` (🔒 Lock) : messages supprimés/édités, arrivées/départs (kick/ban via journal d'audit), rôles, salons et **overwrites**, rôles et **permissions**, invitations, webhooks, threads, emojis, vocal ; signaux de sécurité relayés dans `#alertes` ; rôle de bienvenue `WELCOME_ROLE_ID`. Sans intent `members`, il dit lui-même ce qu'il ne voit pas. |
+| `snapshot` | `/snapshot creer\|liste\|voir\|diff\|supprimer` | instantané JSON déterministe rôles/salons/**overwrites** + diff lisible ; quotidien 04:00 si changement, `#alertes` si des permissions bougent. Pas de restauration automatique (volontaire). Owner. |
+| `sondage` | `/sondage creer\|fermer\|resultats\|liste` | sondages persistants (votes par personne, choix multiple, anonymat réel, clôture programmée idempotente, boutons survivant au redémarrage). |
+| `rappel` | `/rappel creer\|liste\|supprimer` | rappels en salon ou DM, récurrence, anti-doublon au redémarrage, repli DM si le salon disparaît. |
+| `faq` | `/faq voir\|ajouter\|modifier\|supprimer\|liste` | réponses enregistrées (VPN, Jellyfin…), lisibles par tout membre 2FA, mentions neutralisées. Gestion = M/O (cap `faq`). |
+| `moderation` | `/purge`, `/lock`, `/unlock`, `/slowmode`, `/note` | modération légère (pas de ban/kick : serveur privé) ; `/unlock` restaure l'overwrite exact d'avant ; cap `moderation`. |
+
+Intents privilégiés `DISCORD_INTENT_MEMBERS` / `DISCORD_INTENT_MESSAGE_CONTENT` : à cocher dans
+le portail développeur **avant** de les passer à `true` (sinon le bot refuse de démarrer).
