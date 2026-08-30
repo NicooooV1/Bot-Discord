@@ -470,6 +470,7 @@ class Vpn(commands.Cog):
         snap = snapshot(data)
         await self._publish(data, rate_map)
         if self.bot.cfg.vpn_events:
+            await self._logs_channel()  # le salon existe même sans événement (Nico veut le voir)
             await self._post_events(events(prev_snap, snap))
         self.bot.state.set("vpn_snap", snap)
         for key, level in alerts_from(data).items():
