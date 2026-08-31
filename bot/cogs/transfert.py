@@ -42,7 +42,7 @@ log = logging.getLogger("discord-bot.transfert")
 # Une seule commande, une seule connexion SSH par relevé. `tr` : rsync écrit sa
 # progression avec des retours CHARIOT (une seule « ligne » de plusieurs Mo sinon).
 SONDE = r"""
-unite=%(unite)s; journal=%(journal)s; cible=%(cible)s
+unite=%(unite)s; journal=%(journal)s; cible=%(cible)s; source=%(source)s
 echo "etat=$(systemctl is-active "$unite" 2>&1)"
 echo "resultat=$(systemctl show "$unite" -p Result --value 2>/dev/null)"
 echo "debut=$(systemctl show "$unite" -p InactiveExitTimestamp --value 2>/dev/null)"
@@ -54,6 +54,10 @@ tail -n 200 "$journal" 2>/dev/null | tr '\r' '\n' \
 tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' | grep -o 'ir-chk=[0-9/]*\|to-chk=[0-9/]*' \
   | tail -1 | sed 's/^/chk=/'
 timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
+# progression RÉELLE (indépendante du compteur de session rsync, remis à 0 à chaque
+# redémarrage) : octets présents à l'arrivée / volume de la source. df, pas du : instantané.
+timeout 3 df -B1 --output=used "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/utilise=/'
+timeout 5 df -B1 --output=used "$source" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/total_reel=/'
 echo "hote=$(findmnt -n -o SOURCE "$cible" 2>/dev/null | cut -d: -f1)"
 echo "chemin=$(cat /run/avy-media.path 2>/dev/null)"
 """
@@ -107,7 +111,8 @@ def parse_sonde(sortie):
     out = {"etat": "inconnu", "resultat": "", "debut": "", "lignes": [],
            "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
            "analyse": None,   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
-           "hote": "", "chemin": ""}   # 2026-08-30 : serveur NFS réel + vlan25/mgmt
+           "hote": "", "chemin": "",   # 2026-08-30 : serveur NFS réel + vlan25/mgmt
+           "utilise": None, "total_reel": None}   # 2026-08-31 : progression RÉELLE (df)
     for ligne in (sortie or "").splitlines():
         cle, _, val = ligne.partition("=")
         val = val.strip()
@@ -121,6 +126,10 @@ def parse_sonde(sortie):
             out["lignes"].append(val)
         elif cle == "libre":
             out["libre"] = int(val) if val.isdigit() else None
+        elif cle == "utilise":
+            out["utilise"] = int(val) if val.isdigit() else None
+        elif cle == "total_reel":
+            out["total_reel"] = int(val) if val.isdigit() else None
         elif cle == "hote":
             out["hote"] = val
         elif cle == "chemin":
@@ -139,19 +148,35 @@ def parse_sonde(sortie):
                 out["pct"] = int(m.group(2))
                 out["debit"] = m.group(3)
                 out["eta"] = eta_secondes(m.group(4))
-    reste = None
+    # ----- progression RÉELLE (2026-08-31, demande Nico « les vraies données ») -----
+    # Le compteur de session de rsync (out["octets"]) repart de ZÉRO à chaque redémarrage
+    # du service : il affichait « 11,7 Go » alors que 715 Go étaient déjà à l'arrivée.
+    # La vérité, c'est ce qui est RÉELLEMENT présent sur la cible (df used) rapporté au
+    # volume de la source (df used aussi) — deux mesures instantanées, insensibles aux
+    # redémarrages. Le débit reste celui, INSTANTANÉ, de la ligne rsync.
     d = debit_octets(out["debit"])
-    if out["eta"] is not None and d:
-        reste = out["eta"] * d
-    out["reste"] = reste
-    if reste is not None and out["octets"]:
-        total = out["octets"] + reste
-        out["pct_fin"] = out["octets"] / total * 100 if total else None
-        out["total"] = total
+    u, t = out.get("utilise"), out.get("total_reel")
+    if u is not None and t:
+        out["transfere_reel"] = u
+        out["total"] = t
+        out["pct_fin"] = min(100.0, u / t * 100) if t else None
+        out["reste"] = max(0, t - u)
+        out["eta"] = int(out["reste"] / d) if d and out["reste"] else None
+        # avec une base réelle (df), le % ne dépend plus du scan incrémental de rsync :
+        # on neutralise le caveat « provisoire / du volume analysé »
+        out["analyse"] = False
     else:
-        # repli sur le % ENTIER de rsync : moins précis, mais c'est mieux que rien
-        out["pct_fin"] = float(out["pct"]) if out["pct"] is not None else None
-        out["total"] = None
+        # repli (df indisponible) sur l'ancienne estimation par le compteur de session
+        out["transfere_reel"] = out["octets"]
+        reste = out["eta"] * d if (out["eta"] is not None and d) else None
+        out["reste"] = reste
+        if reste is not None and out["octets"]:
+            total = out["octets"] + reste
+            out["pct_fin"] = out["octets"] / total * 100 if total else None
+            out["total"] = total
+        else:
+            out["pct_fin"] = float(out["pct"]) if out["pct"] is not None else None
+            out["total"] = None
     return out
 
 
@@ -190,8 +215,12 @@ def embed_transfert(etat, cfg):
                 value=f"≈ {cfg.transfert_total_hint} — tout part ; rsync analyse encore "
                       "l'arborescence, l'estimation s'affine (le déjà-copié est sauté, "
                       "pas renvoyé)", inline=False)
-    if etat["octets"] is not None:
-        emb.add_field(name="Transféré", value=fmt.humanize_bytes(etat["octets"]))
+    # « Transféré » = octets RÉELLEMENT présents à l'arrivée (df), pas le compteur de
+    # session rsync qui repart de 0 à chaque redémarrage (Nico 2026-08-31)
+    transf = etat.get("transfere_reel")
+    transf = transf if transf is not None else etat.get("octets")
+    if transf is not None:
+        emb.add_field(name="Transféré", value=fmt.humanize_bytes(transf))
     if etat["debit"]:
         emb.add_field(name="Débit", value=re.sub(r"([\d.,]+)([KMGTP]?B/s)", r"\1 \2",
                                                  etat["debit"]))
@@ -428,7 +457,8 @@ class Transfert(commands.Cog):
     async def sonde(self):
         cmd = SONDE % {"unite": self.cfg.transfert_unit,
                        "journal": self.cfg.transfert_log,
-                       "cible": self.cfg.transfert_dest}
+                       "cible": self.cfg.transfert_dest,
+                       "source": self.cfg.transfert_source}
         return parse_sonde(await self._run(cmd))
 
     @tasks.loop(seconds=60)

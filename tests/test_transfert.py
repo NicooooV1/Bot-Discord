@@ -245,5 +245,39 @@ class TestBouton(unittest.TestCase):
         run(body())
 
 
+class TestSondeProgressionReelle(unittest.TestCase):
+    """La progression affichée doit venir des octets RÉELS à l'arrivée (df), pas du
+    compteur de session rsync qui repart de 0 à chaque redémarrage (Nico 2026-08-31)."""
+
+    SORTIE = ("etat=activating\nresultat=\n"
+              "progres=  11.76G   0%   44.88MB/s    0:04:09\n"
+              "chk=ir-chk=1010/1238\n"
+              "libre=4700000000000\nutilise=767000000000\n"
+              "total_reel=4180000000000\nhote=10.0.10.10\nchemin=mgmt\n")
+
+    def test_reel_prime_sur_le_compteur_de_session(self):
+        o = T.parse_sonde(self.SORTIE)
+        # 767 Go réels, PAS les 12,6 Go du compteur rsync
+        self.assertEqual(o["transfere_reel"], 767_000_000_000)
+        self.assertAlmostEqual(o["pct_fin"], 767 / 4180 * 100, places=1)
+        self.assertEqual(o["total"], 4_180_000_000_000)
+        self.assertEqual(o["reste"], 4_180_000_000_000 - 767_000_000_000)
+        # base réelle : le % ne dépend plus du scan incrémental (pas de « provisoire »)
+        self.assertIs(o["analyse"], False)
+        # l'embed montre le RÉEL, pas octets
+        emb = T.embed_transfert(o, FakeCfg())
+        transf = next(f.value for f in emb.fields if f.name == "Transféré")
+        self.assertNotIn("12", transf)                    # pas 12,6 Gio
+        self.assertTrue(any(f.name.startswith("Progression") for f in emb.fields))
+
+    def test_repli_si_df_indisponible(self):
+        # sans utilise/total_reel (df en échec), on retombe sur l'ancienne estimation
+        sortie = ("etat=activating\n"
+                  "progres=  50.0G   0%   40.00MB/s    1:00:00\nchk=to-chk=10/100\n")
+        o = T.parse_sonde(sortie)
+        self.assertEqual(o["transfere_reel"], o["octets"])
+        self.assertIsNotNone(o["octets"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -972,10 +972,15 @@ class TestSondeTransfert(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
             f.write("         16.33G   0%   28.62MB/s   23:04:46  \r"
                     "         16.34G   0%   12.80MB/s    0:20:17 (xfr#3, ir-chk=1022/1251)\r")
-        cmd = self.t.SONDE % {"unite": "inexistant.service", "journal": f.name, "cible": "/"}
+        cmd = self.t.SONDE % {"unite": "inexistant.service", "journal": f.name,
+                              "cible": "/", "source": "/"}
         sortie = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
         e = self.t.parse_sonde(sortie)
-        self.assertEqual(e["eta"], 23 * 3600 + 4 * 60 + 46, sortie)
+        # la ligne de fin « (xfr#N …) » (débit 12.80MB/s, ETA fantaisiste) doit être
+        # ignorée au profit de la vraie ligne de progression (28.62MB/s) — grep -v 'xfr#'.
+        # (l'ETA final, lui, est désormais recalculé sur la progression RÉELLE en df.)
+        self.assertEqual(e["debit"], "28.62MB/s", sortie)
+        self.assertAlmostEqual(e["octets"] / 2**30, 16.33, places=2)
         # bouton « Rafraîchir » : vue persistante, porte justifiée, custom_id stable
         v = self.t.TransfertRefreshView
         import asyncio
