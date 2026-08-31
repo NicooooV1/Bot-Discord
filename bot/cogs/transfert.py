@@ -241,17 +241,30 @@ class TransfertRefreshView(GatedView):
     @discord.ui.button(label="Rafraîchir", emoji="🔄", style=discord.ButtonStyle.secondary,
                        custom_id="transfert:rafraichir")
     async def rafraichir(self, interaction, _button):
+        """Rejoue la sonde et réécrit l'embed EN PLACE, sans rien poster (Nico 2026-08-31 :
+        « enlève ce message inutile "relevé rafraîchi" »). Un message éphémère n'apparaît
+        QUE si le relevé échoue — le succès se voit sur l'embed lui-même, pas dans un accusé.
+
+        `defer()` sans `thinking` = accusé SILENCIEUX (deferred update) : il ferme
+        l'interaction sans « … réfléchit » ni message, et n'impose aucun followup. C'est
+        ce qui permet un succès muet ; l'ancien `defer(thinking=True)` obligeait à
+        répondre, d'où le « ✅ Relevé rafraîchi » superflu."""
         cog = self.cog
+        await interaction.response.defer()
         depuis = time.time() - cog._dernier_releve
         if depuis < self.RAFRAICHIR_MIN_SEC:
-            await interaction.response.send_message(
-                f"⏱️ Déjà relevé il y a {int(depuis)} s — l'embed est à jour.", ephemeral=True)
+            # anti-rafale : l'embed a été relevé il y a moins de RAFRAICHIR_MIN_SEC,
+            # il est déjà à jour — on ne re-sonde pas et on ne dit rien.
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok = await cog.relever()
-        await interaction.followup.send(
-            "✅ Relevé rafraîchi." if ok else "⚠️ Hôte injoignable pour l'instant, "
-            "l'embed n'a pas été modifié.", ephemeral=True)
+        try:
+            ok = await cog.relever()
+        except Exception:  # noqa: BLE001 — un relevé raté ne doit pas « échouer l'interaction »
+            log.warning("bouton Rafraîchir : relevé en échec", exc_info=True)
+            ok = False
+        if not ok:
+            await interaction.followup.send(
+                "⚠️ Hôte injoignable pour l'instant, l'embed n'a pas été modifié.",
+                ephemeral=True)
 
 
 class Transfert(commands.Cog):
@@ -440,12 +453,23 @@ class Transfert(commands.Cog):
             await self._appliquer(guild, etat)
             return True
 
+    # Relevés INACTIFS consécutifs avant de DÉCLARER l'arrêt (message + compte à rebours
+    # de suppression). Un `systemctl restart` — ou tout flap systemd — laisse le service
+    # quelques secondes hors des ETATS_ACTIFS : sans ce filtre, chaque redémarrage pour
+    # changer un réglage (ex. BWLIMIT le 2026-08-31) postait aussitôt un « 🔴 arrêté …
+    # salon supprimé dans 1h » démenti par la reprise. Relevé à 60 s : 2 = ~2 min de grâce.
+    INACTIFS_AVANT_FIN = 2
+
     async def _appliquer(self, guild, etat):
         actif = etat["etat"] in ETATS_ACTIFS
         if actif:
+            self._etat["inactif_n"] = 0
             self._etat.pop("fin_ts", None)
             ch = await self._salon(guild, creer=True)
             if ch is not None:
+                # reprise après un arrêt DÉJÀ annoncé (flap) : retirer le message
+                # « arrêté … » devenu faux, sinon il traîne sous un embed redevenu vert
+                await self._retirer_annonce_fin(ch)
                 await self._publier(ch, embed_transfert(etat, self.cfg))
             self._save()
             return
@@ -460,6 +484,14 @@ class Transfert(commands.Cog):
             return
         fin = self._etat.get("fin_ts")
         if not fin:
+            # anti-rebond : n'annoncer l'arrêt qu'après INACTIFS_AVANT_FIN relevés
+            # inactifs d'affilée. En deçà, on ne touche NI à l'embed (pas de clignotement
+            # vert→rouge→vert lors d'un simple redémarrage) NI au salon.
+            n = self._etat.get("inactif_n", 0) + 1
+            self._etat["inactif_n"] = n
+            self._save()
+            if n < self.INACTIFS_AVANT_FIN:
+                return
             self._etat["fin_ts"] = time.time()
             self._save()
             await self._publier(ch, embed_transfert(etat, self.cfg))
@@ -473,15 +505,34 @@ class Transfert(commands.Cog):
                 else:
                     entete = (f"🔴 **Transfert arrêté** "
                               f"({etat.get('resultat') or 'état inconnu'})")
-                await ch.send(
+                msg = await ch.send(
                     f"{entete} — ce salon temporaire sera supprimé dans "
                     f"{fmt.humanize_duration(garde * 60)}.",
                     allowed_mentions=discord.AllowedMentions.none())
+                # mémorisé pour pouvoir le RETIRER si le transfert repart (cf. actif ci-dessus)
+                self._etat["stop_msg_id"] = msg.id
+                self._save()
             except discord.HTTPException:
                 log.debug("message de fin non publié", exc_info=True)
             return
         if time.time() - fin >= self.cfg.transfert_keep_min * 60:
             await self._supprimer(guild)
+
+    async def _retirer_annonce_fin(self, ch):
+        """Supprime le message « Transfert arrêté … salon supprimé dans … » quand l'arrêt
+        s'est révélé transitoire (le transfert est reparti). Sans ça, un redémarrage pour
+        changer un réglage laissait cette annonce sous un embed redevenu vert
+        (constat Nico 2026-08-31)."""
+        mid = self._etat.pop("stop_msg_id", None)
+        if not mid:
+            return
+        try:
+            msg = await ch.fetch_message(mid)
+            await msg.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            log.debug("retrait de l'annonce d'arrêt échoué", exc_info=True)
 
     @poll.before_loop
     async def _before(self):
