@@ -63,10 +63,13 @@ def _num(v, unit, scale=1, fmt_spec=".0f"):
 def hyperviseur(node, data, cluster, guests, sfx):
     """Même gabarit que NodeChannel.build_node (R820) pour les champs communs
     (titre/description/Uptime/CPU/Charge/RAM/Swap/Disque //footer) : labels et
-    ordre identiques — seuls les champs propres à Aveyron (PSI/Quorum/Tunnel WG/
-    Dernières tâches) et ceux propres au R820 (Stockages/IPMI/RAID/SMART/PBS, qui
-    n'existent pas sans Influx/telegraf côté Aveyron) diffèrent, par nécessité et
-    pas par oubli. Harmonisation demandée par Nico 2026-07-18.
+    ordre identiques. Densifié le 2026-08-31 (demande Nico : « beaucoup plus
+    détaillé pour chacun ») avec tout ce que l'API PVE expose en lecture seule :
+    amorçage, KSM, IO-wait + débits réseau (RRD 1 h), services systèmes, MAJ APT,
+    résumé des stockages et des disques, CPU/RAM par invité. Les champs propres au
+    R820 (IPMI/RAID/PBS) restent absents par nécessité — pas d'Influx/telegraf côté
+    Aveyron — et le détail complet des stockages/disques/sauvegardes vit toujours
+    dans les salons dédiés du nœud.
 
     `cluster` = instantané `Avy._cluster_collect` du cycle, `guests` = [(nom, info)]
     des invités du nœud (cf. `Avy._node_guests`, vide si la carte est illisible),
@@ -114,6 +117,16 @@ def hyperviseur(node, data, cluster, guests, sfx):
     kern = kern if isinstance(kern, str) else (kern[0] if kern else "")
     if kern:
         emb.add_field(name="Noyau", value=kern)
+    bi = st.get("boot-info") or {}
+    if bi.get("mode"):
+        mode = "UEFI" if bi["mode"] == "efi" else str(bi["mode"]).upper()
+        sb = bi.get("secureboot")
+        emb.add_field(name="Amorçage",
+                      value=mode + ("" if sb is None
+                                    else f" · secure boot {'on' if sb else 'off'}"))
+    ksm = (st.get("ksm") or {}).get("shared")
+    if ksm:
+        emb.add_field(name="KSM", value=f"{fmt.humanize_bytes(ksm)} partagés")
     last = data.get("rrd_last") or {}
     pc, pi = last.get("pressurecpusome"), last.get("pressureiosome")
     if pc is not None or pi is not None:
@@ -121,6 +134,20 @@ def hyperviseur(node, data, cluster, guests, sfx):
         # « 0 % » inventé se lit comme une mesure réelle (2026-08-20)
         emb.add_field(name="⚠️ Pression" if max(pc or 0, pi or 0) >= 5 else "Pression",
                       value=f"CPU {_num(pc, '%')} · IO {_num(pi, '%')}")
+    # activité RRD sur l'heure : IO-wait (fraction 0-1, comme `cpu`) + débits réseau
+    # (octets/s) — résumé (dernier, max, moyenne) préparé par Avy._collect
+    rh = data.get("rrd_hour") or {}
+    bouts = []
+    io = rh.get("iowait")
+    if io:
+        bouts.append(f"IO-wait {_num(io[0], '%', scale=100)} "
+                     f"(max 1 h {_num(io[1], '%', scale=100)})")
+    ni, no = rh.get("netin"), rh.get("netout")
+    if ni or no:
+        bouts.append("réseau ↓ " + (fmt.humanize_bytes(ni[0]) + "/s" if ni else "?")
+                     + " · ↑ " + (fmt.humanize_bytes(no[0]) + "/s" if no else "?"))
+    if bouts:
+        emb.add_field(name="Activité (1 h)", value=" · ".join(bouts))
     cl = cluster or {}
     if cl.get("quorate") is not None:
         online = cl.get("online") or {}
@@ -144,11 +171,105 @@ def hyperviseur(node, data, cluster, guests, sfx):
         if cert_days < CERT_ALERT_DAYS:
             worst = max(worst, 90)
 
+    # services systèmes du nœud : les unités masquées/absentes ne comptent pas (un
+    # rsyslog « not-found » sur Bookworm n'est pas une panne) — un service réellement
+    # arrêté, lui, ne se voit NULLE PART ailleurs sans syslog côté Aveyron
+    svcs = data.get("services")
+    if svcs is not None:
+        actifs = [s for s in svcs
+                  if str(s.get("unit-state") or "") not in ("masked", "not-found")]
+        morts = sorted(str(s.get("name") or s.get("service") or "?")
+                       for s in actifs if str(s.get("state")) != "running")
+        if morts:
+            emb.add_field(name="⚙️ Services",
+                          value=(f"⚠️ arrêté(s) : {', '.join(morts[:6])}"
+                                 + (f" +{len(morts) - 6}" if len(morts) > 6 else "")
+                                 + f" · {len(actifs) - len(morts)}/{len(actifs)} actifs"))
+            worst = max(worst, 70)
+        elif actifs:
+            emb.add_field(name="⚙️ Services", value=f"🟢 {len(actifs)}/{len(actifs)} actifs")
+    ups = data.get("updates")
+    if ups is not None:
+        if ups:
+            noms = sorted(str(p.get("Package") or p.get("Title") or "?") for p in ups)
+            val = (f"📦 **{len(ups)}** paquet(s) en attente : "
+                   + ", ".join(f"`{n}`" for n in noms[:5])
+                   + (f" +{len(noms) - 5}" if len(noms) > 5 else ""))
+        else:
+            val = "✅ système à jour"
+        emb.add_field(name="MAJ APT", value=val[:1024])
+
+    # résumé des stockages : le détail (barres) reste dans #stockage-<nœud>, mais leur
+    # remplissage pèse ici aussi sur la couleur, comme sur le R820
+    stos = data.get("storages")
+    if stos is None:
+        emb.add_field(name="💽 Stockages",
+                      value="⚠️ illisibles ce cycle — données incomplètes", inline=False)
+    elif stos:
+        lines = []
+        for s in sorted(stos, key=lambda x: x.get("storage", ""))[:8]:
+            tot = s.get("total") or 0
+            if not s.get("active"):
+                lines.append(f"⚪ `{s.get('storage')}` inactif")
+            elif tot:
+                pct = (s.get("used") or 0) / tot * 100
+                worst = max(worst, pct)
+                flag = ("🔴" if pct >= STO_ALERT_PCT
+                        else "🟠" if pct >= STO_CLEAR_PCT else "🟢")
+                lines.append(f"{flag} `{s.get('storage')}` — "
+                             f"{fmt.pct_of(s.get('used'), tot)}")
+            else:
+                lines.append(f"⚪ `{s.get('storage')}` — taille inconnue")
+        if len(stos) > 8:
+            lines.append(f"… +{len(stos) - 8} autre(s), détail dans #stockage")
+        emb.add_field(name=f"💽 Stockages ({len(stos)})",
+                      value="\n".join(lines)[:1024], inline=False)
+
+    # résumé des disques physiques (santé SMART, température, usure) — détail complet
+    # dans #materiel-<nœud>
+    disks = data.get("disks") or []
+    if disks:
+        lines = []
+        for d in disks[:8]:
+            health = str(d.get("health") or "?")
+            ok = health.upper() in ("PASSED", "OK")
+            unk = health.upper() in ("UNKNOWN", "?", "")
+            mark = "🟢" if ok else ("⚪" if unk else "🔴")
+            if not ok and not unk:
+                worst = max(worst, 95)
+            bouts = [f"{mark} `{d.get('devpath')}`", (d.get("model") or "?")[:24]]
+            if d.get("size"):
+                bouts.append(fmt.humanize_bytes(d["size"]))
+            if d.get("temp") is not None:
+                bouts.append(("🔥 " if d["temp"] >= DISK_TEMP_ALERT else "")
+                             + f"{d['temp']} °C")
+            if str(d.get("wearout") or "").isdigit():
+                w = int(d["wearout"])
+                bouts.append(("⚠️ " if w <= WEAROUT_ALERT else "")
+                             + f"{w} % de vie restante")
+            lines.append(" · ".join(bouts))
+        if len(disks) > 8:
+            lines.append(f"… +{len(disks) - 8} autre(s), détail dans #materiel")
+        emb.add_field(name=f"💿 Disques ({len(disks)})",
+                      value="\n".join(lines)[:1024], inline=False)
+
     if guests:
-        lines = [f"{fmt.status_emoji(i.get('status') == 'running')} "
-                 f"**{n.removesuffix(sfx)}** "
-                 f"({(i.get('vmid') or 0) % 1_000_000})"
-                 for n, i in guests]
+        lines = []
+        for n, i in guests:
+            bouts = [f"{fmt.status_emoji(i.get('status') == 'running')} "
+                     f"**{n.removesuffix(sfx)}** "
+                     f"({(i.get('vmid') or 0) % 1_000_000})"]
+            # métriques /cluster/resources déjà en mémoire : CPU (fraction), RAM,
+            # uptime — seulement pour les invités qui tournent
+            if i.get("status") == "running":
+                if i.get("cpu") is not None:
+                    bouts.append(f"CPU {_num(i.get('cpu'), '%', scale=100)}")
+                if i.get("maxmem"):
+                    rampct = (i.get("mem") or 0) / i["maxmem"]
+                    bouts.append(f"RAM {_num(rampct, '%', scale=100)}")
+                if i.get("uptime"):
+                    bouts.append(f"up {fmt.humanize_duration(i['uptime'])}")
+            lines.append(" · ".join(bouts))
         up = sum(1 for _, i in guests if i.get("status") == "running")
         emb.add_field(name=f"📦 VM/conteneurs — {up}/{len(guests)} up",
                       value="\n".join(lines)[:1024], inline=False)
@@ -158,14 +279,18 @@ def hyperviseur(node, data, cluster, guests, sfx):
         emb.add_field(name="Dernières tâches",
                       value="⚠️ tâches du nœud illisibles ce cycle — données incomplètes",
                       inline=False)
-    recents = [t for t in (data.get("tasks") or []) if t.get("endtime")][:3]
+    recents = [t for t in (data.get("tasks") or []) if t.get("endtime")][:5]
     if recents:
         lines = []
         for t in recents:
             ok = str(t.get("status", "")) == "OK"
             when = datetime.datetime.fromtimestamp(t["endtime"]).strftime("%d/%m %H:%M")
+            duree = fmt.humanize_duration(int(t["endtime"])
+                                          - int(t.get("starttime") or t["endtime"]))
+            qui = str(t.get("user") or "").split("@")[0]
             lines.append(f"{'✅' if ok else '⚠️'} `{t.get('type')}` "
-                         f"{t.get('id') or ''} · {when}")
+                         f"{t.get('id') or ''} · {when} · {duree}"
+                         + (f" · {qui}" if qui else ""))
         emb.add_field(name="Dernières tâches", value="\n".join(lines)[:1024],
                       inline=False)
     emb.color = fmt.health_color(worst)

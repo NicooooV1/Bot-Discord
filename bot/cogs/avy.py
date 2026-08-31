@@ -66,6 +66,10 @@ class Avy(commands.Cog):
         self.enabled = getattr(bot.cfg, "avy_enabled", False)
         self._cluster = {}    # instantané cluster du cycle (quorum, latence, jobs)
         self._cycle_guests = None   # carte des invités du cycle (cf. _node_guests)
+        # nœuds dont la liste des MAJ APT est refusée (403 : le GET exige Sys.Modify sur
+        # certaines versions PVE, que le jeton lecture seule n'a pas). Mémorisé pour ne
+        # pas repayer un refus par nœud et par cycle — l'embed omet alors le champ.
+        self._updates_off = set()
 
     async def cog_load(self):
         self.bot.add_view(AvyNodeView(self))
@@ -197,7 +201,8 @@ class Avy(commands.Cog):
         # rendu (« illisibles ce cycle ») ; les alertes, elles, sautent simplement le
         # bloc — même convention que avy_metrics._backups (2026-08-20).
         out = {"status": None, "storages": None, "tasks": None,
-               "rrd_last": {}, "disks": []}
+               "rrd_last": {}, "rrd_hour": {}, "disks": [],
+               "services": None, "updates": None}
         out["status"] = pve.avy_node_status(node)          # lève si nœud injoignable
         try:
             out["storages"] = pve.avy_node_storages(node) or []
@@ -209,12 +214,36 @@ class Avy(commands.Cog):
         except Exception:
             log.warning("supervision Aveyron: tâches du nœud %s illisibles", node,
                         exc_info=True)
-        # dernier point RRD du nœud : pression PSI CPU/IO (invisible dans status)
+        # RRD du nœud : dernier point (pression PSI, invisible dans status) + résumé
+        # horaire (IO-wait, débits réseau) pour le champ « Activité (1 h) » de l'embed
         try:
             rows = pve.avy_node_rrd(node, "hour") or []
             out["rrd_last"] = rows[-1] if rows else {}
+            for k in ("iowait", "netin", "netout"):
+                vals = [r[k] for r in rows if isinstance(r.get(k), (int, float))]
+                if vals:
+                    # (dernier, max, moyenne) — l'embed choisit quoi montrer
+                    out["rrd_hour"][k] = (vals[-1], max(vals), sum(vals) / len(vals))
         except Exception:
             pass
+        # services systèmes (pveproxy, corosync…) : un service PVE arrêté ne se voit
+        # nulle part ailleurs qu'ici (pas de Loki/telegraf côté Aveyron)
+        try:
+            out["services"] = pve.avy_node_services(node) or []
+        except Exception:
+            log.warning("supervision Aveyron: services du nœud %s illisibles", node,
+                        exc_info=True)
+        # MAJ APT en attente — GET parfois réservé à Sys.Modify : sur refus explicite on
+        # n'insiste JAMAIS plus (cf. __init__), sur panne passagère on retentera
+        if node not in self._updates_off:
+            try:
+                out["updates"] = pve.avy_node_updates(node) or []
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).lower()
+                if "403" in msg or "permission" in msg:
+                    self._updates_off.add(node)
+                    log.info("supervision Aveyron: MAJ APT de %s refusées au jeton "
+                             "lecture seule — champ désactivé jusqu'au redémarrage", node)
         # disques physiques + température SMART (2-3 disques par nœud)
         try:
             for d in pve.avy_disks(node) or []:

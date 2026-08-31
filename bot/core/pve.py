@@ -383,6 +383,17 @@ class _RemoteCluster:
             kw["source"] = source
         return self._node_guard(node, self._ro.nodes(node).tasks.get, **kw)
 
+    def node_services(self, node):
+        """Services systèmes du nœud (pveproxy, corosync…) — Sys.Audit suffit."""
+        return self._node_guard(node, self._ro.nodes(node).services.get)
+
+    def node_updates(self, node):
+        """Paquets APT en attente (liste déjà en cache côté nœud, lecture légère).
+        ⚠️ Ce GET exige Sys.Modify sur certaines versions PVE : un jeton en lecture
+        seule peut se voir refuser — l'appelant (Avy._collect) neutralise alors la
+        lecture pour de bon au lieu de repayer un 403 par cycle."""
+        return self._node_guard(node, self._ro.nodes(node).apt.update.get)
+
     def backup_node(self, node, mode, notes, exclude=""):
         """vzdump all=1 du nœud (bouton 💾 du salon hyperviseur AVY-*)."""
         kw = {"all": 1, "storage": self.storage, "mode": mode}
@@ -664,6 +675,12 @@ class Pve:
 
     def avy_node_tasks(self, node, limit=20, source=None):
         return self._avy_read(self._avy.node_tasks, node, limit=limit, source=source)
+
+    def avy_node_services(self, node):
+        return self._avy_read(self._avy.node_services, node)
+
+    def avy_node_updates(self, node):
+        return self._avy_read(self._avy.node_updates, node)
 
     def avy_pbs_content(self):
         """Contenu COMPLET du stockage de sauvegarde Aveyron (l'énumération CIFS prend
