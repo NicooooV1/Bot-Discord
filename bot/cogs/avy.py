@@ -771,19 +771,40 @@ class Avy(commands.Cog):
 
     async def post_rapports(self):
         """Publie le rapport quotidien de CHAQUE nœud dans son #rapports-<nœud>.
-        Renvoie le nombre de rapports réellement envoyés (0 = rien publié : c'est ce
-        que Reports regarde pour ne pas marquer la journée comme faite)."""
+        Renvoie un nombre non nul SEULEMENT quand tous les nœuds attendus ont reçu
+        leur rapport DU JOUR (c'est ce que Reports regarde pour marquer la journée
+        faite et cesser de retenter).
+
+        ⚠️ MÉMOIRE PAR NŒUD, PERSISTÉE (2026-08-31). L'ancienne version renvoyait 0
+        tant que TOUT n'était pas passé et republiait tout à chaque retentative :
+        « au pire un doublon, préférable à un trou » — pensé pour une panne courte.
+        Avec `llm` injoignable des heures durant, le rattrapage (toutes les 5 min,
+        borné à 12 essais MAIS le compteur, en mémoire, repart à chaque redémarrage
+        du bot) a inondé #rapports-nas et #rapports-ms01 de doublons (constat Nico
+        2026-08-31 : « un rapport quotidien toutes les 10 minutes »). On mémorise
+        donc dans state (survit aux redémarrages) quels nœuds ont DÉJÀ leur rapport
+        du jour : une retentative ne vise plus que les manquants — zéro doublon, et
+        un nœud qui revient dans la journée reçoit quand même le sien."""
         if not self.bot.pve.avy_enabled or not self._sup():
             return 0
-        envoyes, attendus = 0, 0
+        deja = dict(self.bot.state.get("avy_rapports", {}) or {})
+        today = datetime.date.today().isoformat()
+        if deja.get("day") != today:
+            deja = {"day": today, "sent": []}
+        sent = set(deja.get("sent") or [])
+        envoyes, attendus = 0, []
         for node in await asyncio.to_thread(self.bot.pve.avy_nodes):
             cid = self._sup().get(node, {}).get("rapports")
             ch = self.bot.get_channel(cid) if cid else None
             if ch is None:
+                # même sémantique qu'avant : un salon introuvable ne compte pas comme
+                # attendu (sinon il bloquerait la complétion toute la journée)
                 log.warning("rapport quotidien de %s non publié : salon #rapports-%s "
                             "introuvable (id=%s)", node, node, cid)
                 continue
-            attendus += 1
+            attendus.append(node)
+            if node in sent:
+                continue                      # déjà publié aujourd'hui : pas de doublon
             try:
                 emb = await self.build_rapport(node)
             except Exception:
@@ -791,15 +812,17 @@ class Avy(commands.Cog):
                 continue
             try:
                 await ch.send(embed=emb)
+                sent.add(node)
                 envoyes += 1
             except discord.HTTPException:
                 log.warning("rapport quotidien de %s non publié", node, exc_info=True)
-        # COMPLET seulement : un succès partiel (nas en échec, ms01/llm publiés)
-        # marquait la journée « faite » et le nœud raté n'était JAMAIS retenté
-        # (campagne 2026-08-18 : rapport nas de 08:00 perdu). En rendant 0 tant que
-        # tout n'est pas passé, le rattrapage — borné à 12 essais — retente ; les
-        # nœuds déjà servis recevront au pire un doublon, préférable à un trou.
-        return envoyes if (attendus and envoyes == attendus) else 0
+        if sorted(sent) != (deja.get("sent") or []):
+            deja["sent"] = sorted(sent)
+            self.bot.state.set("avy_rapports", deja)
+        complet = attendus and all(n in sent for n in attendus)
+        # complet sans envoi ce tour-ci (tout était déjà parti avant un redémarrage) :
+        # renvoyer quand même non nul, sinon Reports retenterait pour rien
+        return (envoyes or 1) if complet else 0
 
     @tasks.loop(minutes=5)
     async def refresh(self):
