@@ -271,12 +271,23 @@ class TestSondeProgressionReelle(unittest.TestCase):
         self.assertTrue(any(f.name.startswith("Progression") for f in emb.fields))
 
     def test_repli_si_df_indisponible(self):
-        # sans utilise/total_reel (df en échec), on retombe sur l'ancienne estimation
+        # sans utilise/total_reel (df en échec) ET sans cache, on retombe sur l'ancienne
+        # estimation par le compteur de session rsync
         sortie = ("etat=activating\n"
                   "progres=  50.0G   0%   40.00MB/s    1:00:00\nchk=to-chk=10/100\n")
         o = T.parse_sonde(sortie)
         self.assertEqual(o["transfere_reel"], o["octets"])
         self.assertIsNotNone(o["octets"])
+
+    def test_cache_lisse_un_df_qui_expire(self):
+        # df cible NFS expiré ce cycle (pas de utilise) : on garde la dernière progression
+        # RÉELLE via le cache plutôt que d'osciller vers le compteur de session rsync
+        sortie = ("etat=activating\n"
+                  "progres=  21.9G   0%   50.00MB/s    2:00:00\n"
+                  "total_reel=4180000000000\n")     # source locale OK, cible NFS expirée
+        o = T.parse_sonde(sortie, reel_cache=(767_000_000_000, 4_180_000_000_000))
+        self.assertEqual(o["transfere_reel"], 767_000_000_000)   # pas 21.9G
+        self.assertAlmostEqual(o["pct_fin"], 767 / 4180 * 100, places=1)
 
 
 if __name__ == "__main__":

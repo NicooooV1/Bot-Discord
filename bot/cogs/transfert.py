@@ -56,7 +56,7 @@ tail -c 20000 "$journal" 2>/dev/null | tr '\r' '\n' | grep -o 'ir-chk=[0-9/]*\|t
 timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/libre=/'
 # progression RÉELLE (indépendante du compteur de session rsync, remis à 0 à chaque
 # redémarrage) : octets présents à l'arrivée / volume de la source. df, pas du : instantané.
-timeout 3 df -B1 --output=used "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/utilise=/'
+timeout 6 df -B1 --output=used "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/utilise=/'
 timeout 5 df -B1 --output=used "$source" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/total_reel=/'
 echo "hote=$(findmnt -n -o SOURCE "$cible" 2>/dev/null | cut -d: -f1)"
 echo "chemin=$(cat /run/avy-media.path 2>/dev/null)"
@@ -105,9 +105,15 @@ def debit_octets(txt):
         return None
 
 
-def parse_sonde(sortie):
+def parse_sonde(sortie, reel_cache=None):
     """Sortie brute de SONDE -> dict. Tolère les champs manquants (journal vide,
-    montage absent) : c'est justement pendant les ennuis qu'on regarde ce salon."""
+    montage absent) : c'est justement pendant les ennuis qu'on regarde ce salon.
+
+    `reel_cache` = dernier (utilise, total_reel) connu. Le `df` sur la cible est un
+    montage NFS : pendant un creux du lien il dépasse son `timeout` et revient vide,
+    ce qui faisait OSCILLER l'affichage entre la vraie progression (717 Go) et le
+    compteur de session rsync (21 Go). Quand la mesure du cycle manque, on repart de
+    ce cache plutôt que du compteur (2026-08-31)."""
     out = {"etat": "inconnu", "resultat": "", "debut": "", "lignes": [],
            "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
            "analyse": None,   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
@@ -155,6 +161,15 @@ def parse_sonde(sortie):
     # volume de la source (df used aussi) — deux mesures instantanées, insensibles aux
     # redémarrages. Le débit reste celui, INSTANTANÉ, de la ligne rsync.
     d = debit_octets(out["debit"])
+    # df de la cible NFS expiré ce cycle : garder la dernière progression réelle connue
+    # au lieu de retomber sur le compteur de session rsync (source /mnt/media est locale,
+    # elle expire rarement — mais on complète les deux au besoin)
+    if reel_cache:
+        cu, ct = reel_cache
+        if out["utilise"] is None:
+            out["utilise"] = cu
+        if not out["total_reel"]:
+            out["total_reel"] = ct
     u, t = out.get("utilise"), out.get("total_reel")
     if u is not None and t:
         out["transfere_reel"] = u
@@ -307,6 +322,7 @@ class Transfert(commands.Cog):
         self._etat = dict(bot.state.get("transfert", {}) or {})
         self._ssh = None       # connexion SSH RÉUTILISÉE entre les relevés (cf. _run)
         self._dernier_releve = 0.0
+        self._reel_cache = None   # dernier (utilise, total_reel) connu (df cible NFS lisse)
         self._verrou = asyncio.Lock()   # un seul relevé à la fois (boucle + bouton)
         self._view = TransfertRefreshView(self)
         if self.enabled:
@@ -459,7 +475,11 @@ class Transfert(commands.Cog):
                        "journal": self.cfg.transfert_log,
                        "cible": self.cfg.transfert_dest,
                        "source": self.cfg.transfert_source}
-        return parse_sonde(await self._run(cmd))
+        etat = parse_sonde(await self._run(cmd), reel_cache=self._reel_cache)
+        # mémorise la dernière progression RÉELLE (df réussi) pour lisser un df qui expire
+        if etat.get("utilise") is not None and etat.get("total_reel"):
+            self._reel_cache = (etat["utilise"], etat["total_reel"])
+        return etat
 
     @tasks.loop(seconds=60)
     async def poll(self):
