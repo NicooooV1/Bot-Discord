@@ -290,5 +290,39 @@ class TestSondeProgressionReelle(unittest.TestCase):
         self.assertAlmostEqual(o["pct_fin"], 767 / 4180 * 100, places=1)
 
 
+class TestDisque(unittest.TestCase):
+    """Vitesse & saturation du disque source dans l'embed (Nico 2026-08-31)."""
+
+    def _etat(self, util):
+        return T.parse_sonde(
+            "etat=activating\nprogres=  50.0G   0%   40.00MB/s    1:00:00\n"
+            "utilise=767000000000\ntotal_reel=4180000000000\n"
+            f"disque=sda\ndisk_rd=52000000\ndisk_wr=1000000\ndisk_util={util}\n")
+
+    def test_parse_disque(self):
+        o = self._etat(35)
+        self.assertEqual(o["disque"], "sda")
+        self.assertEqual(o["disk_rd"], 52000000)
+        self.assertEqual(o["disk_util"], 35)
+
+    def test_verdict_non_sature(self):
+        emb = T.embed_transfert(self._etat(35), FakeCfg())
+        champ = next(f for f in emb.fields if f.name.startswith("💽 Disque"))
+        self.assertIn("non saturé", champ.value)
+        self.assertIn("35 %", champ.value)
+
+    def test_verdict_sature(self):
+        emb = T.embed_transfert(self._etat(96), FakeCfg())
+        champ = next(f for f in emb.fields if f.name.startswith("💽 Disque"))
+        self.assertIn("saturé", champ.value)
+        self.assertNotIn("non saturé", champ.value)
+
+    def test_champ_absent_si_pas_de_mesure(self):
+        # df/diskstats indisponibles : pas de champ disque (pas de « 0 % » inventé)
+        o = T.parse_sonde("etat=activating\nprogres=  50.0G   0%   40.00MB/s    1:00:00\n")
+        emb = T.embed_transfert(o, FakeCfg())
+        self.assertFalse(any(f.name.startswith("💽 Disque") for f in emb.fields))
+
+
 if __name__ == "__main__":
     unittest.main()

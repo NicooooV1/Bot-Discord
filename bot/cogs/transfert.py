@@ -58,6 +58,20 @@ timeout 3 df -B1 --output=avail "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed
 # redémarrage) : octets présents à l'arrivée / volume de la source. df, pas du : instantané.
 timeout 6 df -B1 --output=used "$cible" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/utilise=/'
 timeout 5 df -B1 --output=used "$source" 2>/dev/null | tail -1 | tr -d ' ' | sed 's/^/total_reel=/'
+# vitesse & saturation du DISQUE physique qui porte la source (la lecture des médias
+# vient de là ; l'écriture, elle, part sur le NFS = réseau, pas un disque local). Delta
+# /proc/diskstats sur 1 s (portable, indépendant de la version d'iostat) : secteurs lus
+# (champ 6, ×512), écrits (champ 10), et temps passé en E/S (champ 13, ms) -> taux util.
+# (les %% sont doublés : cette chaîne passe par un formatage Python à clés — comme le
+#  « %%%% » du grep plus haut — donc tout signe pourcent littéral doit être doublé.)
+srcdev=$(lsblk -no pkname "$(findmnt -no SOURCE /mnt/media-local 2>/dev/null)" 2>/dev/null | head -1)
+[ -z "$srcdev" ] && srcdev=sda
+r1=$(awk -v d="$srcdev" '$3==d{print $6" "$10" "$13}' /proc/diskstats 2>/dev/null)
+sleep 1
+r2=$(awk -v d="$srcdev" '$3==d{print $6" "$10" "$13}' /proc/diskstats 2>/dev/null)
+echo "disque=$srcdev"
+awk -v a="$r1" -v b="$r2" 'BEGIN{n=split(a,x);m=split(b,y); if(n>=3&&m>=3){
+  printf "disk_rd=%%d\ndisk_wr=%%d\ndisk_util=%%d\n",(y[1]-x[1])*512,(y[2]-x[2])*512,(y[3]-x[3])/10}}'
 echo "hote=$(findmnt -n -o SOURCE "$cible" 2>/dev/null | cut -d: -f1)"
 echo "chemin=$(cat /run/avy-media.path 2>/dev/null)"
 """
@@ -118,7 +132,9 @@ def parse_sonde(sortie, reel_cache=None):
            "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
            "analyse": None,   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
            "hote": "", "chemin": "",   # 2026-08-30 : serveur NFS réel + vlan25/mgmt
-           "utilise": None, "total_reel": None}   # 2026-08-31 : progression RÉELLE (df)
+           "utilise": None, "total_reel": None,   # 2026-08-31 : progression RÉELLE (df)
+           # 2026-08-31 : vitesse & saturation du disque source (diskstats)
+           "disque": "", "disk_rd": None, "disk_wr": None, "disk_util": None}
     for ligne in (sortie or "").splitlines():
         cle, _, val = ligne.partition("=")
         val = val.strip()
@@ -136,6 +152,10 @@ def parse_sonde(sortie, reel_cache=None):
             out["utilise"] = int(val) if val.isdigit() else None
         elif cle == "total_reel":
             out["total_reel"] = int(val) if val.isdigit() else None
+        elif cle == "disque":
+            out["disque"] = val
+        elif cle in ("disk_rd", "disk_wr", "disk_util"):
+            out[cle] = int(val) if val.lstrip("-").isdigit() else None
         elif cle == "hote":
             out["hote"] = val
         elif cle == "chemin":
@@ -246,6 +266,19 @@ def embed_transfert(etat, cfg):
                       value=fmt.humanize_duration(etat["eta"]) + " restantes")
     if etat["libre"] is not None:
         emb.add_field(name="Libre à l'arrivée", value=fmt.humanize_bytes(etat["libre"]))
+    # vitesse & saturation du disque SOURCE (les médias sont LUS depuis ce disque local ;
+    # l'écriture part sur le NFS = réseau). %util ≈ part du temps où le disque a eu au
+    # moins une E/S en vol : > 90 % = saturé (le disque suivrait plus vite serait la
+    # limite), sinon la limite est ailleurs (ici le lien WAN d'Aveyron).
+    if etat.get("disk_util") is not None:
+        u = etat["disk_util"]
+        flag = "🔴 saturé" if u >= 90 else ("🟠 chargé" if u >= 70 else "🟢 non saturé")
+        val = f"lecture {fmt.humanize_bytes(etat.get('disk_rd') or 0)}/s"
+        if etat.get("disk_wr"):
+            val += f" · écriture {fmt.humanize_bytes(etat['disk_wr'])}/s"
+        val += f"\ncharge **{u} %** · {flag}"
+        nom = etat.get("disque") or "source"
+        emb.add_field(name=f"💽 Disque source ({nom})", value=val, inline=False)
     if etat.get("hote"):
         # 2026-08-30 (Nico : « en passant par sa VLAN25 ») : le nas exporte le pool sur
         # 10.0.25.10 (VLAN25) ET 10.0.10.10 (mgmt) ; l'hôte préfère le VLAN25 et retombe
