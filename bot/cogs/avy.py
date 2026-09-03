@@ -36,6 +36,7 @@ from .avy_embeds import (AUTH_FAIL_MIN, CERT_ALERT_DAYS, CERT_CLEAR_DAYS,
                          DISK_TEMP_ALERT, DISK_TEMP_CLEAR, LAT_ALERT_MS, LAT_CLEAR_MS,
                          STO_ALERT_PCT, STO_CLEAR_PCT, WEAROUT_ALERT)
 from ..core import format as fmt
+from ..core.pve import AvyUnreachable
 from ..core.gates import GatedView
 from ..core.ui import pin_edit
 from ..views.confirm import ConfirmView
@@ -319,6 +320,14 @@ class Avy(commands.Cog):
         try:
             items = self.bot.pve.avy_pbs_content() or []
             gm = self.bot.pve.guest_map()
+        except AvyUnreachable as e:
+            # Coupe-circuit armé (lien WG / nœud muet) : état ATTENDU, déjà annoncé par
+            # pve.py avec sa cause — une ligne suffit, pas une trace complète toutes les
+            # 10 min pendant toute la panne (2026-09-03 : 8 h de tracebacks identiques
+            # pour un nas muet). Même convention que avy_metrics._backups.
+            log.warning("supervision Aveyron: contenu %s indisponible ce cycle (%s)",
+                        self.bot.cfg.avy_storage, e)
+            return None
         except Exception as e:  # noqa: BLE001
             # Stockage DÉSACTIVÉ à la main côté PVE (`pvesm set … --disable 1`) : ce n'est
             # pas une panne, c'est une décision — un avertissement + sa trace à chaque
