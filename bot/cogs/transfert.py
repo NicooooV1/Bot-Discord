@@ -66,12 +66,43 @@ timeout 5 df -B1 --output=used "$source" 2>/dev/null | tail -1 | tr -d ' ' | sed
 #  « %%%% » du grep plus haut — donc tout signe pourcent littéral doit être doublé.)
 srcdev=$(lsblk -no pkname "$(findmnt -no SOURCE /mnt/media-local 2>/dev/null)" 2>/dev/null | head -1)
 [ -z "$srcdev" ] && srcdev=sda
+# 2026-09-03 (Nico : « la vitesse des disques comme pour nas, mais pour le R820 ») :
+# la source est un mergerfs de PLUSIEURS branches (disque local sda4 + branche NFS du
+# Synology). On mesure CHAQUE branche dans la même seconde : bloc local -> diskstats
+# (lu/écrit/%%util), branche NFS -> /proc/self/mountstats (octets READ reçus / WRITE
+# envoyés, pas de %%util : c'est du réseau). Idem pour l'ÉCRITURE réelle vers la cible
+# (mountstats WRITE de la cible) : c'est ce qui part vraiment vers Aveyron, cache
+# d'écriture compris — la ligne rsync, elle, ne voit que ce qu'elle a poussé en cache.
+branches=$(awk -v s="$source" '$2==s && $3=="fuse.mergerfs"{print $1}' /etc/fstab 2>/dev/null \
+  | tr ':' '\n' | cut -d= -f1)
+snap() {
+  for b in $branches; do
+    t=$(findmnt -no FSTYPE "$b" 2>/dev/null); n=$(basename "$b")
+    case "$t" in
+      nfs*) awk -v m="$b" -v n="$n" '$0 ~ (" mounted on " m " "){f=1} f&&/READ:/{r=$6}
+              f&&/WRITE:/{printf "%%s nfs %%s %%s 0\n",n,r,$5; exit}' /proc/self/mountstats 2>/dev/null ;;
+      "") ;;
+      *) d=$(lsblk -no pkname "$(findmnt -no SOURCE "$b" 2>/dev/null)" 2>/dev/null | head -1)
+         [ -n "$d" ] && awk -v d="$d" -v n="$n" '$3==d{printf "%%s %%s %%d %%d %%s\n",n,d,$6*512,$10*512,$13}' \
+           /proc/diskstats 2>/dev/null ;;
+    esac
+  done
+  awk -v m="$cible" '$0 ~ (" mounted on " m " "){f=1} f&&/WRITE:/{printf "cible nfs 0 %%s 0\n",$5; exit}' \
+    /proc/self/mountstats 2>/dev/null
+}
 r1=$(awk -v d="$srcdev" '$3==d{print $6" "$10" "$13}' /proc/diskstats 2>/dev/null)
+s1=$(snap)
 sleep 1
 r2=$(awk -v d="$srcdev" '$3==d{print $6" "$10" "$13}' /proc/diskstats 2>/dev/null)
+s2=$(snap)
 echo "disque=$srcdev"
 awk -v a="$r1" -v b="$r2" 'BEGIN{n=split(a,x);m=split(b,y); if(n>=3&&m>=3){
   printf "disk_rd=%%d\ndisk_wr=%%d\ndisk_util=%%d\n",(y[1]-x[1])*512,(y[2]-x[2])*512,(y[3]-x[3])/10}}'
+# br=<nom>|<périph>|<lu o/s>|<écrit o/s>|<%%util ou -1 (réseau)>  ;  cible_wr=<o/s>
+printf '%%s\n---\n%%s\n' "$s1" "$s2" | awk '/^---$/{p=1;next} !p{a[$1]=$3" "$4" "$5;next}
+  ($1 in a){split(a[$1],x," "); u=($2=="nfs")?-1:($5-x[3])/10;
+  if($1=="cible"){printf "cible_wr=%%d\ncible_wr_total=%%d\n",$4-x[2],$4} else {printf "br=%%s|%%s|%%d|%%d|%%d\n",$1,$2,$3-x[1],$4-x[2],u}}'
+echo "now=$(date +%%s)"
 echo "hote=$(findmnt -n -o SOURCE "$cible" 2>/dev/null | cut -d: -f1)"
 echo "chemin=$(cat /run/avy-media.path 2>/dev/null)"
 """
@@ -119,7 +150,7 @@ def debit_octets(txt):
         return None
 
 
-def parse_sonde(sortie, reel_cache=None):
+def parse_sonde(sortie, reel_cache=None, cible_cache=None):
     """Sortie brute de SONDE -> dict. Tolère les champs manquants (journal vide,
     montage absent) : c'est justement pendant les ennuis qu'on regarde ce salon.
 
@@ -127,14 +158,22 @@ def parse_sonde(sortie, reel_cache=None):
     montage NFS : pendant un creux du lien il dépasse son `timeout` et revient vide,
     ce qui faisait OSCILLER l'affichage entre la vraie progression (717 Go) et le
     compteur de session rsync (21 Go). Quand la mesure du cycle manque, on repart de
-    ce cache plutôt que du compteur (2026-08-31)."""
+    ce cache plutôt que du compteur (2026-08-31).
+
+    `cible_cache` = (cumul d'octets écrits sur la cible, epoch) du relevé PRÉCÉDENT.
+    L'écriture vers Aveyron oscille de 0 à 75 Mio/s d'une seconde à l'autre (cache
+    d'écriture NFS) : l'échantillon d'1 s de la sonde est un dé à jouer. Avec le cumul
+    du relevé d'avant, on affiche la MOYENNE sur l'intervalle (~60 s) — l'échantillon
+    ne sert qu'au tout premier relevé (2026-09-03)."""
     out = {"etat": "inconnu", "resultat": "", "debut": "", "lignes": [],
            "octets": None, "pct": None, "debit": "", "eta": None, "libre": None,
            "analyse": None,   # True = rsync analyse encore (ir-chk), False = scan fini (to-chk)
            "hote": "", "chemin": "",   # 2026-08-30 : serveur NFS réel + vlan25/mgmt
            "utilise": None, "total_reel": None,   # 2026-08-31 : progression RÉELLE (df)
            # 2026-08-31 : vitesse & saturation du disque source (diskstats)
-           "disque": "", "disk_rd": None, "disk_wr": None, "disk_util": None}
+           "disque": "", "disk_rd": None, "disk_wr": None, "disk_util": None,
+           # 2026-09-03 : chaque branche de la source (mergerfs) + écriture réelle cible
+           "branches": [], "cible_wr": None, "cible_wr_total": None, "now": None}
     for ligne in (sortie or "").splitlines():
         cle, _, val = ligne.partition("=")
         val = val.strip()
@@ -156,6 +195,15 @@ def parse_sonde(sortie, reel_cache=None):
             out["disque"] = val
         elif cle in ("disk_rd", "disk_wr", "disk_util"):
             out[cle] = int(val) if val.lstrip("-").isdigit() else None
+        elif cle in ("cible_wr", "cible_wr_total", "now"):
+            out[cle] = int(val) if val.lstrip("-").isdigit() else None
+        elif cle == "br":
+            # br=<nom>|<périph>|<lu>|<écrit>|<%util ou -1 = réseau, pas de saturation>
+            p = val.split("|")
+            if len(p) == 5 and all(x.lstrip("-").isdigit() for x in p[2:]):
+                out["branches"].append({"nom": p[0], "dev": p[1], "rd": int(p[2]),
+                                        "wr": int(p[3]),
+                                        "util": None if int(p[4]) < 0 else int(p[4])})
         elif cle == "hote":
             out["hote"] = val
         elif cle == "chemin":
@@ -174,6 +222,12 @@ def parse_sonde(sortie, reel_cache=None):
                 out["pct"] = int(m.group(2))
                 out["debit"] = m.group(3)
                 out["eta"] = eta_secondes(m.group(4))
+    # ----- écriture vers Aveyron : moyenne depuis le relevé précédent si possible -----
+    if cible_cache and out["cible_wr_total"] is not None and out["now"]:
+        tot0, t0 = cible_cache
+        dt = out["now"] - t0
+        if tot0 is not None and 5 <= dt <= 3600 and out["cible_wr_total"] >= tot0:
+            out["cible_wr"] = int((out["cible_wr_total"] - tot0) / dt)
     # ----- progression RÉELLE (2026-08-31, demande Nico « les vraies données ») -----
     # Le compteur de session de rsync (out["octets"]) repart de ZÉRO à chaque redémarrage
     # du service : il affichait « 11,7 Go » alors que 715 Go étaient déjà à l'arrivée.
@@ -270,7 +324,30 @@ def embed_transfert(etat, cfg):
     # l'écriture part sur le NFS = réseau). %util ≈ part du temps où le disque a eu au
     # moins une E/S en vol : > 90 % = saturé (le disque suivrait plus vite serait la
     # limite), sinon la limite est ailleurs (ici le lien WAN d'Aveyron).
-    if etat.get("disk_util") is not None:
+    # 2026-09-03 (Nico : « la vitesse des disques comme pour nas, mais pour le R820 ») :
+    # une ligne PAR branche de la source (disque local + branche NFS Synology), puis
+    # l'écriture RÉELLE vers Aveyron. Repli sur l'ancien champ mono-disque si la sonde
+    # n'a pas su lister les branches.
+    if etat.get("branches"):
+        lignes = []
+        for b in etat["branches"]:
+            if b["util"] is None:
+                lignes.append(f"**{b['nom']}** (NFS Synology) · lecture "
+                              f"{fmt.humanize_bytes(b['rd'])}/s"
+                              + (f" · écriture {fmt.humanize_bytes(b['wr'])}/s" if b["wr"] else ""))
+            else:
+                u = b["util"]
+                flag = "🔴 saturé" if u >= 90 else ("🟠 chargé" if u >= 70 else "🟢")
+                lignes.append(f"**{b['nom']}** ({b['dev']}) · lecture "
+                              f"{fmt.humanize_bytes(b['rd'])}/s"
+                              + (f" · écriture {fmt.humanize_bytes(b['wr'])}/s" if b["wr"] else "")
+                              + f" · charge **{u} %** {flag}")
+        if etat.get("cible_wr") is not None:
+            lignes.append(f"📤 **écriture vers Aveyron** (NFS) · "
+                          f"{fmt.humanize_bytes(etat['cible_wr'])}/s")
+        emb.add_field(name="💽 Disques du R820 (source)", value="\n".join(lignes),
+                      inline=False)
+    elif etat.get("disk_util") is not None:
         u = etat["disk_util"]
         flag = "🔴 saturé" if u >= 90 else ("🟠 chargé" if u >= 70 else "🟢 non saturé")
         val = f"lecture {fmt.humanize_bytes(etat.get('disk_rd') or 0)}/s"
@@ -356,6 +433,7 @@ class Transfert(commands.Cog):
         self._ssh = None       # connexion SSH RÉUTILISÉE entre les relevés (cf. _run)
         self._dernier_releve = 0.0
         self._reel_cache = None   # dernier (utilise, total_reel) connu (df cible NFS lisse)
+        self._cible_cache = None  # (cumul octets écrits cible, epoch) du relevé précédent
         self._verrou = asyncio.Lock()   # un seul relevé à la fois (boucle + bouton)
         self._view = TransfertRefreshView(self)
         if self.enabled:
@@ -508,7 +586,10 @@ class Transfert(commands.Cog):
                        "journal": self.cfg.transfert_log,
                        "cible": self.cfg.transfert_dest,
                        "source": self.cfg.transfert_source}
-        etat = parse_sonde(await self._run(cmd), reel_cache=self._reel_cache)
+        etat = parse_sonde(await self._run(cmd), reel_cache=self._reel_cache,
+                           cible_cache=self._cible_cache)
+        if etat.get("cible_wr_total") is not None and etat.get("now"):
+            self._cible_cache = (etat["cible_wr_total"], etat["now"])
         # mémorise la dernière progression RÉELLE (df réussi) pour lisser un df qui expire
         if etat.get("utilise") is not None and etat.get("total_reel"):
             self._reel_cache = (etat["utilise"], etat["total_reel"])

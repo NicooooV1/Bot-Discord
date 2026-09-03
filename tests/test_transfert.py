@@ -324,5 +324,57 @@ class TestDisque(unittest.TestCase):
         self.assertFalse(any(f.name.startswith("💽 Disque") for f in emb.fields))
 
 
+class TestBranches(unittest.TestCase):
+    """2026-09-03 : vitesse de CHAQUE disque du R820 composant la source (mergerfs) +
+    écriture réelle vers Aveyron (Nico : « comme pour nas, mais pour le R820 »)."""
+
+    SONDE = ("etat=activating\nprogres=  50.0G   0%   40.00MB/s    1:00:00\n"
+             "utilise=767000000000\ntotal_reel=4180000000000\n"
+             "disque=sda\ndisk_rd=52000000\ndisk_wr=0\ndisk_util=35\n"
+             "br=media-local|sda|66000000|0|41\n"
+             "br=nas-media|nfs|1200000|0|-1\n"
+             "cible_wr=64000000\n")
+
+    def test_parse_branches(self):
+        o = T.parse_sonde(self.SONDE)
+        self.assertEqual([b["nom"] for b in o["branches"]], ["media-local", "nas-media"])
+        self.assertEqual(o["branches"][0]["util"], 41)
+        self.assertIsNone(o["branches"][1]["util"])       # NFS : pas de %util
+        self.assertEqual(o["cible_wr"], 64000000)
+
+    def test_embed_une_ligne_par_disque_plus_cible(self):
+        emb = T.embed_transfert(T.parse_sonde(self.SONDE), FakeCfg())
+        champ = next(f for f in emb.fields if f.name.startswith("💽 Disques du R820"))
+        self.assertIn("media-local", champ.value)
+        self.assertIn("41 %", champ.value)
+        self.assertIn("nas-media", champ.value)
+        self.assertIn("écriture vers Aveyron", champ.value)
+        # l'ancien champ mono-disque ne doit PAS apparaître en double
+        self.assertFalse(any(f.name.startswith("💽 Disque source") for f in emb.fields))
+
+    def test_ecriture_cible_moyennee_entre_deux_releves(self):
+        # 1er relevé : échantillon 1 s ; 2e relevé 60 s plus tard : moyenne sur 60 s
+        s1 = self.SONDE + "cible_wr_total=1000000000\nnow=1000\n"
+        o1 = T.parse_sonde(s1)
+        self.assertEqual(o1["cible_wr"], 64000000)
+        s2 = self.SONDE + "cible_wr_total=4000000000\nnow=1060\n"
+        o2 = T.parse_sonde(s2, cible_cache=(o1["cible_wr_total"], o1["now"]))
+        self.assertEqual(o2["cible_wr"], 50000000)       # 3 Go / 60 s, pas l'échantillon
+        # compteur reparti en arrière (remontage) ou intervalle absurde : échantillon
+        o3 = T.parse_sonde(s2, cible_cache=(9000000000, 1060 - 60))
+        self.assertEqual(o3["cible_wr"], 64000000)
+        o4 = T.parse_sonde(s2, cible_cache=(1000000000, 1059))
+        self.assertEqual(o4["cible_wr"], 64000000)
+
+    def test_br_malforme_ignore(self):
+        o = T.parse_sonde("etat=activating\nbr=x|y|abc|0|0\nbr=trop|court\n")
+        self.assertEqual(o["branches"], [])
+
+    def test_repli_mono_disque_sans_branches(self):
+        o = T.parse_sonde("etat=activating\ndisque=sda\ndisk_rd=1\ndisk_wr=0\ndisk_util=10\n")
+        emb = T.embed_transfert(o, FakeCfg())
+        self.assertTrue(any(f.name.startswith("💽 Disque source") for f in emb.fields))
+
+
 if __name__ == "__main__":
     unittest.main()
