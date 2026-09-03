@@ -296,8 +296,8 @@ class _RemoteCluster:
         # d'entrée répond — on bascule dessus au passage.
         return self.switch_if_dead()
 
-    def _node_guard(self, node, fn, *a, **kw):
-        """Coupe-circuit PAR NŒUD (2026-08-14).
+    def _node_guard(self, node, fn):
+        """Coupe-circuit PAR NŒUD (2026-08-14). `fn(api)` reçoit le client courant.
 
         Un nœud peut être muet pendant que ses voisins répondent en 0,13 s : le 14/08,
         `nas` était bloqué par un partage CIFS démonté et chacune de ses lectures coûtait
@@ -314,8 +314,25 @@ class _RemoteCluster:
             raise AvyNodeUnreachable(
                 f"nœud {node} muet (coupe-circuit {AVY_NODE_BACKOFF}s)")
         try:
-            r = fn(*a, **kw)
+            r = fn(self._ro)
         except OSError as e:
+            # ⚠️ 2026-09-03 : l'erreur peut venir du POINT D'ENTRÉE, pas du nœud lu. Le
+            # 02/09 17:01 le bot avait basculé sur 10.0.10.12 (llm), qui s'est ensuite
+            # éteint : chaque lecture de nas/ms01 expirait sur CET hôte, ce garde
+            # accusait « nœud nas muet » toutes les 10 min pendant 30 h, et convertissait
+            # l'OSError en AvyNodeUnreachable — que `Pve._avy_guarded` ne voit pas comme
+            # une panne d'hôte : la bascule d'entrée n'était JAMAIS déclenchée. On sonde
+            # donc l'hôte courant d'abord (5 s max) ; s'il est mort et qu'un autre
+            # répond, on rejoue la lecture sur lui — `fn` reçoit le client pour cela.
+            if self.switch_if_dead():
+                try:
+                    r = fn(self._ro)
+                except OSError as e2:
+                    e = e2
+                else:
+                    if self._node_fail.pop(node, None) is not None:
+                        log.info("cluster %s : nœud %s de nouveau joignable", self.key, node)
+                    return r
             self._node_fail[node] = now + AVY_NODE_BACKOFF
             log.warning("cluster %s : nœud %s muet (%s) — ses lectures sont "
                         "court-circuitées %ds, les autres nœuds continuent",
@@ -332,7 +349,7 @@ class _RemoteCluster:
         return sorted(n for n, until in self._node_fail.items() if now < until)
 
     def node_status(self, node):
-        return self._node_guard(node, self._ro.nodes(node).status.get)
+        return self._node_guard(node, lambda api: api.nodes(node).status.get())
 
     # ---- lectures riches (graphes, matériel, cluster, config) ----
     def guest_rrd(self, vmid, gtype, timeframe):
@@ -341,15 +358,13 @@ class _RemoteCluster:
         return ep.rrddata.get(timeframe=timeframe)
 
     def node_rrd(self, node, timeframe):
-        return self._node_guard(node, self._ro.nodes(node).rrddata.get,
-                                timeframe=timeframe)
+        return self._node_guard(node, lambda api: api.nodes(node).rrddata.get(timeframe=timeframe))
 
     def disks(self, node):
-        return self._node_guard(node, self._ro.nodes(node).disks.list.get)
+        return self._node_guard(node, lambda api: api.nodes(node).disks.list.get())
 
     def smart(self, node, devpath):
-        return self._node_guard(node, self._ro.nodes(node).disks.smart.get,
-                                disk=devpath)
+        return self._node_guard(node, lambda api: api.nodes(node).disks.smart.get(disk=devpath))
 
     def cluster_status(self):
         return self._ro.cluster.status.get()
@@ -358,7 +373,16 @@ class _RemoteCluster:
         return self._ro.cluster.log.get(max=maxn)
 
     def certificates(self, node):
-        return self._node_guard(node, self._ro.nodes(node).certificates.info.get)
+        return self._node_guard(node, lambda api: api.nodes(node).certificates.info.get())
+
+    def zfs_pools(self, node):
+        """Pools ZFS du nœud (nom, santé, alloc/size, frag) — Sys.Audit suffit."""
+        return self._node_guard(node, lambda api: api.nodes(node).disks.zfs.get())
+
+    def zfs_pool(self, node, name):
+        """Détail d'un pool : état, dernier scrub (`scan`), arbre des vdev avec
+        compteurs read/write/cksum par disque."""
+        return self._node_guard(node, lambda api: api.nodes(node).disks.zfs(name).get())
 
     def backup_jobs(self):
         return self._ro.cluster.backup.get()
@@ -375,24 +399,24 @@ class _RemoteCluster:
         return (time.perf_counter() - t0) * 1000
 
     def node_storages(self, node):
-        return self._node_guard(node, self._ro.nodes(node).storage.get)
+        return self._node_guard(node, lambda api: api.nodes(node).storage.get())
 
     def node_tasks(self, node, limit=20, source=None):
         kw = {"limit": limit}
         if source is not None:
             kw["source"] = source
-        return self._node_guard(node, self._ro.nodes(node).tasks.get, **kw)
+        return self._node_guard(node, lambda api: api.nodes(node).tasks.get(**kw))
 
     def node_services(self, node):
         """Services systèmes du nœud (pveproxy, corosync…) — Sys.Audit suffit."""
-        return self._node_guard(node, self._ro.nodes(node).services.get)
+        return self._node_guard(node, lambda api: api.nodes(node).services.get())
 
     def node_updates(self, node):
         """Paquets APT en attente (liste déjà en cache côté nœud, lecture légère).
         ⚠️ Ce GET exige Sys.Modify sur certaines versions PVE : un jeton en lecture
         seule peut se voir refuser — l'appelant (Avy._collect) neutralise alors la
         lecture pour de bon au lieu de repayer un 403 par cycle."""
-        return self._node_guard(node, self._ro.nodes(node).apt.update.get)
+        return self._node_guard(node, lambda api: api.nodes(node).apt.update.get())
 
     def backup_node(self, node, mode, notes, exclude=""):
         """vzdump all=1 du nœud (bouton 💾 du salon hyperviseur AVY-*)."""
@@ -711,6 +735,12 @@ class Pve:
 
     def avy_smart(self, node, devpath):
         return self._avy_read(self._avy.smart, node, devpath)
+
+    def avy_zfs_pools(self, node):
+        return self._avy_read(self._avy.zfs_pools, node)
+
+    def avy_zfs_pool(self, node, name):
+        return self._avy_read(self._avy.zfs_pool, node, name)
 
     def avy_cluster_status(self):
         return self._avy_read(self._avy.cluster_status)

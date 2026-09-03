@@ -18,7 +18,9 @@ annoncer « ≥ 85 % » pendant que l'alerte partirait à 90 %.
 ⚠️ Ces fonctions sont appelées depuis la boucle d'événements : elles ne font AUCUN accès
 réseau (c'est le rôle de `Avy._collect` / `_cluster_collect`, exécutés via to_thread).
 """
+import collections
 import datetime
+import re
 import time
 
 import discord
@@ -42,6 +44,85 @@ BACKUP_STALE_DAYS = 7  # ⚠️ invité sans sauvegarde récente
 # garde une marge pour les champs fixes de l'embed. (2026-08-11)
 MAX_LIST_FIELDS = 20
 
+
+
+_MOIS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                                     "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+_SCAN_RE = re.compile(r"with (\d+) errors on \w{3} (\w{3}) +(\d+) [\d:]+ (\d{4})")
+IOWAIT_WARN = 10       # % — charge E/S notable (🟠), 25 % = 🔴
+IOWAIT_CRIT = 25
+
+
+def _vdev_leaves(node):
+    """Feuilles (disques) de l'arbre de vdev renvoyé par /disks/zfs/<pool>."""
+    out = []
+    for ch in (node or {}).get("children") or []:
+        if ch.get("leaf"):
+            out.append(ch)
+        else:
+            out.extend(_vdev_leaves(ch))
+    return out
+
+
+def _vdev_topo(detail):
+    """« raidz1 », « mirror », « simple » : type du premier vdev sous la racine."""
+    racine = ((detail or {}).get("children") or [{}])[0]
+    for ch in racine.get("children") or []:
+        if not ch.get("leaf"):
+            return re.sub(r"-\d+$", "", str(ch.get("name") or "")) or "?"
+    return "simple" if racine.get("children") else "?"
+
+
+def _scan_txt(scan):
+    """Résumé du dernier scrub : « ✅ scrub OK 30/08 », « 🔴 scrub 2 erreur(s) 30/08 »,
+    « 🔄 scrub en cours », vide si jamais scrubé. Mois en anglais ABRÉGÉ dans la chaîne
+    de zpool, d'où la table _MOIS (strptime %b dépend de la locale)."""
+    s = str(scan or "")
+    if not s or s == "none requested":
+        return ""
+    if "in progress" in s:
+        return "🔄 scrub en cours"
+    m = _SCAN_RE.search(s)
+    if not m:
+        return s[:40]
+    err, mois, jour = int(m.group(1)), _MOIS.get(m.group(2)), int(m.group(3))
+    quand = f"{jour:02d}/{mois:02d}" if mois else m.group(4)
+    return (f"✅ scrub OK {quand}" if err == 0 else f"🔴 scrub {err} erreur(s) {quand}")
+
+
+def zfs_lignes(pools):
+    """Une ligne par pool ZFS + pire indice de santé (0-100) pour la couleur.
+    `pools` = liste `Avy._collect`["zfs"] (entrées /disks/zfs + clé "detail")."""
+    lines, worst = [], 0.0
+    for p in pools:
+        det = p.get("detail") or {}
+        state = str(det.get("state") or p.get("health") or "?").upper()
+        leaves = _vdev_leaves(det)
+        n_ok = sum(1 for lf in leaves if str(lf.get("state") or "").upper() == "ONLINE")
+        errs = sum(int(lf.get(k) or 0) for lf in leaves for k in ("read", "write", "cksum"))
+        size, alloc = p.get("size") or 0, p.get("alloc") or 0
+        pct = alloc / size * 100 if size else 0.0
+        if state != "ONLINE":
+            mark, worst = "🔴", max(worst, 95)
+        elif errs or pct >= STO_ALERT_PCT:
+            mark, worst = "🟠", max(worst, 85)
+        else:
+            mark = "🟢"
+        worst = max(worst, pct)
+        bouts = [f"{mark} `{p.get('name')}` {state.lower()} · {_vdev_topo(det)}"]
+        if leaves:
+            bouts.append(f"{n_ok}/{len(leaves)} disques")
+        if size:
+            bouts.append(fmt.pct_of(alloc, size))
+        if p.get("frag") is not None:
+            bouts.append(f"frag {p['frag']} %")
+        if errs:
+            bouts.append(f"⚠️ {errs} erreur(s) vdev")
+        scan = _scan_txt(det.get("scan"))
+        if scan:
+            bouts.append(scan)
+        lines.append(" · ".join(bouts))
+    return lines, worst
 
 
 def _num(v, unit, scale=1, fmt_spec=".0f"):
@@ -225,32 +306,67 @@ def hyperviseur(node, data, cluster, guests, sfx):
         emb.add_field(name=f"💽 Stockages ({len(stos)})",
                       value="\n".join(lines)[:1024], inline=False)
 
-    # résumé des disques physiques (santé SMART, température, usure) — détail complet
-    # dans #materiel-<nœud>
+    # synthèse des disques physiques (Nico 2026-09-03 : « l'état de chaque disque et la
+    # charge, sans détailler chacun ») : une ligne de bilan SMART, l'appel nominal des
+    # disques (un point de couleur par disque), la charge E/S du nœud. Le détail par
+    # disque (modèle, usure, température) reste dans #materiel-<nœud>. ⚠️ La charge PAR
+    # DISQUE n'est pas exposée par l'API PVE (pas de telegraf côté Aveyron) : on montre
+    # ce que le nœud sait de lui-même, IO-wait et pression IO (PSI), pas un chiffre
+    # inventé par disque.
     disks = data.get("disks") or []
     if disks:
-        lines = []
-        for d in disks[:8]:
-            health = str(d.get("health") or "?")
-            ok = health.upper() in ("PASSED", "OK")
-            unk = health.upper() in ("UNKNOWN", "?", "")
-            mark = "🟢" if ok else ("⚪" if unk else "🔴")
-            if not ok and not unk:
-                worst = max(worst, 95)
-            bouts = [f"{mark} `{d.get('devpath')}`", (d.get("model") or "?")[:24]]
-            if d.get("size"):
-                bouts.append(fmt.humanize_bytes(d["size"]))
-            if d.get("temp") is not None:
-                bouts.append(("🔥 " if d["temp"] >= DISK_TEMP_ALERT else "")
-                             + f"{d['temp']} °C")
-            if str(d.get("wearout") or "").isdigit():
-                w = int(d["wearout"])
-                bouts.append(("⚠️ " if w <= WEAROUT_ALERT else "")
-                             + f"{w} % de vie restante")
-            lines.append(" · ".join(bouts))
-        if len(disks) > 8:
-            lines.append(f"… +{len(disks) - 8} autre(s), détail dans #materiel")
-        emb.add_field(name=f"💿 Disques ({len(disks)})",
+        _inconnu = ("UNKNOWN", "?", "")
+        def _etat(d):
+            h = str(d.get("health") or "?").upper()
+            return "ok" if h in ("PASSED", "OK") else ("unk" if h in _inconnu else "bad")
+        etats = [_etat(d) for d in disks]
+        n_bad, n_unk = etats.count("bad"), etats.count("unk")
+        if n_bad:
+            worst = max(worst, 95)
+        bilan = [(f"🔴 {n_bad} disque(s) SMART en échec" if n_bad
+                  else f"🟢 {len(disks) - n_unk}/{len(disks)} SMART PASS")]
+        if n_unk:
+            bilan.append(f"⚪ {n_unk} inconnu(s)")
+        types = collections.Counter(str(d.get("type") or "?").upper() for d in disks)
+        bilan.append(" · ".join(f"{n} {t}" for t, n in sorted(types.items())))
+        temps = [d["temp"] for d in disks if d.get("temp") is not None]
+        if temps:
+            bilan.append(("🔥 " if max(temps) >= DISK_TEMP_ALERT else "")
+                         + f"max {max(temps)} °C")
+        vies = [int(d["wearout"]) for d in disks if str(d.get("wearout") or "").isdigit()]
+        if vies:
+            bilan.append(("⚠️ " if min(vies) <= WEAROUT_ALERT else "")
+                         + f"vie mini {min(vies)} %")
+        marks = {"ok": "🟢", "unk": "⚪", "bad": "🔴"}
+        roster = " ".join(f"{marks[e]}`{str(d.get('devpath') or '?').removeprefix('/dev/')}`"
+                          for d, e in zip(disks, etats))
+        # charge E/S : IO-wait (fraction 0-1, RRD 1 h) + pression IO PSI « some »
+        io = rh.get("iowait")
+        pio = last.get("pressureiosome")
+        charge = []
+        if io:
+            charge.append(f"IO-wait {_num(io[0], '%', scale=100)} "
+                          f"(moy. 1 h {_num(io[2], '%', scale=100)}, "
+                          f"max {_num(io[1], '%', scale=100)})")
+        if pio is not None:
+            charge.append(f"pression IO {_num(pio, '%')}")
+        niveau = max((io[0] or 0) * 100 if io else 0, pio or 0)
+        cmark = ("🔴" if niveau >= IOWAIT_CRIT else "🟠" if niveau >= IOWAIT_WARN else "🟢")
+        ligne_charge = (f"{cmark} charge E/S : " + " · ".join(charge) if charge
+                        else "⚪ charge E/S : non relevée ce cycle")
+        emb.add_field(name=f"💿 Disques ({len(disks)}) & charge E/S",
+                      value="\n".join([" · ".join(bilan), roster, ligne_charge])[:1024],
+                      inline=False)
+
+    # pools ZFS : état/topologie/remplissage/scrub — None = illisibles ce cycle
+    pools = data.get("zfs")
+    if pools is None and disks:
+        emb.add_field(name="🧱 Pools ZFS",
+                      value="⚠️ illisibles ce cycle — données incomplètes", inline=False)
+    elif pools:
+        lines, w = zfs_lignes(pools)
+        worst = max(worst, w)
+        emb.add_field(name=f"🧱 Pools ZFS ({len(pools)})",
                       value="\n".join(lines)[:1024], inline=False)
 
     if guests:

@@ -202,7 +202,7 @@ class Avy(commands.Cog):
         # rendu (« illisibles ce cycle ») ; les alertes, elles, sautent simplement le
         # bloc — même convention que avy_metrics._backups (2026-08-20).
         out = {"status": None, "storages": None, "tasks": None,
-               "rrd_last": {}, "rrd_hour": {}, "disks": [],
+               "rrd_last": {}, "rrd_hour": {}, "disks": [], "zfs": None,
                "services": None, "updates": None}
         out["status"] = pve.avy_node_status(node)          # lève si nœud injoignable
         try:
@@ -256,6 +256,20 @@ class Avy(commands.Cog):
                 out["disks"].append({**d, "temp": temp})
         except Exception:
             pass
+        # pools ZFS : état, remplissage, dernier scrub, erreurs par vdev (Nico
+        # 2026-09-03 : « l'état des disques de nas et la charge, sans le détail de chaque
+        # disque »). None = illisible ce cycle, [] = pas de pool (même convention).
+        try:
+            out["zfs"] = []
+            for pool in pve.avy_zfs_pools(node) or []:
+                det = {}
+                try:
+                    det = pve.avy_zfs_pool(node, pool.get("name")) or {}
+                except Exception:
+                    pass
+                out["zfs"].append({**pool, "detail": det})
+        except Exception:
+            out["zfs"] = None
         # ⚠️ Il y avait ici une lecture /cluster/resources filtrée par nœud (out["rows"]).
         # PERSONNE ne la lisait, mais elle coûtait un aller-retour R820 + un aller-retour
         # Aveyron PAR NŒUD ET PAR CYCLE (et un de plus à chaque clic sur 🔄), sur le lien

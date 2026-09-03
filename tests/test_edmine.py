@@ -722,29 +722,75 @@ class TestCoupeCircuitAveyron(unittest.TestCase):
 
     def test_coupe_circuit_par_noeud(self):
         """Un nœud muet ne doit coûter son timeout qu'UNE fois, et ne pas contaminer
-        ses voisins ni le cluster."""
+        ses voisins ni le cluster. Depuis le 2026-09-03 `fn(api)` reçoit le client et
+        l'hôte d'entrée est sondé (switch_if_dead) AVANT d'accuser le nœud."""
         from bot.core.pve import AvyNodeUnreachable, AvyUnreachable, _RemoteCluster
-        c = _RemoteCluster.__new__(_RemoteCluster)
+
+        class Faux(_RemoteCluster):
+            _ro = "client"
+            sondes = 0
+
+            def switch_if_dead(self):
+                self.sondes += 1
+                return False              # hôte d'entrée VIVANT : c'est bien le nœud
+
+        c = Faux.__new__(Faux)
         c.key, c._node_fail = "AVEYRON", {}
 
-        def muet():
+        def muet(api):
             raise TimeoutError("Read timed out. (read timeout=30)")
 
         with self.assertRaises(AvyNodeUnreachable):
             c._node_guard("nas", muet)
+        self.assertEqual(c.sondes, 1, "l'hôte d'entrée doit être sondé avant d'accuser")
         self.assertIn("nas", c.degraded_nodes())
         appels = []
         with self.assertRaises(AvyNodeUnreachable):      # 2e appel : plus de timeout payé
-            c._node_guard("nas", lambda: appels.append(1))
+            c._node_guard("nas", lambda api: appels.append(1))
         self.assertEqual(appels, [], "le nœud muet doit être court-circuité")
-        self.assertEqual(c._node_guard("ms01", lambda: "ok"), "ok",
+        self.assertEqual(c._node_guard("ms01", lambda api: "ok"), "ok",
                          "les voisins ne doivent pas être touchés")
         # non-OSError : c'est ce qui protège le coupe-circuit du CLUSTER
         self.assertTrue(issubclass(AvyNodeUnreachable, AvyUnreachable))
         self.assertFalse(issubclass(AvyNodeUnreachable, OSError))
         c._node_fail["nas"] = 0                          # fenêtre écoulée
-        self.assertEqual(c._node_guard("nas", lambda: "revenu"), "revenu")
+        self.assertEqual(c._node_guard("nas", lambda api: "revenu"), "revenu")
         self.assertEqual(c.degraded_nodes(), [])
+
+    def test_point_d_entree_mort_bascule_sans_accuser_le_noeud(self):
+        """2026-09-03 : le bot est resté 30 h collé sur 10.0.10.12 (llm, éteint) en
+        loggant « nœud nas muet » toutes les 10 min, alors que nas répondait en 0,1 s
+        via les deux autres hôtes. Un OSError doit d'abord faire sonder l'hôte d'entrée ;
+        s'il est mort et qu'un autre répond, la lecture est REJOUÉE sur lui."""
+        from bot.core.pve import AvyNodeUnreachable, _RemoteCluster
+
+        class Faux(_RemoteCluster):
+            def __init__(self):
+                self.key, self._node_fail = "AVEYRON", {}
+                self.hote = "mort"
+
+            @property
+            def _ro(self):
+                return self.hote
+
+            def switch_if_dead(self):
+                self.hote = "vivant"
+                return True
+
+        def lecture(api):
+            if api == "mort":
+                raise TimeoutError("Connection to 10.0.10.12 timed out. (connect timeout=30)")
+            return f"status via {api}"
+
+        c = Faux()
+        self.assertEqual(c._node_guard("nas", lecture), "status via vivant")
+        self.assertEqual(c.degraded_nodes(), [], "le nœud n'a rien fait, pas de blâme")
+        # aucun hôte de rechange : comportement d'avant, le nœud est court-circuité
+        c2 = Faux()
+        c2.switch_if_dead = lambda: False
+        with self.assertRaises(AvyNodeUnreachable):
+            c2._node_guard("nas", lecture)
+        self.assertIn("nas", c2.degraded_nodes())
 
     def test_any_node_prefere_le_noeud_local(self):
         """Viser un autre nœud fait passer l'appel par le tunnel inter-nœuds, qui ne rend

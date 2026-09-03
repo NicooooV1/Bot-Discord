@@ -113,3 +113,101 @@ class TestHyperviseurRiche(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+POOL_OK = {"name": "data-pool", "size": 24_000_277_250_048, "alloc": 4_859_791_941_632,
+           "free": 19_140_485_308_416, "health": "ONLINE", "frag": 4, "dedup": 1,
+           "detail": {"state": "ONLINE", "errors": "No known data errors",
+                      "scan": "scrub repaired 0B in 00:31:39 with 0 errors on "
+                              "Sun Aug 30 00:46:39 2026",
+                      "children": [{"leaf": 0, "name": "data-pool", "children": [
+                          {"leaf": 0, "name": "raidz1-0", "state": "ONLINE", "children": [
+                              {"leaf": 1, "name": "sdb1", "state": "ONLINE",
+                               "read": 0, "write": 0, "cksum": 0},
+                              {"leaf": 1, "name": "sdc1", "state": "ONLINE",
+                               "read": 0, "write": 0, "cksum": 0},
+                              {"leaf": 1, "name": "sdf1", "state": "ONLINE",
+                               "read": 0, "write": 0, "cksum": 0}]}]}]}}
+POOL_DEGRADED = {"name": "rpool", "size": 498_216_206_336, "alloc": 48_403_083_264,
+                 "health": "DEGRADED", "frag": 43,
+                 "detail": {"state": "DEGRADED",
+                            "scan": "scrub repaired 0B in 00:15:01 with 3 errors on "
+                                    "Wed Aug 26 14:15:20 2026",
+                            "children": [{"leaf": 0, "name": "rpool", "children": [
+                                {"leaf": 0, "name": "mirror-0", "children": [
+                                    {"leaf": 1, "name": "sda3", "state": "ONLINE",
+                                     "read": 0, "write": 0, "cksum": 0},
+                                    {"leaf": 1, "name": "sde3", "state": "FAULTED",
+                                     "read": 12, "write": 4, "cksum": 0}]}]}]}}
+DISKS_NAS = [
+    {"devpath": "/dev/nvme0n1", "type": "nvme", "health": "PASSED", "wearout": 99, "temp": 41},
+    {"devpath": "/dev/sda", "type": "ssd", "health": "PASSED", "wearout": 86, "temp": 30},
+    {"devpath": "/dev/sdb", "type": "hdd", "health": "PASSED", "wearout": "N/A", "temp": 38},
+    {"devpath": "/dev/sdc", "type": "hdd", "health": "UNKNOWN", "wearout": "N/A"},
+]
+
+
+class TestDisquesEtPoolsZFS(unittest.TestCase):
+    """Synthèse disques + charge E/S + pools ZFS dans #hyperviseur (Nico 2026-09-03)."""
+
+    def _champ(self, emb, prefix):
+        for f in emb.fields:
+            if f.name.startswith(prefix):
+                return f
+        self.fail(f"champ {prefix!r} absent de {_noms(emb)}")
+
+    def test_synthese_disques_roster_et_charge(self):
+        data = {**DATA, "disks": DISKS_NAS, "zfs": [POOL_OK]}
+        emb = e.hyperviseur("nas", data, CLUSTER, GUESTS, "-avy")
+        f = self._champ(emb, "💿 Disques (4)")
+        l1, roster, charge = f.value.split("\n")
+        self.assertIn("🟢 3/4 SMART PASS", l1)
+        self.assertIn("⚪ 1 inconnu", l1)
+        self.assertIn("2 HDD", l1)
+        self.assertIn("max 41 °C", l1)
+        self.assertIn("vie mini 86 %", l1)
+        # un point par disque, sans modèle ni détail
+        self.assertEqual(roster, "🟢`nvme0n1` 🟢`sda` 🟢`sdb` ⚪`sdc`")
+        self.assertNotIn("Samsung", f.value)
+        self.assertIn("🟢 charge E/S : IO-wait 2 %", charge)
+        self.assertIn("pression IO 0 %", charge)
+
+    def test_pool_online_scrub_ok(self):
+        lines, worst = e.zfs_lignes([POOL_OK])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("🟢 `data-pool` online · raidz1 · 3/3 disques", lines[0])
+        self.assertIn("frag 4 %", lines[0])
+        self.assertIn("✅ scrub OK 30/08", lines[0])
+        self.assertLess(worst, 80)
+
+    def test_pool_degrade_passe_au_rouge(self):
+        data = {**DATA, "disks": DISKS_NAS, "zfs": [POOL_OK, POOL_DEGRADED]}
+        emb = e.hyperviseur("nas", data, CLUSTER, GUESTS, "-avy")
+        f = self._champ(emb, "🧱 Pools ZFS (2)")
+        ligne = f.value.split("\n")[1]
+        self.assertIn("🔴 `rpool` degraded · mirror · 1/2 disques", ligne)
+        self.assertIn("⚠️ 16 erreur(s) vdev", ligne)
+        self.assertIn("🔴 scrub 3 erreur(s) 26/08", ligne)
+        self.assertEqual(emb.color.value, e.fmt.health_color(95))
+
+    def test_pools_illisibles_dits_et_absents_omis(self):
+        emb = e.hyperviseur("nas", {**DATA, "zfs": None}, CLUSTER, GUESTS, "-avy")
+        self.assertIn("illisibles", self._champ(emb, "🧱 Pools ZFS").value)
+        emb = e.hyperviseur("nas", {**DATA, "zfs": []}, CLUSTER, GUESTS, "-avy")
+        self.assertFalse(any(n.startswith("🧱") for n in _noms(emb)))
+
+    def test_charge_es_forte_en_rouge(self):
+        data = {**DATA, "disks": DISKS_NAS, "zfs": [],
+                "rrd_hour": {"iowait": (0.31, 0.40, 0.12)}, "rrd_last": {"pressureiosome": 9.0}}
+        emb = e.hyperviseur("nas", data, CLUSTER, GUESTS, "-avy")
+        self.assertIn("🔴 charge E/S : IO-wait 31 %", self._champ(emb, "💿").value)
+
+    def test_limites_discord_11_disques_5_pools(self):
+        disks = [{"devpath": f"/dev/sd{c}", "type": "hdd", "health": "PASSED",
+                  "wearout": "N/A", "temp": 35} for c in "abcdefghijk"]
+        pools = [{**POOL_OK, "name": f"pool{i}"} for i in range(5)]
+        emb = e.hyperviseur("nas", {**DATA, "disks": disks, "zfs": pools},
+                            CLUSTER, GUESTS, "-avy")
+        self.assertLessEqual(len(emb.fields), 25)
+        for f in emb.fields:
+            self.assertLessEqual(len(f.value), 1024)
