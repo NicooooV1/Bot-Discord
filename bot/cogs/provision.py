@@ -1090,6 +1090,10 @@ class Provision(commands.Cog):
             # (Nico 07/11 : « trop visibles sur discord »). Leurs salons existants partent par _sweep_ghost_channels.
             if r.get("template"):
                 continue
+            # VPS des clients : Convoy les crée tous dans le pool PVE « vps » (son jeton n'a VM.Allocate que là).
+            # Pas de salon non plus (Nico 07/11 : « Vas-y pour 1 & 2 »).
+            if r.get("pool") == "vps":
+                continue
             key = None
             if pve.is_avy_name(r["name"]):
                 # -avy sans nœud résolu (réponse Aveyron partielle) : NE PAS le classer.
