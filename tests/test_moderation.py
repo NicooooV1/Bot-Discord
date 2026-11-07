@@ -238,6 +238,13 @@ class TestPermsEtLibelles(unittest.TestCase):
 
 # ---------------------------------------------------------------------------- /purge
 class TestPurgeCommande(unittest.TestCase):
+    def setUp(self):
+        # Messages factices datés depuis NOW (figé) : figer aussi l'horloge du cog, sinon ils dépassent
+        # les 14 jours avec le temps et ces tests cassent (vécu le 07/11/2026, deploy.sh bloqué).
+        p = mock.patch.object(M, "datetime")
+        p.start().now.return_value = NOW
+        self.addCleanup(p.stop)
+
     def test_compte_reel_et_vieux_ignores_et_audit(self):
         msgs = [FakeMsg(1), FakeMsg(2), FakeMsg(3, age=timedelta(days=20))]
         ch = FakeChannel(msgs=msgs)
