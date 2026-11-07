@@ -1086,6 +1086,10 @@ class Provision(commands.Cog):
         for r in res:
             if not r.get("name") or r.get("vmid") is None:
                 continue
+            # Modèles Proxmox (template=1, ex. les tpl-* que Convoy clone pour créer les VPS) : jamais de salon
+            # (Nico 07/11 : « trop visibles sur discord »). Leurs salons existants partent par _sweep_ghost_channels.
+            if r.get("template"):
+                continue
             key = None
             if pve.is_avy_name(r["name"]):
                 # -avy sans nœud résolu (réponse Aveyron partielle) : NE PAS le classer.
