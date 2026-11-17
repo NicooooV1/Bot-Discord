@@ -621,14 +621,19 @@ from(bucket:"{self._b}")
         }
 
     async def host_cpu_series(self, rng="24h"):
+        # CPU réellement occupé = 100 - idle - iowait. L'iowait n'est PAS du calcul : un NFS
+        # `hard` bloqué (NAS muet du 17/11/2026) le faisait passer pour un « pic CPU » de 30 %.
         rng = self._rng(rng)
         flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-{rng})
   |> filter(fn:(r)=> r._measurement=="cpu" and r.host=="{self.cfg.pve_node}"
-        and r.cpu=="cpu-total" and r._field=="usage_idle")
+        and r.cpu=="cpu-total" and (r._field=="usage_idle" or r._field=="usage_iowait"))
   |> aggregateWindow(every:{self._agg(rng)}, fn:mean, createEmpty:false)
-  |> map(fn:(r)=>({{ r with _value: 100.0 - r._value }}))
+  |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
+  |> filter(fn:(r)=> exists r.usage_idle)
+  |> map(fn:(r)=>({{ r with _value: 100.0 - r.usage_idle
+        - (if exists r.usage_iowait then r.usage_iowait else 0.0) }}))
   |> keep(columns:["_time","_value"])'''
         return self._series(await self.aq(flux))
 
