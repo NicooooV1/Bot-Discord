@@ -396,7 +396,7 @@ class LiveLogStream:
                 self.recent[key] = {"last_posted": now, "pending": 0,
                                     "first_seen": now, "g": g}
                 out.append((g, None))
-            elif now - r["last_posted"] < self.cooldown:
+            elif now - r["last_posted"] < r.get("cd", self.cooldown):
                 r["pending"] += g["count"]
                 r["g"] = g
                 self._bump("suppressed_repeats")
@@ -407,8 +407,10 @@ class LiveLogStream:
                     gg = dict(g)
                     gg["count"] = 1  # note replaces the builtin _(xN)_ suffix
                     out.append((gg, f"(x{total}, toujours en cours depuis {since})"))
+                    r["cd"] = self._backoff(r)
                 else:
                     r["first_seen"] = now  # quiet episode ended; new one starts
+                    r["cd"] = self.cooldown
                     out.append((g, None))
                 r["last_posted"] = now
                 r["pending"] = 0
@@ -417,18 +419,25 @@ class LiveLogStream:
         for key, r in list(self.recent.items()):
             if key in seen:
                 continue
-            if r["pending"] and now - r["last_posted"] >= self.cooldown:
+            if r["pending"] and now - r["last_posted"] >= r.get("cd", self.cooldown):
                 since = time.strftime("%H:%M", time.localtime(r["first_seen"]))
                 gg = dict(r["g"])
                 gg["count"] = 1
                 out.append((gg, f"(x{r['pending']}, toujours en cours depuis {since})"))
+                r["cd"] = self._backoff(r)
                 r["last_posted"] = now
                 r["pending"] = 0
-            elif not r["pending"] and now - r["last_posted"] > 2 * self.cooldown:
+            elif not r["pending"] and now - r["last_posted"] > 2 * r.get("cd", self.cooldown):
                 del self.recent[key]
         while len(self.recent) > RECENT_HARD_CAP:
             self.recent.popitem(last=False)
         return out
+
+    def _backoff(self, r):
+        """Rappel « toujours en cours » de plus en plus espacé : 10 → 20 → 40 → 80 min,
+        plafonné à 4 h (17/11 : la panne NAS a reposté les mêmes lignes toutes les
+        10 min pendant 17 h). Revient au cooldown normal au prochain épisode."""
+        return min(r.get("cd", self.cooldown) * 2, max(self.cooldown, 4 * 3600))
 
     # --- overflow digest ---------------------------------------------------
 

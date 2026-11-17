@@ -63,6 +63,14 @@ class SeerrActivity(commands.Cog):
         # {str(request_id): [status, media_status]} — transitions déjà publiées
         self._statuts = dict(bot.state.get("seerr_req_status", {}) or {})
         self._titres = {}          # (type, tmdbId) -> (titre, année) ; cache mémoire
+        # {str(request_id): media_status déjà ANNONCÉ (4 ou 5)} — Seerr fait osciller le statut
+        # d un média (dispo 5 <-> partiel 4 à chaque scan Sonarr/Jellyfin) : sans cette mémoire,
+        # « Classroom of the Elite … est disponible » repartait chaque jour (17/11).
+        self._annonces = dict(bot.state.get("seerr_announced", {}) or {})
+        if bot.state.get("seerr_announced") is None:
+            # 1re mise en service : ce qui est déjà dispo/partiel a déjà été annoncé
+            self._annonces = {k: v[1] for k, v in self._statuts.items()
+                              if v and v[1] in (MEDIA_PARTIAL, MEDIA_AVAILABLE)}
         if self.channel_id and self.enabled:
             self.poll.start()
 
@@ -151,11 +159,16 @@ class SeerrActivity(commands.Cog):
                     lignes.append(f"⛔ demande de **{user or '?'}** refusée : {media}")
                 elif statut == REQ_APPROVED and avant[0] == REQ_PENDING:
                     lignes.append(f"✅ demande de **{user or '?'}** approuvée : {media}")
-                if m_statut == MEDIA_AVAILABLE and avant[1] != MEDIA_AVAILABLE:
+                deja = self._annonces.get(str(rid), 0)
+                if (m_statut == MEDIA_AVAILABLE and avant[1] != MEDIA_AVAILABLE
+                        and deja != MEDIA_AVAILABLE):
                     lignes.append(f"🎬 {media} est **disponible**")
-                elif m_statut == MEDIA_PARTIAL and avant[1] not in (MEDIA_PARTIAL,
-                                                                    MEDIA_AVAILABLE):
+                    self._annonces[str(rid)] = MEDIA_AVAILABLE
+                elif (m_statut == MEDIA_PARTIAL and avant[1] not in (MEDIA_PARTIAL,
+                                                                     MEDIA_AVAILABLE)
+                        and not deja):
                     lignes.append(f"🎬 {media} est **partiellement disponible**")
+                    self._annonces[str(rid)] = MEDIA_PARTIAL
             self._statuts[str(rid)] = [statut, m_statut]
         # garde-fou anti-flood, même logique que JellyfinActivity : 20 lignes max/tour ;
         # le curseur n'avance que si l'envoi a réussi (un échec Discord rejouera le tour)
@@ -183,6 +196,9 @@ class SeerrActivity(commands.Cog):
                 self._statuts.pop(k, None)
         self.bot.state.set("seerr_last_req_id", self._last_id)
         self.bot.state.set("seerr_req_status", self._statuts)
+        for k in sorted(self._annonces, key=int)[:max(0, len(self._annonces) - 400)]:
+            self._annonces.pop(k, None)
+        self.bot.state.set("seerr_announced", self._annonces)
 
     @poll.before_loop
     async def _before(self):

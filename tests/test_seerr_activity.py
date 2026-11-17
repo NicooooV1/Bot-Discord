@@ -43,3 +43,54 @@ class TestTimecode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _State(dict):
+    def set(self, k, v):
+        self[k] = v
+
+
+class _Chan:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, msg, **kw):
+        self.sent.append(msg)
+
+
+class _Seerr:
+    def __init__(self):
+        self.media_status = 5
+
+    async def aget(self, path, params=None, quiet=False):
+        if path.startswith("/api/v1/tv/"):
+            return {"name": "Classroom of the Elite", "firstAirDate": "2017-07-12"}
+        return {"results": [{"id": 105, "status": 2, "type": "tv",
+                             "media": {"mediaType": "tv", "tmdbId": 72517,
+                                       "status": self.media_status},
+                             "seasons": [{"seasonNumber": n} for n in (1, 2, 3, 4)],
+                             "requestedBy": {"displayName": "Nico"}}]}
+
+
+class TestDisponibleUneFois(unittest.IsolatedAsyncioTestCase):
+    """17/11 : Seerr fait osciller dispo(5) <-> partiel(4) à chaque scan ;
+    « … est disponible » ne doit partir qu UNE fois par demande."""
+
+    async def test_oscillation(self):
+        from unittest import mock
+        from bot.cogs import seerr_activity as sa
+        chan = _Chan()
+        bot = mock.Mock()
+        bot.state = _State(prov={"jellyfin_logs": 1}, seerr_last_req_id=105,
+                           seerr_req_status={"105": [2, 4]})
+        bot.get_channel.return_value = chan
+        with mock.patch.object(sa, "client_for", return_value=None):
+            cog = sa.SeerrActivity(bot)           # seerr None : la boucle ne démarre pas
+        cog.seerr = _Seerr()
+        cog._annonces = {}                        # comme une demande jamais annoncée
+        for statut in (5, 4, 5, 4, 5):
+            cog.seerr.media_status = statut
+            await cog.poll.coro(cog)
+        dispo = [m for m in chan.sent if "disponible" in m]
+        self.assertEqual(len(dispo), 1, chan.sent)
+        self.assertIn("Classroom of the Elite", dispo[0])

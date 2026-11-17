@@ -25,6 +25,21 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
+def _flood_lines(rows):
+    """Lignes flood-guard (Loki) -> résumé : coupures des 24 h + domaines encore coupés."""
+    coupures, encore = [], {}
+    for ts, _labels, line in rows or []:
+        txt = line.split("flood-guard", 1)[-1].lstrip(":[]0123456789 ")
+        if txt.startswith("COUPURE"):
+            coupures.append(f"🔴 {dt.datetime.fromtimestamp(ts):%d/%m %H:%M} {txt}")
+        elif txt.startswith("TOUJOURS COUPÉ"):
+            encore[txt.split()[2]] = f"⛔ {txt}"
+    if not coupures and not encore:
+        return "✅ aucune coupure"
+    return "\n".join(coupures[-5:] + [v for k, v in sorted(encore.items())
+                                        if not any(k in c for c in coupures)])
+
+
 class Reports(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -153,6 +168,16 @@ class Reports(commands.Cog):
             else:
                 emb.add_field(name="Top logs (24h)",
                               value="➖ indisponible (pas de données ce matin)", inline=False)
+
+        if bot.loki.enabled:
+            # flood-guard (CT116, 17/11) : un domaine public submergé est coupé (Caddy ferme
+            # la connexion) et reste coupé jusqu'à ce que Nico le rallume ; rappel horaire
+            # « TOUJOURS COUPÉ » dans le journal pour que cette fenêtre 24 h le voie.
+            rows = await bot.loki.query_range(
+                '{host="reverseproxy", job="systemd-journal"} |= "flood-guard" '
+                '|~ "COUPURE|TOUJOURS COUPÉ"', 1440, limit=200)
+            emb.add_field(name="🛡️ Anti-flood (24h)",
+                          value=_flood_lines(rows)[:1024], inline=False)
 
         file = await asyncio.to_thread(render.timeseries, "Hôte CPU/RAM (24h)", "%",
                                        {"CPU%": cpu, "RAM%": mem}, "report.png", True)
