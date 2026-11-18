@@ -235,21 +235,50 @@ from(bucket:"{self._b}")
         out.sort(key=lambda x: x["cpu_pct"], reverse=True)
         return out
 
+    # Un storage PVE « dir » n'est qu'un dossier : PVE rapporte le système de fichiers
+    # ENTIER → local/local-dump et vps/vps-dump sortaient en double, « vps » annonçait
+    # 3 Tio qui sont des médias, et le NAS médias (aucun storage PVE) manquait (18/11).
+    # On affiche donc les DISQUES de l'hôte à la place des storages dir.
+    # shortcut: liste fixe ; un nouveau storage dir sur un autre montage → l'ajouter ici.
+    _HOST_DISKS = {"/": "Système / (local, local-dump)",
+                   "/mnt/media-local": "Disque local médias + VPS (sda4)",
+                   "/mnt/nas-media": "NAS — médias (volume2)"}
+    _STORAGE_LABELS = {"pbs-nas": "NAS — sauvegardes PBS (volume1)"}
+
     async def storages(self):
-        flux = f'''
+        pve_flux = f'''
 from(bucket:"{self._b}")
   |> range(start:-5m)
   |> filter(fn:(r)=> r._measurement=="system" and r.object=="storages"
-        and (r._field=="used" or r._field=="total" or r._field=="avail"))
+        and (r._field=="used" or r._field=="avail"))
   |> last()
   |> pivot(rowKey:["host"], columnKey:["_field"], valueColumn:"_value")'''
-        rows = await self.aq(flux)
+        paths = ", ".join(f'"{_esc(p)}"' for p in self._HOST_DISKS)
+        disk_flux = f'''
+from(bucket:"{self._b}")
+  |> range(start:-10m)
+  |> filter(fn:(r)=> r._measurement=="disk" and r.host=="{_esc(self.cfg.pve_node)}"
+        and contains(value: r.path, set: [{paths}])
+        and (r._field=="used" or r._field=="free"))
+  |> last()
+  |> pivot(rowKey:["path"], columnKey:["_field"], valueColumn:"_value")'''
+        pve_rows, disk_rows = await asyncio.gather(self.aq(pve_flux), self.aq(disk_flux))
         out = []
-        for r in rows:
-            total = r.get("total") or 0
-            out.append({"name": r.get("host"), "used": r.get("used") or 0,
-                        "total": total, "avail": r.get("avail") or 0,
-                        "pct": (r.get("used") or 0) / total * 100.0 if total else 0.0})
+
+        def add(name, used, free):
+            used, free = used or 0, free or 0
+            # capacité UTILISABLE = utilisé + libre (comme df) : le total brut compte les
+            # 5 % réservés ext4 et sous-estimait le remplissage (sda4 : 82 % au lieu de 87 %).
+            total = used + free
+            out.append({"name": name, "used": used, "total": total, "avail": free,
+                        "pct": used / total * 100.0 if total else 0.0})
+
+        for r in pve_rows:
+            if r.get("type") != "dir":
+                host = r.get("host")
+                add(self._STORAGE_LABELS.get(host, host), r.get("used"), r.get("avail"))
+        for r in disk_rows:
+            add(self._HOST_DISKS.get(r.get("path"), r.get("path")), r.get("used"), r.get("free"))
         out.sort(key=lambda x: x["pct"], reverse=True)
         return out
 
