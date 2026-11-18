@@ -75,6 +75,7 @@ class Servarr(commands.Cog):
         self._ratio_view = None     # UNE seule instance de la vue persistante (cf. _view)
         self._last_debit = None     # dernier débit publié -> pas de PATCH Discord inutile
         self._debit_ticks = 0       # tours depuis la dernière édition (réédition forcée)
+        self._debit_pause = 0.0     # monotonic jusqu'auquel la boucle débit se tait (30046)
         self._last_manual_refresh = 0.0   # anti-rebond du bouton Rafraîchir
         self._qbit_warn_at = 0.0    # dernière panne qBittorrent journalisée (throttle)
         self._ratio_public_warned = False  # #ratio lisible de @everyone : signalé 1 fois
@@ -766,6 +767,8 @@ class Servarr(commands.Cog):
         géré par le cycle lent ~10 min (inutile de le rafraîchir souvent)."""
         if self._ratio_cache is None or self._ratio_msg is None:
             return  # attend qu'un cycle complet ait créé le message + le cache
+        if time.monotonic() < self._debit_pause:
+            return  # plafond Discord 30046 atteint : on laisse passer la fenêtre
         speed = await self._qbit_transfer()
         if speed is None:
             return
@@ -799,7 +802,14 @@ class Servarr(commands.Cog):
             log.warning("#ratio : édition refusée (permissions) — boucle débit en veille")
             self._ratio_msg = None
         except discord.HTTPException as e:
-            log.warning("#ratio : édition du débit impossible: %s", e)
+            if e.code == 30046:
+                # Discord plafonne les éditions d'un message de plus d'1 h : réessayer
+                # toutes les 10 s prolonge le blocage (39 refus le 17/11 22:57-23:12).
+                # Pause de la boucle rapide ; le cycle lent (10 min) continue.
+                self._debit_pause = time.monotonic() + 900
+                log.warning("#ratio : plafond d'éditions Discord (30046) — débit en pause 15 min")
+            else:
+                log.warning("#ratio : édition du débit impossible: %s", e)
 
     @ratiodebit.before_loop
     async def _before_debit(self):
